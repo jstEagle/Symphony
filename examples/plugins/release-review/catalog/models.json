@@ -1,0 +1,23 @@
+{
+  "models": [
+    {
+      "id": "codex/example-model",
+      "harness": "codex",
+      "model": "example-model",
+      "name": "Example local model card",
+      "description": "An illustrative local override. Replace this card with facts for a model actually exposed by its native harness.",
+      "contextTokens": 200000,
+      "pricing": {
+        "inputPerMillion": 1,
+        "outputPerMillion": 5
+      },
+      "metrics": {
+        "artificialAnalysisIntelligence": 50,
+        "artificialAnalysisCoding": 55,
+        "artificialAnalysisAgentic": 45,
+        "arenaFrontend": 1200
+      },
+      "context": ["text", "coding"]
+    }
+  ]
+}

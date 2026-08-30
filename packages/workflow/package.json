@@ -1,0 +1,24 @@
+{
+  "name": "@symphony/workflow",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsup src/index.ts --format esm --dts --sourcemap --clean",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@symphony/config": "workspace:*",
+    "@symphony/protocol": "workspace:*",
+    "@symphony/runtime": "workspace:*",
+    "@symphony/storage": "workspace:*",
+    "croner": "10.0.1",
+    "jiti": "2.7.0",
+    "ulid": "3.0.2",
+    "zod": "4.5.4"
+  },
+  "devDependencies": { "tsup": "8.5.1", "typescript": "5.9.3" }
+}

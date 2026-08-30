@@ -1,0 +1,12 @@
+{
+  "id": "example.release-review",
+  "name": "Release review example",
+  "version": "0.1.0",
+  "apiVersion": 1,
+  "entry": "index.ts",
+  "piCompatible": true,
+  "description": "A minimal trusted plugin showing a hot-reloaded agent utility.",
+  "contributes": {
+    "modelCatalogs": ["catalog/models.json"]
+  }
+}

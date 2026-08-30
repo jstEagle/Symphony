@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+.turbo/
+*.tsbuildinfo
+*.log
+.DS_Store
+
+# Runtime state and secrets
+.symphony/
+.env
+.env.*
+
+# Frontend build products
+apps/web/.next/
+apps/web/out/
+apps/web/dist/
+apps/web/.output/
+apps/web/.vercel/

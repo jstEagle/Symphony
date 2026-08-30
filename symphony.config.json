@@ -1,0 +1,124 @@
+{
+  "version": 1,
+  "dataDirectory": ".symphony",
+  "server": {
+    "host": "127.0.0.1",
+    "port": 3210,
+    "openBrowser": true,
+    "webDirectory": "apps/web/out"
+  },
+  "conductor": {
+    "harness": "codex",
+    "model": "gpt-5.6-sol"
+  },
+  "agents": {
+    "maxDepth": 3,
+    "maxConcurrent": 8,
+    "defaultPermissions": "full-access"
+  },
+  "harnesses": {
+    "codex": {
+      "enabled": true,
+      "process": {
+        "command": "codex",
+        "args": [
+          "app-server"
+        ]
+      }
+    },
+    "claude": {
+      "enabled": true,
+      "process": {
+        "command": "claude",
+        "args": []
+      }
+    },
+    "cursor": {
+      "enabled": true,
+      "process": {
+        "command": "cursor-agent",
+        "args": []
+      },
+      "autoCreatePR": false
+    },
+    "opencode": {
+      "enabled": true,
+      "process": {
+        "command": "opencode",
+        "args": [
+          "serve"
+        ]
+      },
+      "baseUrl": "http://127.0.0.1:4096",
+      "autoStart": true
+    },
+    "pi": {
+      "enabled": true,
+      "process": {
+        "command": "pi",
+        "args": [
+          "--mode",
+          "rpc"
+        ]
+      }
+    },
+    "acp": []
+  },
+  "harnessUpdates": {
+    "checkIntervalMinutes": 10,
+    "harnesses": {
+      "codex": { "command": "codex", "args": ["update"], "latest": { "source": "npm", "packageName": "@openai/codex" } },
+      "claude": { "command": "claude", "args": ["update"], "latest": { "source": "npm", "packageName": "@anthropic-ai/claude-code" } },
+      "cursor": { "command": "cursor-agent", "args": ["update"], "latest": { "source": "installer", "url": "https://cursor.com/install", "versionPattern": "TEMP_EXTRACT_DIR=.*?\\.tmp-([0-9]{4}\\.[0-9]{2}\\.[0-9]{2}-[A-Za-z0-9]+)-" } },
+      "opencode": { "command": "opencode", "args": ["upgrade"], "latest": { "source": "npm", "packageName": "opencode-ai" } },
+      "pi": { "command": "pnpm", "args": ["--filter", "@symphony/drivers", "update", "@earendil-works/pi-coding-agent", "--latest"], "latest": { "source": "npm", "packageName": "@earendil-works/pi-coding-agent" } }
+    }
+  },
+  "observer": {
+    "provider": "openrouter",
+    "model": "z-ai/glm-5.3-flash",
+    "maxInputCharacters": 400000,
+    "cache": true,
+    "baseUrl": "https://openrouter.ai/api/v1"
+  },
+  "uiUtilities": {
+    "provider": "openrouter",
+    "model": "z-ai/glm-5.3-flash",
+    "baseUrl": "https://openrouter.ai/api/v1",
+    "chatTitles": true,
+    "maxInputCharacters": 12000
+  },
+  "router": {
+    "provider": "openrouter",
+    "reranker": "cohere/rerank-v3.5",
+    "baseUrl": "https://openrouter.ai/api/v1",
+    "catalogRefreshMinutes": 60,
+    "localCatalogFiles": [],
+    "fallbackHarnessOrder": [
+      "codex",
+      "claude",
+      "cursor",
+      "opencode",
+      "pi",
+      "acp"
+    ]
+  },
+  "workflows": {
+    "directory": ".symphony/workflows",
+    "maxLoopIterations": 100,
+    "triggersEnabled": true
+  },
+  "plugins": {
+    "roots": [
+      ".symphony/plugins"
+    ],
+    "trusted": [],
+    "watch": true,
+    "debounceMs": 250,
+    "keepBuilds": 3
+  },
+  "telemetry": {
+    "enabled": false,
+    "includeContent": false
+  }
+}

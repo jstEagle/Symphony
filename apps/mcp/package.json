@@ -1,0 +1,18 @@
+{
+  "name": "@symphony/mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "symphony-mcp": "./dist/index.js" },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsup src/index.ts --format esm --sourcemap --clean",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@symphony/protocol": "workspace:*",
+    "zod": "4.5.4"
+  },
+  "devDependencies": { "tsx": "4.23.13", "tsup": "8.5.1", "typescript": "5.9.3" }
+}
