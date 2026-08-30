@@ -1,12 +1,11 @@
 "use client";
 
 import { ClockCounterClockwise, FlowArrow, Pulse, TreeStructure } from "@phosphor-icons/react";
-import type { ReactNode } from "react";
-import type { RunSnapshot } from "@/lib/symphony/contracts";
-import { costLabel, isLiveAgentState, loaderForHarness } from "@/lib/symphony/format";
+import { useCallback, type ReactNode } from "react";
+import type { RunSnapshot, WorkNode } from "@/lib/symphony/contracts";
+import { costLabel, isActivelyWorkingAgent, loaderForHarness, statusLabel } from "@/lib/symphony/format";
 import { progressCopy } from "@/lib/symphony/project";
 import { AgentLoader } from "@/components/symphony/agent-tool";
-import { AgentTree } from "@/components/symphony/agent-tree";
 import { RunTrace } from "@/components/symphony/run-trace";
 import { WorkflowGraph } from "@/components/symphony/workflow-graph";
 import { PluginSlot } from "@/components/symphony/plugin-slots";
@@ -32,8 +31,11 @@ export function RunDetails({
   onSelectAgent: (id: string) => void;
   tab: RunWorkspaceTab;
 }) {
-  const live = snapshot.agents.filter((agent) => isLiveAgentState(agent.state)).length;
-  const liveAgent = snapshot.agents.find((agent) => isLiveAgentState(agent.state));
+  const live = snapshot.agents.filter((agent) => isActivelyWorkingAgent(agent.state)).length;
+  const liveAgent = snapshot.agents.find((agent) => isActivelyWorkingAgent(agent.state));
+  const selectGraphNode = useCallback((node: WorkNode) => {
+    if (node.agentId) onSelectAgent(node.agentId);
+  }, [onSelectAgent]);
 
   return (
     <section className="flex min-h-0 flex-1 flex-col overflow-hidden bg-background">
@@ -58,18 +60,10 @@ export function RunDetails({
                 detail="Execution spans appear when the conductor starts working."
               />
             ) : (
-              <div className="grid flex-1 gap-5 lg:grid-cols-[minmax(0,1.65fr)_minmax(18rem,0.7fr)]">
-                <Surface className="min-h-[28rem] p-5 md:p-6">
-                  <SectionHeading title="Timeline" meta={`${snapshot.agents.length} agents`} />
+              <div className="flex flex-1">
+                <Surface className="min-h-[28rem] w-full overflow-hidden p-5 md:p-6">
+                  <SectionHeading title="Trace waterfall" meta={`${snapshot.agents.length} agents`} />
                   <RunTrace snapshot={snapshot} onSelectAgent={onSelectAgent} />
-                </Surface>
-                <Surface className="min-h-[28rem] p-5 md:p-6">
-                  <SectionHeading title="Agent tree" meta={`${live} active`} />
-                  <AgentTree
-                    agents={snapshot.agents}
-                    selectedId={selectedAgentId}
-                    onSelect={(agent) => onSelectAgent(agent.id)}
-                  />
                 </Surface>
               </div>
             )
@@ -84,12 +78,12 @@ export function RunDetails({
                 grid
               />
             ) : (
-              <Surface className="symphony-graph-surface min-h-[34rem] flex-1 overflow-auto p-6 md:p-8">
+              <Surface className="symphony-graph-surface min-h-[34rem] flex-1 overflow-hidden p-0">
                 <WorkflowGraph
                   nodes={snapshot.nodes}
                   edges={snapshot.edges}
                   selectedId={selectedAgentId}
-                  onSelect={(node) => node.agentId && onSelectAgent(node.agentId)}
+                  onSelect={selectGraphNode}
                 />
               </Surface>
             )
@@ -108,7 +102,7 @@ export function RunDetails({
                   {snapshot.events.map((event, index) => (
                     <li
                       key={event.id}
-                      className="grid grid-cols-[5.5rem_1rem_minmax(0,1fr)] gap-3 py-5 md:grid-cols-[7rem_1rem_minmax(0,1fr)]"
+                      className="grid grid-cols-[5.5rem_1rem_minmax(0,1fr)] gap-3 py-5 [contain-intrinsic-size:auto_76px] [content-visibility:auto] md:grid-cols-[7rem_1rem_minmax(0,1fr)]"
                     >
                       <time className="pt-0.5 text-right text-[11px] tabular-nums text-muted-foreground">
                         {event.at}
@@ -204,7 +198,7 @@ function Overview({
         </Surface>
 
         <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-          <Fact label="Status" value={snapshot.runStatus ?? snapshot.phase} />
+          <Fact label="Status" value={snapshot.phase} />
           <Fact label="Agents" value={String(snapshot.agents.length)} />
           <Fact label="Active" value={String(live)} />
           <Fact label="Cost" value={costLabel(snapshot.cost)} />
@@ -231,21 +225,18 @@ function Overview({
                 onClick={() => onSelectAgent(agent.id)}
                 className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors hover:bg-muted/55"
               >
-                {isLiveAgentState(agent.state) ? (
-                  <AgentLoader kind={loaderForHarness(agent.harness)} size={15} label={`${agent.harness} active`} />
-                ) : (
-                  <span
-                    className={cn(
-                      "size-2 rounded-full",
-                      agent.state === "succeeded" ? "bg-foreground" : "bg-muted-foreground/40",
-                    )}
-                  />
-                )}
+                <AgentLoader
+                  kind={loaderForHarness(agent.harness)}
+                  size={15}
+                  label={`${agent.name} ${agent.state}`}
+                  animated={isActivelyWorkingAgent(agent.state)}
+                  tone={agent.state === "succeeded" ? "success" : agent.state === "failed" ? "danger" : agent.state === "running" || agent.state === "queued" ? "info" : "warning"}
+                />
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-[13px] font-medium" title={agent.objective}>{agent.name}</span>
                   <span className="mt-0.5 block truncate text-[10px] text-muted-foreground">{agent.harness} · {agent.model}</span>
                 </span>
-                <span className="text-[10px] text-muted-foreground">{agent.state}</span>
+                <span className="text-[10px] text-muted-foreground">{statusLabel(agent.state, agent.nativeStatus)}</span>
               </button>
             ))}
           </div>

@@ -2,6 +2,8 @@ const PINNED_KEY = "symphony.ui.pinnedConversationIds";
 const ACTIVE_KEY = "symphony.ui.activeConversationId";
 const READ_INBOX_KEY = "symphony.ui.readInboxIds";
 const GROUPS_KEY = "symphony.ui.groups";
+const CHAT_ORDER_KEY = "symphony.ui.conversationOrder";
+const PINNED_ORDER_KEY = "symphony.ui.pinnedConversationOrder";
 
 function readJson<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
@@ -48,4 +50,26 @@ export function readGroups(): Array<{ id: string; title: string }> {
 
 export function writeGroups(groups: Array<{ id: string; title: string }>): void {
   writeJson(GROUPS_KEY, groups);
+}
+
+export function readConversationOrder(): string[] {
+  return readStringIds(CHAT_ORDER_KEY);
+}
+
+export function writeConversationOrder(ids: string[]): void {
+  writeJson(CHAT_ORDER_KEY, ids);
+}
+
+export function readPinnedConversationOrder(): string[] {
+  return readStringIds(PINNED_ORDER_KEY);
+}
+
+export function writePinnedConversationOrder(ids: string[]): void {
+  writeJson(PINNED_ORDER_KEY, ids);
+}
+
+function readStringIds(key: string): string[] {
+  const value = readJson<unknown>(key, []);
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value.filter((item): item is string => typeof item === "string" && item.trim().length > 0))];
 }

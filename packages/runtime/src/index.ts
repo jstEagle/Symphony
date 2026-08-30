@@ -1,16 +1,17 @@
-import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
-import { existsSync, readFileSync } from "node:fs";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { z } from "zod";
 import { Ajv } from "ajv";
 import { ulid } from "ulid";
 import type { LoadedConfig, SecretStore } from "@symphony/config";
 import type { DriverRegistry } from "@symphony/drivers";
-import { extractStructuredOutput } from "@symphony/drivers";
+import { extractStructuredOutput, inspectProcessIdentity, type ProcessIdentityInspection } from "@symphony/drivers";
 import {
   AgentWorkOrderSchema,
+  DriverSessionSchema,
   isTerminalAgentStatus,
   nowIso,
   resolveChildPermission,
@@ -18,6 +19,7 @@ import {
   type AgentWorkOrder,
   type DriverEvent,
   type DriverSession,
+  type DriverProcessSupervisor,
   type Harness,
   type JsonValue,
   type ModelDescriptor,
@@ -26,8 +28,9 @@ import {
   type ResolvedHarness,
   type RoutingTrace,
   type UsageEvent,
+  type WorkerProcessLease,
 } from "@symphony/protocol";
-import type { SymphonyStore } from "@symphony/storage";
+import type { AgentListCursor, SymphonyStore } from "@symphony/storage";
 
 const execFileAsync = promisify(execFile);
 
@@ -78,9 +81,26 @@ function describeCard(card: ModelCard): string {
   return `${card.name}. ${card.description}. harness=${card.harness}. context=${card.context.join(", ")}. ${metrics}. ${price}`;
 }
 
+function driverFailureMessage(payload: JsonValue): string {
+  if (typeof payload === "string" && payload.trim()) return payload;
+  if (payload !== null && typeof payload === "object" && !Array.isArray(payload)) {
+    for (const key of ["error", "message", "detail"] as const) {
+      const value = payload[key];
+      if (typeof value === "string" && value.trim()) return value;
+      if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+        const nestedMessage = value.message;
+        if (typeof nestedMessage === "string" && nestedMessage.trim()) return nestedMessage;
+      }
+    }
+  }
+  const serialized = JSON.stringify(payload);
+  return serialized && serialized !== "null" ? serialized : "Native run failed.";
+}
+
 export class ModelRouter {
   private cards: ModelCard[] = [];
   private snapshotId = "uninitialized";
+  private runnableHarnesses = new Set<ResolvedHarness>();
 
   constructor(
     private readonly loaded: LoadedConfig,
@@ -89,13 +109,26 @@ export class ModelRouter {
     private readonly store: SymphonyStore,
   ) {}
 
-  async refresh(): Promise<ModelCard[]> {
+  async refresh(signal?: AbortSignal): Promise<ModelCard[]> {
+    signal?.throwIfAborted();
     const cards: ModelCard[] = [];
+    const runnableHarnesses = new Set<ResolvedHarness>();
     for (const driver of this.drivers.list()) {
+      try {
+        const report = await driver.doctor();
+        signal?.throwIfAborted();
+        if (!report.available || report.authenticated === false) continue;
+      } catch {
+        signal?.throwIfAborted();
+        continue;
+      }
+      runnableHarnesses.add(driver.id);
       let models: ModelDescriptor[] = [];
       try {
         models = await driver.listModels();
+        signal?.throwIfAborted();
       } catch {
+        signal?.throwIfAborted();
         // Doctor exposes native catalog failures; routing retains a harness fallback.
       }
       if (!models.length) {
@@ -117,13 +150,15 @@ export class ModelRouter {
         }));
       }
     }
-    await this.enrichFromOpenRouter(cards).catch(() => undefined);
+    await this.enrichFromOpenRouter(cards, signal).catch(() => signal?.throwIfAborted());
+    signal?.throwIfAborted();
     for (const path of this.loaded.config.router.localCatalogFiles) {
       const absolute = resolve(this.loaded.rootDirectory, path);
       if (!existsSync(absolute)) continue;
       const raw = JSON.parse(readFileSync(absolute, "utf8")) as unknown;
       const entries = z.array(ModelCardSchema).parse(Array.isArray(raw) ? raw : (raw as { models?: unknown }).models ?? []);
       for (const entry of entries) {
+        if (!runnableHarnesses.has(entry.harness)) continue;
         const existing = cards.findIndex((card) => card.id === entry.id);
         if (existing >= 0) cards[existing] = entry;
         else cards.push(entry);
@@ -132,6 +167,7 @@ export class ModelRouter {
     const canonical = JSON.stringify(cards.map((card) => ({ ...card, description: card.description.trim() })).sort((a, b) => a.id.localeCompare(b.id)));
     this.snapshotId = createHash("sha256").update(canonical).digest("hex").slice(0, 20);
     this.cards = cards;
+    this.runnableHarnesses = runnableHarnesses;
     this.store.setMetadata("model-catalog", { snapshotId: this.snapshotId, refreshedAt: nowIso(), cards } as JsonValue);
     return cards;
   }
@@ -151,13 +187,15 @@ export class ModelRouter {
     };
   }
 
-  async route(workOrder: AgentWorkOrder): Promise<RouteResult> {
-    if (!this.cards.length) await this.refresh();
+  async route(workOrder: AgentWorkOrder, signal?: AbortSignal): Promise<RouteResult> {
+    signal?.throwIfAborted();
+    if (!this.cards.length) await this.refresh(signal);
+    signal?.throwIfAborted();
     const explicitHarness = workOrder.harness === "auto" ? undefined : workOrder.harness;
     const explicitModel = workOrder.model === "auto" ? undefined : workOrder.model;
     let eligible = this.cards.filter((card) => !explicitHarness || card.harness === explicitHarness);
     if (explicitModel) eligible = eligible.filter((card) => card.model === explicitModel || card.id === explicitModel);
-    if (!eligible.length && explicitHarness && explicitModel) {
+    if (!eligible.length && explicitHarness && explicitModel && this.runnableHarnesses.has(explicitHarness)) {
       eligible = [ModelCardSchema.parse({ id: `${explicitHarness}/${explicitModel}`, harness: explicitHarness, model: explicitModel, name: explicitModel })];
     }
     if (!eligible.length) throw new Error("No eligible native harness/model is configured for this work order.");
@@ -168,7 +206,10 @@ export class ModelRouter {
     let method: RoutingTrace["method"] = explicitHarness || explicitModel ? "explicit" : "neutral-lexical";
     let reranker: string | null = null;
     if (!explicitHarness && !explicitModel && this.loaded.config.router.provider === "openrouter") {
-      const ranked = await this.rerank(workOrder, query, anonymousCards).catch(() => null);
+      const ranked = await this.rerank(workOrder, query, anonymousCards, signal).catch(() => {
+        signal?.throwIfAborted();
+        return null;
+      });
       if (ranked) {
         method = "openrouter-rerank";
         reranker = this.loaded.config.router.reranker;
@@ -199,6 +240,7 @@ export class ModelRouter {
       selectedCandidateId: selected.id,
       createdAt: nowIso(),
     };
+    signal?.throwIfAborted();
     this.store.saveRoutingTrace(trace);
     return { harness: selected.harness, model: selected.model, trace };
   }
@@ -214,10 +256,11 @@ export class ModelRouter {
     ].filter(Boolean).join(". ");
   }
 
-  private async enrichFromOpenRouter(cards: ModelCard[]): Promise<void> {
+  private async enrichFromOpenRouter(cards: ModelCard[], signal?: AbortSignal): Promise<void> {
     const apiKey = this.secrets.get("openrouter.apiKey");
     const response = await fetch(`${this.loaded.config.router.baseUrl}/models`, {
       headers: apiKey ? { authorization: `Bearer ${apiKey}` } : {},
+      ...(signal ? { signal } : {}),
     });
     if (!response.ok) throw new Error(`OpenRouter model catalog failed: ${response.status}`);
     type OpenRouterModel = {
@@ -235,6 +278,7 @@ export class ModelRouter {
       };
     };
     const json = await response.json() as { data?: OpenRouterModel[] };
+    signal?.throwIfAborted();
     const normalize = (value: string): string => value.toLowerCase().split("/").at(-1)?.replace(/[^a-z0-9]/gu, "") ?? value;
     for (const card of cards) {
       if (card.model === "auto") continue;
@@ -268,19 +312,26 @@ export class ModelRouter {
     }
   }
 
-  private async rerank(workOrder: AgentWorkOrder, query: string, cards: Array<{ opaqueId: string; text: string }>): Promise<Array<{ opaqueId: string; score: number }>> {
+  private async rerank(
+    workOrder: AgentWorkOrder,
+    query: string,
+    cards: Array<{ opaqueId: string; text: string }>,
+    signal?: AbortSignal,
+  ): Promise<Array<{ opaqueId: string; score: number }>> {
     const apiKey = this.secrets.get("openrouter.apiKey");
     if (!apiKey) throw new Error("OpenRouter API key is unavailable");
     const response = await fetch(`${this.loaded.config.router.baseUrl}/rerank`, {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
       body: JSON.stringify({ model: this.loaded.config.router.reranker, query, documents: cards.map((card) => card.text), top_n: cards.length }),
+      ...(signal ? { signal } : {}),
     });
     if (!response.ok) throw new Error(`OpenRouter rerank failed: ${response.status}`);
     const json = await response.json() as {
       results?: Array<{ index: number; relevance_score?: number; score?: number }>;
       usage?: { prompt_tokens?: number; input_tokens?: number; completion_tokens?: number; output_tokens?: number; cost?: number };
     };
+    signal?.throwIfAborted();
     if (json.usage) {
       const usage = json.usage;
       const costAmount = typeof usage.cost === "number" ? usage.cost : null;
@@ -340,7 +391,9 @@ export class PassiveObserver {
     const cursor = this.store.latestCursor();
     const cached = this.loaded.config.observer.cache ? this.store.getObservation(agent.id, level, cursor) : null;
     if (cached) return cached;
-    const events = this.store.eventsAfter(0, { agentId: agent.id, limit: 10_000 });
+    // Observations are intentionally bounded, but must describe the newest
+    // native evidence rather than silently freezing on the first 10k events.
+    const events = this.store.recentEvents({ agentId: agent.id, limit: 10_000 });
     const source = events.map((event) => ({ id: event.id, type: event.type, at: event.occurredAt, payload: event.payload }));
     let summary = this.deterministic(agent, level, source);
     let generatedBy: Observation["generatedBy"] = "deterministic";
@@ -468,6 +521,11 @@ export function normalizeGeneratedChatTitle(value: string): string | null {
 }
 
 export class UiUtilityService {
+  private readonly chatSearchCache = new Map<string, {
+    expiresAt: number;
+    results: Array<{ id: string; score: number }>;
+  }>();
+
   constructor(
     private readonly loaded: LoadedConfig,
     private readonly secrets: SecretStore,
@@ -546,16 +604,240 @@ export class UiUtilityService {
     const parsed = z.object({ title: z.string() }).safeParse(JSON.parse(content) as unknown);
     return parsed.success ? normalizeGeneratedChatTitle(parsed.data.title) : null;
   }
+
+  async rankChats(
+    query: string,
+    documents: Array<{ id: string; text: string }>,
+    signal?: AbortSignal,
+  ): Promise<Array<{ id: string; score: number }> | null> {
+    const config = this.loaded.config.uiUtilities;
+    const searchConfig = config.chatSearch;
+    if (!searchConfig.rerankEnabled || config.provider !== "openrouter" || documents.length === 0) return null;
+    const apiKey = this.secrets.get("openrouter.apiKey");
+    if (!apiKey) return null;
+    signal?.throwIfAborted();
+
+    const boundedDocuments = documents.slice(0, searchConfig.prefilterLimit).map((document) => ({
+      id: document.id,
+      text: document.text.slice(0, searchConfig.maxDocumentCharacters),
+    }));
+    const digest = createHash("sha256");
+    digest.update(searchConfig.reranker);
+    digest.update("\0");
+    digest.update(query.replace(/\s+/gu, " ").trim().toLocaleLowerCase());
+    for (const document of boundedDocuments) {
+      digest.update("\0");
+      digest.update(document.id);
+      digest.update("\0");
+      digest.update(document.text);
+    }
+    const cacheKey = digest.digest("hex");
+    const now = Date.now();
+    for (const [key, entry] of this.chatSearchCache) {
+      if (entry.expiresAt <= now) this.chatSearchCache.delete(key);
+    }
+    const cached = this.chatSearchCache.get(cacheKey);
+    if (cached) return cached.results.map((result) => ({ ...result }));
+
+    const controller = new AbortController();
+    const abort = () => controller.abort(signal?.reason);
+    signal?.addEventListener("abort", abort, { once: true });
+    const timeout = setTimeout(
+      () => controller.abort(new Error(`Chat rerank timed out after ${searchConfig.requestTimeoutMs}ms.`)),
+      searchConfig.requestTimeoutMs,
+    );
+    timeout.unref();
+    let response: Response;
+    try {
+      response = await fetch(`${config.baseUrl}/rerank`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
+        body: JSON.stringify({
+          model: searchConfig.reranker,
+          query: query.slice(0, 2_000),
+          documents: boundedDocuments.map((document) => document.text),
+          top_n: boundedDocuments.length,
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener("abort", abort);
+    }
+    if (!response.ok) throw new Error(`Chat rerank failed: ${response.status}`);
+    const json = await response.json() as {
+      results?: Array<{ index: number; relevance_score?: number; score?: number }>;
+      usage?: { prompt_tokens?: number; input_tokens?: number; completion_tokens?: number; output_tokens?: number; cost?: number };
+    };
+    const usageEvent: UsageEvent = {
+      id: ulid(), workflowId: "ui:chat-search", runId: "ui:chat-search", agentId: null,
+      model: searchConfig.reranker, harness: null,
+      inputTokens: json.usage?.prompt_tokens ?? json.usage?.input_tokens ?? null,
+      outputTokens: json.usage?.completion_tokens ?? json.usage?.output_tokens ?? null,
+      cacheReadTokens: null,
+      costAmount: typeof json.usage?.cost === "number" ? json.usage.cost : null,
+      currency: "USD",
+      basis: typeof json.usage?.cost === "number" ? "provider-reported" : "unknown",
+      priceSnapshotId: null,
+      recordedAt: nowIso(),
+    };
+    this.store.recordUsage(usageEvent);
+    this.store.appendEvent({
+      type: "ui.utility.usage.recorded", workflowId: usageEvent.workflowId, runId: usageEvent.runId,
+      agentId: null, occurredAt: usageEvent.recordedAt, payload: usageEvent as unknown as JsonValue,
+      provenance: { source: "daemon" },
+    });
+    const seen = new Set<string>();
+    const results = (json.results ?? []).flatMap((result) => {
+      if (!Number.isInteger(result.index)) return [];
+      const document = boundedDocuments[result.index];
+      const score = result.relevance_score ?? result.score;
+      if (!document || typeof score !== "number" || !Number.isFinite(score) || seen.has(document.id)) return [];
+      seen.add(document.id);
+      return [{ id: document.id, score }];
+    });
+    if (results.length === 0) return null;
+    this.chatSearchCache.set(cacheKey, {
+      expiresAt: now + searchConfig.cacheTtlSeconds * 1_000,
+      results: results.map((result) => ({ ...result })),
+    });
+    while (this.chatSearchCache.size > 128) {
+      const oldest = this.chatSearchCache.keys().next().value as string | undefined;
+      if (!oldest) break;
+      this.chatSearchCache.delete(oldest);
+    }
+    return results;
+  }
 }
 
-type QueueEntry = { order: AgentWorkOrder; record: AgentRecord };
+type StartQueueEntry = { kind: "start"; order: AgentWorkOrder; record: AgentRecord };
+
+const FollowUpDispatchSchema = z.object({
+  version: z.literal(1),
+  attemptId: z.string().min(1),
+  agentId: z.string().min(1),
+  content: z.string().min(1),
+  state: z.enum(["queued", "dispatching", "delivered", "settled", "cancelled", "failed", "outcome-unknown"]),
+  receiptId: z.string().nullable(),
+  outcome: z.enum(["completed", "failed", "cancelled"]).optional(),
+  error: z.string().optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+type FollowUpDispatch = z.infer<typeof FollowUpDispatchSchema>;
+
+const SteeringDispatchSchema = z.object({
+  version: z.literal(1),
+  attemptId: z.string().min(1),
+  agentId: z.string().min(1),
+  content: z.string().min(1),
+  state: z.enum(["dispatching", "delivered", "settled", "failed", "outcome-unknown"]),
+  receiptId: z.string().nullable(),
+  queued: z.boolean().nullable(),
+  error: z.string().optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+type SteeringDispatch = z.infer<typeof SteeringDispatchSchema>;
+
+export type AgentMessageAttempt = {
+  kind: "follow-up" | "steering";
+  attemptId: string;
+  agentId: string;
+  state: FollowUpDispatch["state"] | SteeringDispatch["state"];
+  receiptId: string | null;
+  queued: boolean | null;
+  error: string | null;
+};
+type FollowUpQueueEntry = { kind: "follow-up"; dispatch: FollowUpDispatch };
+type QueueEntry = StartQueueEntry | FollowUpQueueEntry;
+
+const SessionRetirementIntentSchema = z.object({
+  version: z.literal(1),
+  agentId: z.string().min(1),
+  driver: z.enum(["codex", "claude", "cursor", "opencode", "pi", "acp"]),
+  nativeSessionId: z.string().min(1),
+  reason: z.string().min(1),
+  state: z.enum(["requested", "retired"]),
+  attempts: z.number().int().nonnegative(),
+  error: z.string().nullable(),
+  requestedAt: z.string(),
+  updatedAt: z.string(),
+  retiredAt: z.string().nullable(),
+});
+type SessionRetirementIntent = z.infer<typeof SessionRetirementIntentSchema>;
+
+type RecoveryDispatch = {
+  attemptId: string;
+  nativeSessionId: string;
+  state: "dispatching" | "delivered" | "failed" | "settled";
+  createdAt: string;
+  updatedAt: string;
+  receiptId?: string;
+  error?: string;
+  outcome?: "completed" | "failed" | "cancelled";
+};
+
+type RecoveryContext = {
+  active: boolean;
+  provisional?: {
+    driver: ReturnType<DriverRegistry["get"]>;
+    session: DriverSession;
+  };
+};
+
+type CancellationAttempt =
+  | { state: "acknowledged" }
+  | { state: "timed-out" }
+  | { state: "failed"; error: string };
+
+type AgentLifecyclePhase = "routing" | "startup" | "recovery" | "retirement";
+
+class AgentLifecycleTimeoutError extends Error {
+  constructor(
+    readonly agentId: string,
+    readonly phase: AgentLifecyclePhase,
+    readonly timeoutMs: number,
+  ) {
+    super(`Agent ${phase} timed out after ${timeoutMs}ms: ${agentId}`);
+    this.name = "AgentLifecycleTimeoutError";
+  }
+}
+
+function recoverySessionState(status: AgentRecord["status"]): DriverSession["state"] {
+  if (["queued", "routing", "starting"].includes(status)) return "starting";
+  if (["running", "cancel-requested"].includes(status)) return "running";
+  return "idle";
+}
+
+function requiresRunContinuity(status: AgentRecord["status"]): boolean {
+  return ["queued", "routing", "starting", "running"].includes(status);
+}
+
+function isReusableDriverSession(session: DriverSession): boolean {
+  return session.metadata.transportReusable !== false;
+}
+
+function isReconnectableHostedDriver(driver: ResolvedHarness): boolean {
+  return driver === "codex" || driver === "claude" || driver === "cursor" || driver === "opencode" || driver === "pi";
+}
 
 export class AgentCoordinator {
   private readonly queue: QueueEntry[] = [];
   private readonly sessions = new Map<string, DriverSession>();
   private readonly terminalResolvers = new Map<string, () => void>();
+  private readonly createInFlight = new Map<string, Promise<AgentRecord>>();
+  private readonly cancelInFlight = new Map<string, Promise<void>>();
+  private readonly sessionRetirements = new Map<string, Promise<void>>();
+  private readonly escalatingCancellation = new Set<string>();
   private readonly ajv = new Ajv({ allErrors: true, strict: false });
   private readonly daemonSecret: string;
+  private readonly daemonOwnerId = ulid();
+  private readonly controllerOwnerId: string;
+  private readonly controllerEpoch: number;
+  private readonly adoptableProcessLeases = new Map<string, WorkerProcessLease>();
+  private readonly processLeaseIds = new Map<string, string>();
+  private acceptingDriverEvents = true;
   private running = 0;
 
   constructor(
@@ -565,9 +847,20 @@ export class AgentCoordinator {
     private readonly router: ModelRouter,
     private readonly observer: PassiveObserver,
     private readonly workspace = new WorkspaceGuard(),
+    private readonly daemonCredential: { secret: string; allowNewCredentials: boolean } = {
+      secret: randomBytes(32).toString("hex"),
+      allowNewCredentials: true,
+    },
   ) {
-    this.daemonSecret = this.store.getMetadata<string>("daemon-secret") ?? randomBytes(32).toString("hex");
-    this.store.setMetadata("daemon-secret", this.daemonSecret);
+    this.daemonSecret = this.daemonCredential.secret;
+    this.controllerOwnerId = createHmac("sha256", this.daemonSecret)
+      .update("worker-host-controller:v1")
+      .digest("hex");
+    const previousEpoch = this.store.getMetadata<number>("worker-host-controller-epoch");
+    this.controllerEpoch = Number.isSafeInteger(previousEpoch) && (previousEpoch as number) >= 0
+      ? (previousEpoch as number) + 1
+      : 1;
+    this.store.setMetadata("worker-host-controller-epoch", this.controllerEpoch);
   }
 
   tokenFor(agentId: string): string {
@@ -575,7 +868,139 @@ export class AgentCoordinator {
   }
 
   authenticate(agentId: string, token: string): boolean {
-    return this.tokenFor(agentId) === token;
+    const expected = Buffer.from(this.tokenFor(agentId), "utf8");
+    const supplied = Buffer.from(token, "utf8");
+    return expected.length === supplied.length && timingSafeEqual(expected, supplied);
+  }
+
+  /**
+   * Reconcile process evidence from a previous daemon generation before any
+   * driver resume can spawn a second local adapter. Reconnectable worker-host
+   * transports are staged for authenticated adoption; direct stdio transports
+   * keep the original fail-closed orphan policy. This method never signals an
+   * old PID.
+   */
+  reconcileWorkerProcesses(
+    inspector: (identity: NonNullable<WorkerProcessLease["identity"]>) => ProcessIdentityInspection = inspectProcessIdentity,
+  ): void {
+    const oldLeases = this.store.listWorkerProcessLeases({ states: ["reserved", "running"] })
+      .filter((lease) => lease.daemonOwnerId !== this.daemonOwnerId);
+    const inspections = new Map<string, ProcessIdentityInspection>();
+    for (const lease of oldLeases) {
+      const hostedTransport = lease.transport.kind === "worker-host" ? lease.transport : null;
+      const inspectedIdentity = hostedTransport?.hostIdentity ?? lease.identity;
+      inspections.set(lease.id, inspectedIdentity
+        ? inspector(inspectedIdentity)
+        : { status: "unverified", identity: null, detail: "The daemon stopped before the spawned process identity was durably attached." });
+    }
+    const hostedCandidatesByAgent = new Map<string, number>();
+    for (const lease of oldLeases) {
+      if (lease.state !== "running" || !isReconnectableHostedDriver(lease.driver) || lease.transport.kind !== "worker-host") continue;
+      if (!lease.nativeSessionId || !lease.transport.hostIdentity) continue;
+      // Exact and unverified identities can both still be live. Never choose
+      // between potentially live claims based on storage iteration order.
+      // Only proved-dead or mismatched historical leases can be excluded.
+      const status = inspections.get(lease.id)?.status;
+      if (status !== "exact" && status !== "unverified") continue;
+      hostedCandidatesByAgent.set(lease.agentId, (hostedCandidatesByAgent.get(lease.agentId) ?? 0) + 1);
+    }
+    for (const lease of oldLeases) {
+      const hostedTransport = lease.transport.kind === "worker-host" ? lease.transport : null;
+      const inspection = inspections.get(lease.id)
+        ?? { status: "unverified" as const, identity: null, detail: "Process inspection evidence was unavailable." };
+      const agent = this.store.getAgent(lease.agentId);
+      const canAdoptHostedProcess = Boolean(
+        hostedTransport
+        && isReconnectableHostedDriver(lease.driver)
+        && lease.state === "running"
+        && lease.nativeSessionId
+        && hostedTransport.hostIdentity
+        && agent
+        && (!isTerminalAgentStatus(agent.status) || agent.status === "completed"),
+      );
+      if (canAdoptHostedProcess && (hostedCandidatesByAgent.get(lease.agentId) ?? 0) > 1) {
+        const error = "Multiple potentially live worker-host leases claim the same agent. Symphony cannot prove which native session is authoritative and will not attach or signal either process.";
+        const transitioned = this.store.transitionWorkerProcessLease(
+          lease.id,
+          ["running"],
+          { state: "unverified", error },
+        );
+        if (transitioned) this.processEvent(transitioned, "supervisor.host.adoption-ambiguous", {
+          error,
+          candidates: hostedCandidatesByAgent.get(lease.agentId) ?? 0,
+          signalAttempted: false,
+        });
+        this.adoptableProcessLeases.delete(lease.agentId);
+        if (agent && !isTerminalAgentStatus(agent.status)) {
+          const interrupted = this.update(agent, { status: "interrupted", error, finishedAt: nowIso() });
+          this.event(interrupted, "agent.interrupted", {
+            error,
+            phase: "process-reconciliation",
+            continuity: "ambiguous-worker-host-leases",
+            signalAttempted: false,
+          });
+        }
+        continue;
+      }
+      if (canAdoptHostedProcess && (inspection.status === "exact" || inspection.status === "unverified")) {
+        this.processEvent(lease, "supervisor.host.adoption-pending", {
+          detail: inspection.detail,
+          previousDaemonOwnerId: lease.daemonOwnerId,
+          hostInstanceId: hostedTransport?.hostInstanceId ?? null,
+          ownerEpoch: hostedTransport?.ownerEpoch ?? null,
+          identityVerification: inspection.status,
+          signalAttempted: false,
+        });
+        const staged = this.store.getWorkerProcessLease(lease.id) ?? lease;
+        this.adoptableProcessLeases.set(lease.agentId, staged);
+        continue;
+      }
+      if (inspection.status === "dead") {
+        const transitioned = this.store.transitionWorkerProcessLease(
+          lease.id,
+          ["reserved", "running"],
+          { state: "exited", releasedAt: nowIso(), error: inspection.detail },
+        );
+        if (transitioned) this.processEvent(transitioned, "supervisor.process.exited", { detail: inspection.detail, reconciliation: true });
+        continue;
+      }
+      const state = inspection.status === "exact"
+        ? "orphaned" as const
+        : inspection.status === "mismatch"
+          ? "identity-mismatch" as const
+          : "unverified" as const;
+      const transitioned = this.store.transitionWorkerProcessLease(
+        lease.id,
+        ["reserved", "running"],
+        { state, error: inspection.detail },
+      );
+      if (!transitioned) continue;
+      const eventType = state === "orphaned"
+        ? "supervisor.orphan.detected"
+        : state === "identity-mismatch"
+          ? "supervisor.identity-mismatch"
+          : "supervisor.identity-unverified";
+      this.processEvent(transitioned, eventType, {
+        detail: inspection.detail,
+        previousDaemonOwnerId: lease.daemonOwnerId,
+        signalAttempted: false,
+      });
+      if (agent && !isTerminalAgentStatus(agent.status)) {
+        const error = state === "orphaned"
+          ? "A strongly verified local adapter from the previous daemon generation is still alive, but its stdio transport is not reconnectable. Symphony will not start a duplicate adapter."
+          : state === "identity-mismatch"
+            ? "The previous adapter PID now has a different birth identity. Symphony did not signal it and will not resume this work automatically."
+            : "The previous adapter process identity cannot be verified strongly enough for safe recovery. Symphony did not signal it and will not resume this work automatically.";
+        const interrupted = this.update(agent, { status: "interrupted", error, finishedAt: nowIso() });
+        this.event(interrupted, "agent.interrupted", {
+          error,
+          phase: "process-reconciliation",
+          processLeaseId: lease.id,
+          processState: state,
+          signalAttempted: false,
+        });
+      }
+    }
   }
 
   async create(input: unknown): Promise<AgentRecord> {
@@ -589,6 +1014,35 @@ export class AgentCoordinator {
       id: requested.id ?? ulid(),
       permissions: parent ? resolveChildPermission(parent.permissions, requested.permissions) : requested.permissions,
     });
+    if (requested.id) {
+      const existing = this.existingAgentForOrder(order);
+      if (existing) return existing;
+      const inFlight = this.createInFlight.get(requested.id);
+      if (inFlight) return await inFlight;
+      const creating = this.createNewAgent(order).finally(() => this.createInFlight.delete(requested.id as string));
+      this.createInFlight.set(requested.id, creating);
+      return await creating;
+    }
+    return await this.createNewAgent(order);
+  }
+
+  private existingAgentForOrder(order: AgentWorkOrder): AgentRecord | null {
+    const logicalAgentId = order.id as string;
+    const existing = this.store.getAgentByLogicalAgentId(logicalAgentId);
+    if (!existing) return null;
+    const raw = this.store.getMetadata<JsonValue>(`work-order:${existing.id}`);
+    if (!raw) throw new Error(`Logical agent id ${logicalAgentId} already exists but its work order is unavailable.`);
+    const previousOrder = AgentWorkOrderSchema.parse(raw);
+    if (JSON.stringify(previousOrder) !== JSON.stringify(order)) {
+      throw new Error(`Logical agent id ${logicalAgentId} is already bound to a different work order.`);
+    }
+    return existing;
+  }
+
+  private async createNewAgent(order: AgentWorkOrder): Promise<AgentRecord> {
+    if (!this.daemonCredential.allowNewCredentials) {
+      throw new Error("Symphony is preserving legacy daemon credentials for retained work and cannot create new agents until the external credential is reconciled.");
+    }
     await this.workspace.verify(order);
     const id = ulid();
     const now = nowIso();
@@ -600,10 +1054,12 @@ export class AgentCoordinator {
       workspacePath: resolve(order.workspace.path), output: null, error: null,
       createdAt: now, updatedAt: now, startedAt: null, finishedAt: null,
     };
-    this.store.saveAgent(record);
-    this.store.setMetadata(`work-order:${id}`, order as unknown as JsonValue);
-    this.event(record, "agent.queued", { objective: order.objective, parentAgentId: order.parentAgentId });
-    this.queue.push({ order, record });
+    this.store.durableTransaction(() => {
+      this.store.saveAgent(record);
+      this.store.setMetadata(`work-order:${id}`, order as unknown as JsonValue);
+      this.event(record, "agent.queued", { objective: order.objective, parentAgentId: order.parentAgentId });
+    });
+    this.queue.push({ kind: "start", order, record });
     this.drain();
     return record;
   }
@@ -619,26 +1075,460 @@ export class AgentCoordinator {
   }
 
   hasSession(agentId: string): boolean {
-    return this.sessions.has(agentId);
+    const session = this.sessions.get(agentId);
+    return Boolean(session && isReusableDriverSession(session));
   }
 
-  async message(agentId: string, content: string): Promise<{ receiptId: string; queued: boolean }> {
+  retireReusableSession(agentId: string, reason: string): boolean {
+    if (!this.prepareReusableSessionRetirement(agentId, reason)) return false;
+    this.continueReusableSessionRetirement(agentId);
+    return true;
+  }
+
+  prepareReusableSessionRetirement(agentId: string, reason: string): boolean {
+    const agent = this.store.getAgent(agentId);
+    const session = this.sessions.get(agentId);
+    if (!agent || !agent.harness || !session || !["completed", "idle"].includes(agent.status)) return false;
+    const existing = this.sessionRetirementIntent(agentId);
+    if (existing?.state === "retired") return true;
+    if (existing && (
+      existing.driver !== agent.harness
+      || existing.nativeSessionId !== session.nativeSessionId
+    )) {
+      throw new Error(`Agent ${agentId} already has a retirement intent for a different native session.`);
+    }
+    if (!existing) {
+      const timestamp = nowIso();
+      const intent = SessionRetirementIntentSchema.parse({
+        version: 1,
+        agentId,
+        driver: agent.harness,
+        nativeSessionId: session.nativeSessionId,
+        reason,
+        state: "requested",
+        attempts: 0,
+        error: null,
+        requestedAt: timestamp,
+        updatedAt: timestamp,
+        retiredAt: null,
+      });
+      // This composes with the chat thread transaction. The durable intent and
+      // the conductor pointer therefore cross the commit boundary together;
+      // the asynchronous native close cannot begin until the stack unwinds.
+      this.store.durableTransaction(() => {
+        this.store.setMetadata(this.sessionRetirementKey(agentId), intent as unknown as JsonValue);
+        this.event(agent, "agent.session.retirement-requested", {
+          reason,
+          nativeSessionId: session.nativeSessionId,
+        });
+      });
+    }
+    return true;
+  }
+
+  continueReusableSessionRetirement(agentId: string): boolean {
+    const intent = this.sessionRetirementIntent(agentId);
+    if (!intent) return false;
+    if (intent.state === "retired") {
+      this.sessions.delete(agentId);
+      return true;
+    }
+    const session = this.sessions.get(agentId);
+    if (!session || session.driver !== intent.driver || session.nativeSessionId !== intent.nativeSessionId) return false;
+    void this.retireSession(agentId, this.drivers.get(intent.driver), session);
+    return true;
+  }
+
+  quiesce(): void {
+    this.acceptingDriverEvents = false;
+  }
+
+  async message(
+    agentId: string,
+    content: string,
+    options: { attemptId?: string } = {},
+  ): Promise<{ receiptId: string; queued: boolean; terminalBoundary?: boolean }> {
     const agent = this.get(agentId);
     const session = this.sessions.get(agentId);
     if (!session || !agent.harness) throw new Error(`Agent has no active native session: ${agentId}`);
-    const result = await this.drivers.get(agent.harness).sendMessage(session, content);
-    this.update(agent, { status: "running", finishedAt: null, error: null });
-    this.store.addAgentMessage({ agentId, direction: "to-agent", content, receiptId: result.receiptId, deliveryState: result.queued ? "queued" : "delivered" });
-    this.event(agent, "agent.message.sent", { content, ...result });
-    return result;
+    if (agent.status === "cancel-requested") throw new Error(`Agent cancellation is already in progress: ${agentId}`);
+    if (["failed", "cancelled", "interrupted", "lost"].includes(agent.status)) {
+      throw new Error(`Agent native session cannot accept another turn after ${agent.status}: ${agentId}`);
+    }
+
+    // A message sent while a native turn is already running is steering for
+    // that supervised turn. It uses the slot already held by that turn rather
+    // than acquiring a second slot for the same native work.
+    if (agent.status === "running") return await this.steerRunningAgent(agent, agent.harness, session, content, options.attemptId);
+
+    return this.queueFollowUp(this.get(agentId), content, options.attemptId);
+  }
+
+  messageAttempt(agentId: string, attemptId: string): AgentMessageAttempt | null {
+    const followUp = this.followUpDispatch(agentId);
+    if (followUp?.attemptId === attemptId) {
+      return {
+        kind: "follow-up",
+        attemptId,
+        agentId,
+        state: followUp.state,
+        receiptId: followUp.receiptId,
+        queued: true,
+        error: followUp.error ?? null,
+      };
+    }
+    const steering = this.steeringDispatch(agentId, attemptId);
+    if (!steering) return null;
+    return {
+      kind: "steering",
+      attemptId,
+      agentId,
+      state: steering.state,
+      receiptId: steering.receiptId,
+      queued: steering.queued,
+      error: steering.error ?? null,
+    };
+  }
+
+  private queueFollowUp(agent: AgentRecord, content: string, attemptId = ulid()): { receiptId: string; queued: boolean } {
+    const agentId = agent.id;
+    const previousFollowUp = this.followUpDispatch(agentId);
+    if (previousFollowUp?.attemptId === attemptId) {
+      if (["queued", "dispatching", "delivered", "settled"].includes(previousFollowUp.state)) {
+        return { receiptId: previousFollowUp.receiptId ?? attemptId, queued: previousFollowUp.state === "queued" };
+      }
+      throw new Error(`Agent follow-up ${attemptId} already ended with ${previousFollowUp.state}: ${previousFollowUp.error ?? "no additional detail"}`);
+    }
+    if (previousFollowUp && ["queued", "dispatching", "delivered"].includes(previousFollowUp.state)) {
+      throw new Error(`Agent already has a follow-up turn in progress: ${agentId}`);
+    }
+
+    const now = nowIso();
+    const dispatch = FollowUpDispatchSchema.parse({
+      version: 1,
+      attemptId,
+      agentId,
+      content,
+      state: "queued",
+      receiptId: null,
+      createdAt: now,
+      updatedAt: now,
+    });
+    this.store.durableTransaction(() => {
+      const updated = this.update(agent, { status: "waiting", output: null, error: null, finishedAt: null });
+      this.store.setMetadata(this.followUpKey(agentId), dispatch as unknown as JsonValue);
+      this.store.addAgentMessage({
+        agentId,
+        direction: "to-agent",
+        content,
+        receiptId: dispatch.attemptId,
+        deliveryState: "queued",
+      });
+      this.event(updated, "agent.message.queued", {
+        content,
+        receiptId: dispatch.attemptId,
+        scheduler: "bounded",
+      });
+      return updated;
+    });
+    this.queue.push({ kind: "follow-up", dispatch });
+    this.drain();
+    return { receiptId: dispatch.attemptId, queued: true };
+  }
+
+  private async steerRunningAgent(
+    agent: AgentRecord,
+    harness: ResolvedHarness,
+    session: DriverSession,
+    content: string,
+    attemptId?: string,
+  ): Promise<{ receiptId: string; queued: boolean; terminalBoundary?: boolean }> {
+    const durableAttemptId = attemptId ?? ulid();
+    const existing = this.steeringDispatch(agent.id, durableAttemptId);
+    if (existing) {
+      if (existing.content !== content) {
+        throw new Error(`Agent steering attempt ${durableAttemptId} is already bound to different content.`);
+      }
+      if (["delivered", "settled"].includes(existing.state) && existing.receiptId !== null && existing.queued !== null) {
+        return { receiptId: existing.receiptId, queued: existing.queued };
+      }
+      throw new Error(`Agent steering attempt ${durableAttemptId} already ended with ${existing.state}: ${existing.error ?? "delivery has not been proven"}`);
+    }
+    const timestamp = nowIso();
+    const dispatching = SteeringDispatchSchema.parse({
+      version: 1,
+      attemptId: durableAttemptId,
+      agentId: agent.id,
+      content,
+      state: "dispatching",
+      receiptId: null,
+      queued: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    this.store.durableTransaction(() => {
+      this.store.setMetadata(this.steeringKey(agent.id, durableAttemptId), dispatching as unknown as JsonValue);
+      this.event(agent, "agent.message.dispatching", {
+        content,
+        receiptId: durableAttemptId,
+        scheduler: "active-turn-steering",
+        steering: true,
+      });
+    });
+    try {
+      const result = await this.drivers.get(harness).sendMessage(session, content);
+      if (result.terminalBoundary) {
+        const latest = this.get(agent.id);
+        if (latest.status === "completed" || latest.status === "waiting") {
+          const queued = this.queueFollowUp(latest, content, durableAttemptId);
+          this.store.setMetadata(this.steeringKey(agent.id, durableAttemptId), {
+            ...dispatching,
+            state: "settled",
+            receiptId: result.receiptId,
+            queued: true,
+            updatedAt: nowIso(),
+          } as unknown as JsonValue);
+          return queued;
+        }
+        throw new Error(`Native session crossed a terminal result boundary with status ${latest.status}; the message was not dispatched.`);
+      }
+      const updatedSession = this.applyMessageSessionUpdate(agent.id, session, result.session);
+      this.store.durableTransaction(() => {
+        this.store.setMetadata(this.steeringKey(agent.id, durableAttemptId), {
+          ...dispatching,
+          state: "delivered",
+          receiptId: result.receiptId,
+          queued: result.queued,
+          updatedAt: nowIso(),
+        } as unknown as JsonValue);
+        this.store.addAgentMessage({
+          agentId: agent.id,
+          direction: "to-agent",
+          content,
+          receiptId: durableAttemptId,
+          deliveryState: result.queued ? "queued" : "delivered",
+        });
+        this.event(this.get(agent.id), "agent.message.sent", {
+          content,
+          receiptId: durableAttemptId,
+          nativeReceiptId: result.receiptId,
+          queued: result.queued,
+          steering: true,
+          nativeSessionId: updatedSession.nativeSessionId,
+          nativeRunId: updatedSession.nativeRunId,
+        });
+      });
+      // Native session metadata is an internal durability checkpoint, not part
+      // of the public agent-message receipt returned by daemon APIs.
+      return { receiptId: result.receiptId, queued: result.queued };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const deliveryError = `Native steering delivery could not be proven: ${message}`;
+      // Steering is subordinate to the already-supervised native turn. A
+      // rejected or transport-ambiguous steering RPC is not terminal evidence
+      // for that turn: the harness may still be working and remains the only
+      // authority that can settle the agent. Preserve its session and running
+      // state while failing closed on replay of this specific attempt.
+      this.store.durableTransaction(() => {
+        this.store.setMetadata(this.steeringKey(agent.id, durableAttemptId), {
+          ...dispatching,
+          state: "outcome-unknown",
+          error: deliveryError,
+          updatedAt: nowIso(),
+        } as unknown as JsonValue);
+        this.event(this.get(agent.id), "agent.message.delivery-unknown", {
+          error: deliveryError,
+          receiptId: durableAttemptId,
+          steering: true,
+          nativeSessionId: session.nativeSessionId,
+          nativeRunId: session.nativeRunId,
+        });
+      });
+      throw error;
+    }
   }
 
   async cancel(agentId: string): Promise<void> {
+    const existingCancellation = this.cancelInFlight.get(agentId);
+    if (existingCancellation) return await existingCancellation;
     const agent = this.get(agentId);
+    if (isTerminalAgentStatus(agent.status)) return;
     const session = this.sessions.get(agentId);
-    if (!session || !agent.harness) return;
-    this.update(agent, { status: "cancel-requested" });
-    await this.drivers.get(agent.harness).cancel(session);
+    const pending = this.update(agent, { status: "cancel-requested" });
+    this.event(pending, "agent.cancel.requested", {
+      nativeSessionId: pending.nativeSessionId,
+      previousStatus: agent.status,
+    });
+    const queuedFollowUpIndex = this.queue.findIndex(
+      (entry) => entry.kind === "follow-up" && entry.dispatch.agentId === agentId,
+    );
+    if (queuedFollowUpIndex >= 0) {
+      const [entry] = this.queue.splice(queuedFollowUpIndex, 1);
+      if (entry?.kind === "follow-up") {
+        this.store.setMetadata(this.followUpKey(agentId), {
+          ...entry.dispatch,
+          state: "cancelled",
+          outcome: "cancelled",
+          updatedAt: nowIso(),
+        } as unknown as JsonValue);
+      }
+      const cancelled = this.update(pending, { status: "cancelled", finishedAt: nowIso() });
+      this.event(cancelled, "agent.cancelled", { phase: "before-follow-up-dispatch" });
+      this.drain();
+      return;
+    }
+    if (!session || !agent.harness) {
+      if (agent.status === "queued") {
+        const queueIndex = this.queue.findIndex((entry) => entry.kind === "start" && entry.record.id === agentId);
+        if (queueIndex >= 0) this.queue.splice(queueIndex, 1);
+        const cancelled = this.update(pending, { status: "cancelled", finishedAt: nowIso() });
+        this.event(cancelled, "agent.cancelled", { phase: "before-native-dispatch" });
+      } else if (!["routing", "starting"].includes(agent.status)) {
+        const cancelled = this.update(pending, { status: "cancelled", finishedAt: nowIso() });
+        this.event(cancelled, "agent.cancelled", { phase: "before-native-session" });
+        this.resolveTerminal(agentId);
+      }
+      return;
+    }
+    const cancellation = this.cancelNativeSession(agentId, this.drivers.get(agent.harness), session, "user-requested")
+      .finally(() => {
+        if (this.cancelInFlight.get(agentId) === cancellation) this.cancelInFlight.delete(agentId);
+      });
+    this.cancelInFlight.set(agentId, cancellation);
+    await cancellation;
+  }
+
+  private async cancelNativeSession(
+    agentId: string,
+    driver: ReturnType<DriverRegistry["get"]>,
+    session: DriverSession,
+    phase: "user-requested" | "late-native-start" | "recovery",
+    isActive: () => boolean = () => true,
+  ): Promise<void> {
+    const acknowledgementTimeoutMs = this.loaded.config.agents.cancellationAcknowledgementTimeoutMs ?? 3_000;
+    const terminationGraceMs = this.loaded.config.agents.cancellationTerminationGraceMs ?? 5_000;
+    const acknowledgementWatch = this.watchAgentTerminal(agentId);
+    let acknowledgement: CancellationAttempt;
+    try {
+      const first = await Promise.race([
+        this.settleCancellationAttempt(driver.cancel(session), acknowledgementTimeoutMs)
+          .then((result) => ({ kind: "acknowledgement" as const, result })),
+        acknowledgementWatch.promise.then(() => ({ kind: "terminal" as const })),
+      ]);
+      if (first.kind === "terminal") return;
+      acknowledgement = first.result;
+      if (!isActive() || isTerminalAgentStatus(this.get(agentId).status)) return;
+      if (acknowledgement.state === "acknowledged") {
+        const confirmed = await this.waitForTerminalWithin(acknowledgementWatch.promise, terminationGraceMs);
+        if (confirmed || !isActive() || isTerminalAgentStatus(this.get(agentId).status)) return;
+      }
+    } finally {
+      acknowledgementWatch.dispose();
+    }
+
+    if (!isActive() || isTerminalAgentStatus(this.get(agentId).status)) return;
+    this.escalatingCancellation.add(agentId);
+    const escalationReason = acknowledgement.state === "acknowledged"
+      ? "termination-unconfirmed"
+      : acknowledgement.state === "timed-out"
+        ? "acknowledgement-timeout"
+        : "acknowledgement-failed";
+    this.event(this.get(agentId), "agent.cancel.escalated", {
+      phase,
+      reason: escalationReason,
+      acknowledgement: acknowledgement.state,
+      acknowledgementTimeoutMs,
+      terminationGraceMs,
+      nativeSessionId: session.nativeSessionId,
+      ...(acknowledgement.state === "failed" ? { error: acknowledgement.error } : {}),
+    });
+
+    const terminationWatch = this.watchAgentTerminal(agentId);
+    let forceTermination: CancellationAttempt = { state: "failed", error: "Driver does not expose per-session force termination." };
+    try {
+      if (driver.forceTerminate) {
+        void this.settleCancellationAttempt(driver.forceTerminate(session), terminationGraceMs)
+          .then((result) => { forceTermination = result; });
+      }
+      const confirmed = await this.waitForTerminalWithin(terminationWatch.promise, terminationGraceMs);
+      if (confirmed || !isActive() || isTerminalAgentStatus(this.get(agentId).status)) return;
+    } finally {
+      terminationWatch.dispose();
+      this.escalatingCancellation.delete(agentId);
+    }
+
+    const latest = this.get(agentId);
+    if (isTerminalAgentStatus(latest.status)) return;
+    const error = [
+      `Cancellation could not be confirmed by the native ${latest.harness ?? session.driver} session.`,
+      `Acknowledgement: ${acknowledgement.state}.`,
+      `Force termination: ${forceTermination.state}.`,
+      "Symphony released the scheduler slot without claiming that the native run was cancelled.",
+    ].join(" ");
+    const interrupted = this.update(latest, { status: "interrupted", error, finishedAt: nowIso() });
+    this.sessions.delete(agentId);
+    this.resolveTerminal(agentId);
+    this.event(interrupted, "agent.interrupted", {
+      error,
+      phase: "cancellation",
+      cancellationPhase: phase,
+      continuity: "native-cancellation-unconfirmed",
+      acknowledgement: acknowledgement.state,
+      forceTermination: forceTermination.state,
+      acknowledgementTimeoutMs,
+      terminationGraceMs,
+      nativeSessionId: session.nativeSessionId,
+      ...(forceTermination.state === "failed" ? { forceTerminationError: forceTermination.error } : {}),
+    });
+  }
+
+  private async settleCancellationAttempt(operation: Promise<void>, timeoutMs: number): Promise<CancellationAttempt> {
+    return await new Promise<CancellationAttempt>((resolvePromise) => {
+      let settled = false;
+      const finish = (result: CancellationAttempt) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolvePromise(result);
+      };
+      const timer = setTimeout(() => finish({ state: "timed-out" }), timeoutMs);
+      void operation.then(
+        () => finish({ state: "acknowledged" }),
+        (error: unknown) => finish({ state: "failed", error: error instanceof Error ? error.message : String(error) }),
+      );
+    });
+  }
+
+  private async waitForTerminalWithin(terminal: Promise<void>, timeoutMs: number): Promise<boolean> {
+    return await new Promise<boolean>((resolvePromise) => {
+      let settled = false;
+      const finish = (confirmed: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolvePromise(confirmed);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      void terminal.then(() => finish(true));
+    });
+  }
+
+  private watchAgentTerminal(agentId: string): { promise: Promise<void>; dispose: () => void } {
+    let settled = false;
+    let stop: () => void = () => undefined;
+    let resolveTerminal!: () => void;
+    const promise = new Promise<void>((resolvePromise) => { resolveTerminal = resolvePromise; });
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      stop();
+      resolveTerminal();
+    };
+    stop = this.store.onEvent((event) => {
+      if (event.agentId === agentId && isTerminalAgentStatus(this.get(agentId).status)) finish();
+    });
+    if (isTerminalAgentStatus(this.get(agentId).status)) finish();
+    return { promise, dispose: () => { if (!settled) { settled = true; stop(); } } };
   }
 
   observe(agentId: string, level: ObservationLevel): Promise<Observation> {
@@ -646,29 +1536,892 @@ export class AgentCoordinator {
   }
 
   async recover(): Promise<void> {
-    for (const agent of this.store.listAgents({ activeOnly: true })) {
-      if (!agent.harness || !agent.nativeSessionId) {
-        this.update(agent, { status: "lost", error: "Daemon restarted before a native session was recorded.", finishedAt: nowIso() });
+    this.failClosedUnknownFollowUpDispatches();
+    this.failClosedUnknownSteeringDispatches();
+    const retirementIntents = this.pendingSessionRetirementIntents();
+    const agents: AgentRecord[] = [];
+    let pageCursor: AgentListCursor | undefined;
+    do {
+      const page = this.store.listAgentPage({
+        activeOnly: true,
+        limit: 250,
+        ...(pageCursor ? { cursor: pageCursor } : {}),
+      });
+      agents.push(...page.agents);
+      pageCursor = page.nextCursor ?? undefined;
+    } while (pageCursor);
+    const activeIds = new Set(agents.map((agent) => agent.id));
+    for (const agentId of this.adoptableProcessLeases.keys()) {
+      if (activeIds.has(agentId)) continue;
+      const retained = this.store.getAgent(agentId);
+      if (retained?.status === "completed") {
+        agents.push(retained);
+        activeIds.add(agentId);
+      }
+    }
+    for (const intent of retirementIntents) {
+      if (activeIds.has(intent.agentId)) continue;
+      const retained = this.store.getAgent(intent.agentId);
+      if (!retained) continue;
+      agents.push(retained);
+      activeIds.add(intent.agentId);
+    }
+    const concurrency = Math.min(
+      this.loaded.config.agents.recoveryConcurrency ?? 4,
+      Math.max(agents.length, 1),
+    );
+    let cursor = 0;
+    await Promise.all(Array.from({ length: concurrency }, async () => {
+      while (cursor < agents.length) {
+        const agent = agents[cursor] as AgentRecord;
+        cursor += 1;
+        await this.recoverAgentWithinDeadline(agent);
+      }
+    }));
+    await Promise.all(retirementIntents.map(async (intent) => {
+      const current = this.sessionRetirementIntent(intent.agentId);
+      if (!current || current.state !== "requested") return;
+      const session = this.sessions.get(intent.agentId);
+      if (!session) {
+        this.recordSessionRetirementFailure(
+          current,
+          "The daemon recovered the retirement request but could not reattach its exact native session. The request remains pending and Symphony will not report the session as retired.",
+          "retirement-recovery",
+        );
+        return;
+      }
+      if (session.driver !== current.driver || session.nativeSessionId !== current.nativeSessionId) {
+        this.recordSessionRetirementFailure(
+          current,
+          "The recovered native session identity does not match the durable retirement request. Symphony refused to terminate an unproven session.",
+          "retirement-recovery",
+        );
+        return;
+      }
+      const timeoutMs = this.loaded.config.agents.recoveryTimeoutMs ?? 30_000;
+      try {
+        await this.withLifecycleDeadline(
+          intent.agentId,
+          "retirement",
+          timeoutMs,
+          () => this.retireSession(intent.agentId, this.drivers.get(current.driver), session),
+        );
+      } catch (error) {
+        const latestIntent = this.sessionRetirementIntent(intent.agentId) ?? current;
+        const message = error instanceof AgentLifecycleTimeoutError
+          ? `Native-session retirement timed out after ${timeoutMs}ms during recovery. The exact retirement request remains pending and will be retried after a later daemon restart.`
+          : error instanceof Error ? error.message : String(error);
+        this.recordSessionRetirementFailure(latestIntent, message, "retirement-recovery");
+      }
+    }));
+    this.restoreQueuedFollowUps();
+    this.drain();
+  }
+
+  private failClosedUnknownFollowUpDispatches(): void {
+    for (const entry of this.store.listMetadata<JsonValue>("agent-follow-up:")) {
+      const parsed = FollowUpDispatchSchema.safeParse(entry.value);
+      if (!parsed.success || parsed.data.state !== "dispatching") continue;
+      const dispatch = parsed.data;
+      const retainedLease = this.adoptableProcessLeases.get(dispatch.agentId);
+      if (retainedLease?.state === "running" && retainedLease.transport.kind === "worker-host") {
+        // A verified retained host may already own the next native turn even
+        // when the previous daemon died before projecting its delivery
+        // receipt. Preserve the dispatch ledger until resume/spool replay can
+        // fence it by native run identity. Idle recovery still fails closed in
+        // continueRecoveredRun; this branch never resends work by itself.
         continue;
+      }
+      const agent = this.store.getAgent(dispatch.agentId);
+      if (agent && isTerminalAgentStatus(agent.status)) {
+        this.store.setMetadata(entry.key, {
+          ...dispatch,
+          state: "settled",
+          outcome: agent.status === "completed" ? "completed" : agent.status === "cancelled" ? "cancelled" : "failed",
+          updatedAt: nowIso(),
+        } as unknown as JsonValue);
+        continue;
+      }
+      const error = "The daemon stopped while a follow-up message was being handed to the native session. Its delivery outcome is unknown, so Symphony will not send it again automatically.";
+      this.store.durableTransaction(() => {
+        this.store.setMetadata(entry.key, {
+          ...dispatch,
+          state: "outcome-unknown",
+          error,
+          updatedAt: nowIso(),
+        } as unknown as JsonValue);
+        if (agent && !isTerminalAgentStatus(agent.status)) {
+          const interrupted = this.update(agent, { status: "interrupted", error, finishedAt: nowIso() });
+          this.event(interrupted, "agent.interrupted", {
+            error,
+            phase: "follow-up-recovery",
+            deliveryState: "unknown",
+            receiptId: dispatch.attemptId,
+          });
+        }
+      });
+    }
+  }
+
+  private failClosedUnknownSteeringDispatches(): void {
+    for (const entry of this.store.listMetadata<JsonValue>("agent-steering:")) {
+      const parsed = SteeringDispatchSchema.safeParse(entry.value);
+      if (!parsed.success || parsed.data.state !== "dispatching") continue;
+      this.store.setMetadata(entry.key, {
+        ...parsed.data,
+        state: "outcome-unknown",
+        error: "The daemon restarted before native steering delivery was acknowledged. Symphony will not replay the instruction automatically.",
+        updatedAt: nowIso(),
+      } as unknown as JsonValue);
+    }
+  }
+
+  private restoreQueuedFollowUps(): void {
+    for (const entry of this.store.listMetadata<JsonValue>("agent-follow-up:")) {
+      const parsed = FollowUpDispatchSchema.safeParse(entry.value);
+      if (!parsed.success || parsed.data.state !== "queued") continue;
+      const dispatch = parsed.data;
+      if (this.queue.some((queued) => queued.kind === "follow-up" && queued.dispatch.attemptId === dispatch.attemptId)) continue;
+      const agent = this.store.getAgent(dispatch.agentId);
+      if (!agent || !agent.harness || !this.sessions.has(dispatch.agentId) || isTerminalAgentStatus(agent.status)) {
+        const error = "The queued follow-up could not be restored because its retained native session is unavailable.";
+        this.store.setMetadata(entry.key, {
+          ...dispatch,
+          state: "failed",
+          error,
+          updatedAt: nowIso(),
+        } as unknown as JsonValue);
+        if (agent && !isTerminalAgentStatus(agent.status)) {
+          const interrupted = this.update(agent, { status: "interrupted", error, finishedAt: nowIso() });
+          this.event(interrupted, "agent.interrupted", { error, phase: "follow-up-recovery" });
+        }
+        continue;
+      }
+      if (agent.status !== "waiting") this.update(agent, { status: "waiting", error: null, finishedAt: null });
+      this.queue.push({ kind: "follow-up", dispatch });
+      this.event(this.get(agent.id), "agent.message.queue.recovered", {
+        receiptId: dispatch.attemptId,
+        continuity: "durable-follow-up-restored",
+      });
+    }
+  }
+
+  private async recoverAgentWithinDeadline(agent: AgentRecord): Promise<void> {
+    const timeoutMs = this.loaded.config.agents.recoveryTimeoutMs ?? 30_000;
+    const context: RecoveryContext = { active: true };
+    try {
+      await this.withLifecycleDeadline(
+        agent.id,
+        "recovery",
+        timeoutMs,
+        (signal) => this.recoverAgent(agent, context, signal),
+        {
+          onTimeout: () => {
+            context.active = false;
+            const provisional = context.provisional;
+            if (provisional?.driver.detach) {
+              void provisional.driver.detach(provisional.session).catch(() => undefined);
+            } else if (provisional?.driver.forceTerminate) {
+              void provisional.driver.forceTerminate(provisional.session).catch(() => undefined);
+            }
+          },
+        },
+      );
+    } catch (error) {
+      context.active = false;
+      const latest = this.get(agent.id);
+      if (isTerminalAgentStatus(latest.status)) {
+        this.sessions.delete(agent.id);
+        this.event(latest, "agent.session.recovery-failed", {
+          error: error instanceof Error ? error.message : String(error),
+          phase: "recovery",
+          previousStatus: agent.status,
+          continuity: "retained-session-unavailable",
+        });
+        return;
+      }
+      const timedOut = error instanceof AgentLifecycleTimeoutError && error.phase === "recovery";
+      const message = timedOut
+        ? `Recovery timed out after ${timeoutMs}ms while reconciling the ${agent.harness ?? "native"} session. Its outcome is unknown, so Symphony released daemon startup without retrying the work automatically.`
+        : `Resume failed: ${error instanceof Error ? error.message : String(error)}`;
+      const failed = this.update(latest, {
+        status: timedOut ? "interrupted" : "lost",
+        error: message,
+        finishedAt: nowIso(),
+      });
+      this.sessions.delete(agent.id);
+      this.resolveTerminal(agent.id);
+      this.event(failed, timedOut ? "agent.interrupted" : "agent.failed", {
+        error: message,
+        phase: "recovery",
+        previousStatus: agent.status,
+        continuity: timedOut ? "recovery-timeout" : "resume-failed",
+        ...(timedOut ? { timeoutMs } : {}),
+      });
+    }
+  }
+
+  private async recoverAgent(agent: AgentRecord, context: RecoveryContext, signal: AbortSignal): Promise<void> {
+      if (["queued", "routing"].includes(agent.status)) {
+        const raw = this.store.getMetadata<JsonValue>(`work-order:${agent.id}`);
+        if (!raw) {
+          const lost = this.update(agent, { status: "lost", error: "Persisted work order is missing.", finishedAt: nowIso() });
+          this.event(lost, "agent.failed", { error: lost.error ?? "Persisted work order is missing.", phase: "recovery" });
+          return;
+        }
+        const order = AgentWorkOrderSchema.parse(raw);
+        const queued = this.update(agent, {
+          status: "queued",
+          harness: null,
+          model: null,
+          nativeSessionId: null,
+          nativeRunId: null,
+          error: null,
+          startedAt: null,
+          finishedAt: null,
+        });
+        this.queue.push({ kind: "start", order, record: queued });
+        this.event(queued, "agent.recovered", {
+          previousStatus: agent.status,
+          recoveredStatus: queued.status,
+          continuity: "durable-queue-restored",
+        });
+        return;
+      }
+      const retainedLease = this.adoptableProcessLeases.get(agent.id);
+      if (agent.harness && !agent.nativeSessionId && retainedLease?.nativeSessionId) {
+        agent = this.update(agent, {
+          nativeSessionId: retainedLease.nativeSessionId,
+          nativeRunId: retainedLease.nativeRunId ?? retainedLease.activeTurnId,
+        });
+        this.event(agent, "agent.session.hydrated", {
+          processLeaseId: retainedLease.id,
+          nativeSessionId: retainedLease.nativeSessionId,
+          nativeRunId: retainedLease.nativeRunId ?? retainedLease.activeTurnId,
+          previousStatus: agent.status,
+          continuity: "lease-authoritative-native-identity",
+        });
+      }
+      if (!agent.harness || !agent.nativeSessionId) {
+        const message = agent.status === "starting"
+          ? "The daemon stopped while the native start request was in flight. Its outcome is unknown, so Symphony will not dispatch the work order again automatically."
+          : "Daemon restarted before a native session was recorded.";
+        const lost = this.update(agent, {
+          status: agent.status === "starting" ? "interrupted" : "lost",
+          error: message,
+          finishedAt: nowIso(),
+        });
+        this.event(lost, agent.status === "starting" ? "agent.interrupted" : "agent.failed", {
+          error: message,
+          phase: "recovery",
+          previousStatus: agent.status,
+          continuity: agent.status === "starting" ? "native-start-outcome-unknown" : "native-session-missing",
+        });
+        return;
       }
       const raw = this.store.getMetadata<JsonValue>(`work-order:${agent.id}`);
       if (!raw) {
-        this.update(agent, { status: "lost", error: "Persisted work order is missing.", finishedAt: nowIso() });
-        continue;
+        const lost = this.update(agent, { status: "lost", error: "Persisted work order is missing.", finishedAt: nowIso() });
+        this.event(lost, "agent.failed", { error: lost.error ?? "Persisted work order is missing.", phase: "recovery" });
+        return;
       }
       const order = AgentWorkOrderSchema.parse(raw);
       const driver = this.drivers.get(agent.harness);
       try {
-        const session = await driver.resume({
-          driver: agent.harness, nativeSessionId: agent.nativeSessionId, nativeRunId: agent.nativeRunId,
-          state: "idle", startedAt: agent.startedAt ?? agent.createdAt, metadata: { agentId: agent.id },
-        }, this.startRequest(agent.id, order, agent.model ?? "auto"), (event) => this.onDriverEvent(agent.id, event));
-        this.sessions.set(agent.id, session);
-        this.update(agent, { status: "idle" });
+        const queuedFollowUp = this.followUpDispatch(agent.id);
+        let restoringQueuedFollowUp = queuedFollowUp?.state === "queued";
+        const persistedSession = DriverSessionSchema.safeParse(
+          this.store.getMetadata<JsonValue>(`driver-session:${agent.id}`),
+        );
+        const recoverySessionBase = persistedSession.success
+          && persistedSession.data.driver === agent.harness
+          && persistedSession.data.nativeSessionId === agent.nativeSessionId
+          ? {
+              ...persistedSession.data,
+              nativeRunId: agent.nativeRunId ?? persistedSession.data.nativeRunId,
+              state: recoverySessionState(agent.status),
+            }
+          : {
+              driver: agent.harness,
+              nativeSessionId: agent.nativeSessionId,
+              nativeRunId: agent.nativeRunId,
+              state: recoverySessionState(agent.status),
+              startedAt: agent.startedAt ?? agent.createdAt,
+              metadata: { agentId: agent.id },
+            };
+        const retainedActiveToolIds = this.store.getMetadata<JsonValue>(`driver-active-tools:${agent.id}`);
+        const recoverySession = DriverSessionSchema.parse({
+          ...recoverySessionBase,
+          metadata: {
+            ...recoverySessionBase.metadata,
+            activeToolIds: Array.isArray(retainedActiveToolIds)
+              ? retainedActiveToolIds.filter((value): value is string => typeof value === "string")
+              : [],
+          },
+        });
+        const resume = driver.resume(
+          recoverySession,
+          this.startRequest(agent.id, order, agent.model ?? "auto"),
+          (event) => {
+            const oldTerminalEvidence = restoringQueuedFollowUp
+              && ["output.completed", "run.completed", "run.failed", "run.cancelled"].includes(event.kind);
+            if (context.active && !oldTerminalEvidence) this.onDriverEvent(agent.id, event);
+          },
+          {
+            signal,
+            processSupervisor: this.processSupervisor(agent.id, ulid(), agent.harness),
+          },
+        );
+        void resume.then((lateSession) => {
+          if (signal.aborted && driver.detach) {
+            void driver.detach(lateSession).catch(() => undefined);
+          } else if (signal.aborted && driver.forceTerminate) {
+            void driver.forceTerminate(lateSession).catch(() => undefined);
+          }
+        }, () => undefined);
+        const session = await resume;
+        restoringQueuedFollowUp = false;
+        context.provisional = { driver, session };
+        if (!context.active || signal.aborted) return;
+        const reusableSession = isReusableDriverSession(session);
+        if (queuedFollowUp?.state === "queued") {
+          if (!reusableSession) {
+            const error = "The retained native process exited before Symphony could restore the queued follow-up. The queued message was not delivered.";
+            this.store.setMetadata(this.followUpKey(agent.id), {
+              ...queuedFollowUp,
+              state: "failed",
+              error,
+              updatedAt: nowIso(),
+            } as unknown as JsonValue);
+            this.persistSession(agent.id, session);
+            this.sessions.delete(agent.id);
+            const latest = this.get(agent.id);
+            const recovered = isTerminalAgentStatus(latest.status)
+              ? latest
+              : this.update(latest, { status: "interrupted", error, finishedAt: nowIso() });
+            this.event(recovered, "agent.recovered", {
+              nativeSessionId: session.nativeSessionId,
+              nativeRunId: session.nativeRunId,
+              previousStatus: agent.status,
+              resumedState: session.state,
+              recoveredStatus: recovered.status,
+              continuity: "retained-process-exited",
+              receiptId: queuedFollowUp.attemptId,
+            });
+            return;
+          }
+          if (session.state === "running" || session.state === "starting") {
+            const error = "A follow-up was durably queued before daemon restart, but the retained native session now reports active work. Symphony will not send the queued turn concurrently because its ordering cannot be proven.";
+            this.store.setMetadata(this.followUpKey(agent.id), {
+              ...queuedFollowUp,
+              state: "failed",
+              error,
+              updatedAt: nowIso(),
+            } as unknown as JsonValue);
+            const interrupted = this.update(this.get(agent.id), {
+              status: "interrupted",
+              nativeSessionId: session.nativeSessionId,
+              nativeRunId: session.nativeRunId,
+              error,
+              finishedAt: nowIso(),
+            });
+            this.event(interrupted, "agent.interrupted", {
+              error,
+              phase: "follow-up-recovery",
+              continuity: "retained-session-unexpectedly-active",
+              receiptId: queuedFollowUp.attemptId,
+            });
+            return;
+          }
+          const idleSession: DriverSession = { ...session, state: "idle" };
+          this.persistSession(agent.id, idleSession);
+          this.sessions.set(agent.id, idleSession);
+          const recovered = this.update(this.get(agent.id), {
+            status: "waiting",
+            nativeSessionId: idleSession.nativeSessionId,
+            nativeRunId: idleSession.nativeRunId,
+            error: null,
+            finishedAt: null,
+          });
+          this.event(recovered, "agent.recovered", {
+            nativeSessionId: recovered.nativeSessionId,
+            nativeRunId: recovered.nativeRunId,
+            previousStatus: agent.status,
+            resumedState: session.state,
+            recoveredStatus: recovered.status,
+            continuity: "retained-session-restored-for-queued-follow-up",
+            receiptId: queuedFollowUp.attemptId,
+          });
+          return;
+        }
+        this.persistSession(agent.id, session);
+        if (reusableSession) this.sessions.set(agent.id, session);
+        else this.sessions.delete(agent.id);
+        const latest = this.get(agent.id);
+        if (isTerminalAgentStatus(latest.status) && session.state !== "unknown") {
+          this.settleFollowUpDispatch(
+            agent.id,
+            latest.status === "completed" ? "completed" : latest.status === "cancelled" ? "cancelled" : "failed",
+            session.state === "completed",
+          );
+          if (latest.status !== "completed") await this.retireSession(agent.id, driver, session);
+          const recovered = this.update(latest, { nativeSessionId: session.nativeSessionId, nativeRunId: session.nativeRunId });
+          this.event(recovered, "agent.recovered", {
+            nativeSessionId: recovered.nativeSessionId,
+            nativeRunId: recovered.nativeRunId,
+            previousStatus: agent.status,
+            resumedState: session.state,
+            recoveredStatus: recovered.status,
+            continuity: "terminal-event-observed",
+          });
+          return;
+        }
+
+        if (agent.status === "cancel-requested") {
+          await this.recoverCancellation(agent, latest, driver, session, context);
+          return;
+        }
+
+        if (session.state === "unknown") {
+          const pendingFollowUp = this.followUpDispatch(agent.id);
+          const error = pendingFollowUp && ["dispatching", "delivered"].includes(pendingFollowUp.state)
+            ? `${agent.harness} restored the native session, but cannot prove whether the pending follow-up was accepted or what its outcome was. Symphony will not resend it automatically because doing so could duplicate side effects.`
+            : `${agent.harness} restored the native session context, but cannot prove the outcome of the run that was active when Symphony stopped. Symphony will not continue automatically because doing so could duplicate side effects.`;
+          if (pendingFollowUp && ["dispatching", "delivered"].includes(pendingFollowUp.state)) {
+            this.store.setMetadata(this.followUpKey(agent.id), {
+              ...pendingFollowUp,
+              state: "outcome-unknown",
+              error,
+              updatedAt: nowIso(),
+            } as unknown as JsonValue);
+          }
+          const interrupted = this.update(latest, {
+            status: "interrupted",
+            nativeSessionId: session.nativeSessionId,
+            nativeRunId: session.nativeRunId,
+            error,
+            finishedAt: nowIso(),
+          });
+          this.event(interrupted, "agent.interrupted", {
+            error,
+            phase: "recovery",
+            previousStatus: agent.status,
+            resumedState: session.state,
+            continuity: "native-outcome-unknown",
+          });
+          return;
+        }
+
+        if (session.state === "running" || session.state === "starting") {
+          this.superviseRecovered(agent.id);
+          const recovered = this.update(latest, {
+            status: session.state,
+            nativeSessionId: session.nativeSessionId,
+            nativeRunId: session.nativeRunId,
+            error: null,
+            finishedAt: null,
+          });
+          this.event(recovered, "agent.recovered", {
+            nativeSessionId: recovered.nativeSessionId,
+            nativeRunId: recovered.nativeRunId,
+            previousStatus: agent.status,
+            resumedState: session.state,
+            recoveredStatus: recovered.status,
+            continuity: "native-run-reattached",
+          });
+          return;
+        }
+
+        if (session.state === "idle" && requiresRunContinuity(agent.status)) {
+          await this.continueRecoveredRun(agent, latest, order, driver, session, context);
+          return;
+        }
+
+        const recovered = this.projectRecoveredSession(agent, latest, order, session);
+        if (isTerminalAgentStatus(recovered.status)) {
+          this.settleFollowUpDispatch(
+            agent.id,
+            recovered.status === "completed" ? "completed" : recovered.status === "cancelled" ? "cancelled" : "failed",
+            true,
+          );
+        }
+        this.event(recovered, "agent.recovered", {
+          nativeSessionId: recovered.nativeSessionId,
+          nativeRunId: recovered.nativeRunId,
+          previousStatus: agent.status,
+          resumedState: session.state,
+          recoveredStatus: recovered.status,
+          continuity: recovered.status === "idle" || recovered.status === "waiting" ? "session-restored" : "native-terminal-state",
+        });
       } catch (error) {
-        this.update(agent, { status: "lost", error: `Resume failed: ${String(error)}`, finishedAt: nowIso() });
+        if (!context.active) return;
+        context.active = false;
+        const lost = this.update(agent, { status: "lost", error: `Resume failed: ${String(error)}`, finishedAt: nowIso() });
+        this.event(lost, "agent.failed", { error: lost.error ?? "Native session resume failed.", phase: "recovery" });
       }
+  }
+
+  private async recoverCancellation(
+    previous: AgentRecord,
+    latest: AgentRecord,
+    driver: ReturnType<DriverRegistry["get"]>,
+    session: DriverSession,
+    context: RecoveryContext,
+  ): Promise<void> {
+    const native = { nativeSessionId: session.nativeSessionId, nativeRunId: session.nativeRunId };
+    if (session.state === "idle" || session.state === "cancelled") {
+      const cancelled = this.update(latest, { ...native, status: "cancelled", error: null, finishedAt: nowIso() });
+      this.event(cancelled, "agent.recovered", {
+        nativeSessionId: cancelled.nativeSessionId,
+        nativeRunId: cancelled.nativeRunId,
+        previousStatus: previous.status,
+        resumedState: session.state,
+        recoveredStatus: cancelled.status,
+        continuity: "cancellation-settled",
+      });
+      return;
     }
+    if (session.state === "completed" || session.state === "failed") {
+      const raw = this.store.getMetadata<JsonValue>(`work-order:${previous.id}`);
+      const order = raw ? AgentWorkOrderSchema.parse(raw) : null;
+      const recovered = order
+        ? this.projectRecoveredSession(previous, latest, order, session)
+        : this.update(latest, { ...native, status: "lost", error: "Persisted work order is missing during cancellation recovery.", finishedAt: nowIso() });
+      this.event(recovered, "agent.recovered", {
+        nativeSessionId: recovered.nativeSessionId,
+        nativeRunId: recovered.nativeRunId,
+        previousStatus: previous.status,
+        resumedState: session.state,
+        recoveredStatus: recovered.status,
+        continuity: "native-terminal-state",
+      });
+      return;
+    }
+
+    this.superviseRecovered(previous.id);
+    const pending = this.update(latest, { ...native, status: "cancel-requested", finishedAt: null });
+    try {
+      await this.cancelNativeSession(previous.id, driver, session, "recovery", () => context.active);
+      if (!context.active) return;
+      const afterCancel = this.get(previous.id);
+      const recovered = isTerminalAgentStatus(afterCancel.status) ? afterCancel : pending;
+      this.event(recovered, "agent.recovered", {
+        nativeSessionId: recovered.nativeSessionId,
+        nativeRunId: recovered.nativeRunId,
+        previousStatus: previous.status,
+        resumedState: session.state,
+        recoveredStatus: recovered.status,
+        continuity: "cancellation-reissued",
+      });
+      this.event(recovered, "agent.cancel.reissued", { previousStatus: previous.status, resumedState: session.state });
+    } catch (error) {
+      if (!context.active) return;
+      const message = error instanceof Error ? error.message : String(error);
+      const interrupted = this.update(this.get(previous.id), {
+        ...native,
+        status: "interrupted",
+        error: `The native run resumed, but its persisted cancellation request could not be reissued: ${message}`,
+        finishedAt: nowIso(),
+      });
+      this.resolveTerminal(previous.id);
+      this.event(interrupted, "agent.interrupted", { error: interrupted.error ?? message, phase: "cancellation-recovery" });
+    }
+  }
+
+  private async continueRecoveredRun(
+    previous: AgentRecord,
+    latest: AgentRecord,
+    order: AgentWorkOrder,
+    driver: ReturnType<DriverRegistry["get"]>,
+    session: DriverSession,
+    context: RecoveryContext,
+  ): Promise<void> {
+    const followUp = this.followUpDispatch(previous.id);
+    if (followUp && ["dispatching", "delivered"].includes(followUp.state)) {
+      const error = "The retained native session is idle after a follow-up had been dispatched, but Symphony cannot prove whether that turn completed. It will not resend the follow-up automatically.";
+      const interrupted = this.update(latest, {
+        status: "interrupted",
+        nativeSessionId: session.nativeSessionId,
+        nativeRunId: session.nativeRunId,
+        error,
+        finishedAt: nowIso(),
+      });
+      this.store.setMetadata(this.followUpKey(previous.id), {
+        ...followUp,
+        state: "outcome-unknown",
+        error,
+        updatedAt: nowIso(),
+      } as unknown as JsonValue);
+      this.event(interrupted, "agent.interrupted", {
+        error,
+        phase: "follow-up-recovery",
+        deliveryState: "unknown",
+        receiptId: followUp.attemptId,
+      });
+      return;
+    }
+    const recoveryKey = `agent-recovery:${previous.id}`;
+    const pending = this.store.getMetadata<JsonValue>(recoveryKey);
+    if (this.isUnknownRecoveryDispatch(pending, session.nativeSessionId)) {
+      const error = "A previous recovery continuation may have been delivered, but its outcome is unknown. Symphony will not retry it automatically because that could duplicate side effects.";
+      const interrupted = this.update(latest, {
+        status: "interrupted",
+        nativeSessionId: session.nativeSessionId,
+        nativeRunId: session.nativeRunId,
+        error,
+        finishedAt: nowIso(),
+      });
+      this.event(interrupted, "agent.interrupted", {
+        error,
+        phase: "recovery",
+        previousStatus: previous.status,
+        resumedState: session.state,
+        deliveryState: "unknown",
+      });
+      return;
+    }
+
+    const now = nowIso();
+    const dispatch: RecoveryDispatch = {
+      attemptId: ulid(),
+      nativeSessionId: session.nativeSessionId,
+      state: "dispatching",
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.store.setMetadata(recoveryKey, dispatch as unknown as JsonValue);
+    this.superviseRecovered(previous.id);
+    const prompt = this.recoveryPrompt(order);
+    try {
+      const receipt = await driver.sendMessage(session, prompt);
+      if (!context.active) return;
+      if (receipt.terminalBoundary) {
+        const error = "The retained native session crossed a terminal result boundary before Symphony's recovery continuation was delivered. Symphony did not mark the undelivered continuation as running.";
+        this.store.setMetadata(recoveryKey, {
+          ...dispatch,
+          state: "failed",
+          updatedAt: nowIso(),
+          error,
+        } as unknown as JsonValue);
+        const afterBoundary = this.get(previous.id);
+        if (!isTerminalAgentStatus(afterBoundary.status)) {
+          const interrupted = this.update(afterBoundary, {
+            status: "interrupted",
+            nativeSessionId: session.nativeSessionId,
+            nativeRunId: session.nativeRunId,
+            error,
+            finishedAt: nowIso(),
+          });
+          this.event(interrupted, "agent.interrupted", {
+            error,
+            phase: "recovery",
+            continuity: "terminal-boundary-before-recovery-delivery",
+            recoveryAttemptId: dispatch.attemptId,
+          });
+        }
+        this.resolveTerminal(previous.id);
+        return;
+      }
+      const updatedSession = this.applyMessageSessionUpdate(previous.id, session, receipt.session);
+      const delivered: RecoveryDispatch = {
+        ...dispatch,
+        state: "delivered",
+        updatedAt: nowIso(),
+        receiptId: receipt.receiptId,
+      };
+      const currentDispatch = this.store.getMetadata<JsonValue>(recoveryKey);
+      if (!this.isSettledRecoveryDispatch(currentDispatch, dispatch.attemptId)) {
+        this.store.setMetadata(recoveryKey, delivered as unknown as JsonValue);
+      }
+      this.store.addAgentMessage({
+        agentId: previous.id,
+        direction: "to-agent",
+        content: prompt,
+        receiptId: receipt.receiptId,
+        deliveryState: receipt.queued ? "queued" : "delivered",
+      });
+      const afterDispatch = this.get(previous.id);
+      const recovered = isTerminalAgentStatus(afterDispatch.status)
+        ? this.update(afterDispatch, {
+            nativeSessionId: updatedSession.nativeSessionId,
+            nativeRunId: updatedSession.nativeRunId,
+          })
+        : this.update(afterDispatch, {
+            status: "running",
+            nativeSessionId: updatedSession.nativeSessionId,
+            nativeRunId: updatedSession.nativeRunId,
+            error: null,
+            finishedAt: null,
+          });
+      this.event(recovered, "agent.recovered", {
+        nativeSessionId: recovered.nativeSessionId,
+        nativeRunId: recovered.nativeRunId,
+        previousStatus: previous.status,
+        resumedState: session.state,
+        recoveredStatus: recovered.status,
+        continuity: isTerminalAgentStatus(recovered.status) ? "terminal-event-observed" : "checkpoint-continuation",
+        recoveryAttemptId: dispatch.attemptId,
+        receiptId: receipt.receiptId,
+        queued: receipt.queued,
+      });
+      this.event(recovered, "agent.recovery.continued", {
+        recoveryAttemptId: dispatch.attemptId,
+        receiptId: receipt.receiptId,
+        queued: receipt.queued,
+      });
+    } catch (error) {
+      if (!context.active) return;
+      const message = error instanceof Error ? error.message : String(error);
+      this.store.setMetadata(recoveryKey, {
+        ...dispatch,
+        state: "failed",
+        updatedAt: nowIso(),
+        error: message,
+      } as unknown as JsonValue);
+      const interrupted = this.update(this.get(previous.id), {
+        status: "interrupted",
+        nativeSessionId: session.nativeSessionId,
+        nativeRunId: session.nativeRunId,
+        error: `Native session resumed, but the recovery continuation could not be delivered: ${message}`,
+        finishedAt: nowIso(),
+      });
+      this.resolveTerminal(previous.id);
+      this.event(interrupted, "agent.interrupted", {
+        error: interrupted.error ?? message,
+        phase: "recovery",
+        previousStatus: previous.status,
+        resumedState: session.state,
+        recoveryAttemptId: dispatch.attemptId,
+      });
+    }
+  }
+
+  private projectRecoveredSession(
+    previous: AgentRecord,
+    latest: AgentRecord,
+    order: AgentWorkOrder,
+    session: DriverSession,
+  ): AgentRecord {
+    const native = { nativeSessionId: session.nativeSessionId, nativeRunId: session.nativeRunId };
+    if (session.state === "completed") {
+      const validationError = this.validateOutput(order, latest.output);
+      if (validationError) {
+        return this.update(latest, { ...native, status: "failed", error: validationError, finishedAt: nowIso() });
+      }
+      return this.update(latest, { ...native, status: "completed", error: null, finishedAt: latest.finishedAt ?? nowIso() });
+    }
+    if (session.state === "failed") {
+      return this.update(latest, {
+        ...native,
+        status: "failed",
+        error: latest.error ?? "The native harness reported a failed session during daemon recovery.",
+        finishedAt: latest.finishedAt ?? nowIso(),
+      });
+    }
+    if (session.state === "cancelled") {
+      return this.update(latest, { ...native, status: "cancelled", finishedAt: latest.finishedAt ?? nowIso() });
+    }
+    if (previous.status === "cancel-requested") {
+      return this.update(latest, {
+        ...native,
+        status: "interrupted",
+        error: "The daemon restarted while cancellation was pending, and the native harness did not confirm whether cancellation completed.",
+        finishedAt: nowIso(),
+      });
+    }
+    return this.update(latest, {
+      ...native,
+      status: previous.status === "waiting" ? "waiting" : "idle",
+      error: null,
+      finishedAt: null,
+    });
+  }
+
+  private isUnknownRecoveryDispatch(value: JsonValue | null, nativeSessionId: string): boolean {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    return ["dispatching", "delivered"].includes(String(value.state)) && value.nativeSessionId === nativeSessionId;
+  }
+
+  private isSettledRecoveryDispatch(value: JsonValue | null, attemptId: string): boolean {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+    return value.state === "settled" && value.attemptId === attemptId;
+  }
+
+  private settleRecoveryDispatch(agentId: string, outcome: NonNullable<RecoveryDispatch["outcome"]>): void {
+    const recoveryKey = `agent-recovery:${agentId}`;
+    const value = this.store.getMetadata<JsonValue>(recoveryKey);
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return;
+    if (!["dispatching", "delivered"].includes(String(value.state))) return;
+    this.store.setMetadata(recoveryKey, {
+      ...value,
+      state: "settled",
+      outcome,
+      updatedAt: nowIso(),
+    });
+  }
+
+  private followUpKey(agentId: string): string {
+    return `agent-follow-up:${agentId}`;
+  }
+
+  private followUpDispatch(agentId: string): FollowUpDispatch | null {
+    const value = this.store.getMetadata<JsonValue>(this.followUpKey(agentId));
+    if (value === null) return null;
+    const parsed = FollowUpDispatchSchema.safeParse(value);
+    return parsed.success ? parsed.data : null;
+  }
+
+  private steeringKey(agentId: string, attemptId: string): string {
+    const digest = createHash("sha256").update(attemptId).digest("hex");
+    return `agent-steering:${agentId}:${digest}`;
+  }
+
+  private steeringDispatch(agentId: string, attemptId: string): SteeringDispatch | null {
+    const value = this.store.getMetadata<JsonValue>(this.steeringKey(agentId, attemptId));
+    if (value === null) return null;
+    const parsed = SteeringDispatchSchema.safeParse(value);
+    return parsed.success && parsed.data.attemptId === attemptId && parsed.data.agentId === agentId
+      ? parsed.data
+      : null;
+  }
+
+  private settleFollowUpDispatch(
+    agentId: string,
+    outcome: NonNullable<FollowUpDispatch["outcome"]>,
+    allowDispatchingCompletion = false,
+  ): void {
+    const dispatch = this.followUpDispatch(agentId);
+    if (!dispatch || !["dispatching", "delivered"].includes(dispatch.state)) return;
+    if (dispatch.state === "dispatching" && outcome === "completed" && !allowDispatchingCompletion) return;
+    this.store.setMetadata(this.followUpKey(agentId), {
+      ...dispatch,
+      state: "settled",
+      outcome,
+      updatedAt: nowIso(),
+    } as unknown as JsonValue);
+  }
+
+  private recoveryPrompt(order: AgentWorkOrder): string {
+    return [
+      "Symphony recovered this durable agent after its daemon restarted. Continue the same persisted work order from this native session; this is not a new task.",
+      `Objective: ${order.objective}`,
+      "Before acting, inspect the native transcript and current workspace to identify the last confirmed checkpoint.",
+      "Do not repeat any already-confirmed external write, message, purchase, publish, deletion, commit, push, deployment, or other side effect.",
+      "If the outcome of an earlier side effect cannot be proven, treat it as unknown and report it instead of retrying it.",
+      "Continue only the unfinished work, verify the resulting state, and produce the originally requested output.",
+    ].join("\n\n");
+  }
+
+  private superviseRecovered(agentId: string): void {
+    if (this.terminalResolvers.has(agentId)) return;
+    let resolveTerminal!: () => void;
+    const terminal = new Promise<void>((resolvePromise) => { resolveTerminal = resolvePromise; });
+    this.terminalResolvers.set(agentId, resolveTerminal);
+    this.running += 1;
+    void terminal.finally(() => {
+      this.running = Math.max(0, this.running - 1);
+      this.drain();
+    });
   }
 
   private drain(): void {
@@ -676,38 +2429,550 @@ export class AgentCoordinator {
     while ((maxConcurrent === null || this.running < maxConcurrent) && this.queue.length) {
       const entry = this.queue.shift() as QueueEntry;
       this.running += 1;
-      void this.launch(entry).finally(() => {
+      const operation = entry.kind === "start" ? this.launch(entry) : this.dispatchFollowUp(entry.dispatch);
+      void operation.finally(() => {
         this.running -= 1;
         this.drain();
       });
     }
   }
 
-  private async launch(entry: QueueEntry): Promise<void> {
+  private async dispatchFollowUp(dispatch: FollowUpDispatch): Promise<void> {
+    const persisted = this.followUpDispatch(dispatch.agentId);
+    if (!persisted || persisted.attemptId !== dispatch.attemptId || persisted.state !== "queued") return;
+    let agent = this.get(dispatch.agentId);
+    if (agent.status === "cancel-requested" || isTerminalAgentStatus(agent.status)) {
+      this.store.setMetadata(this.followUpKey(dispatch.agentId), {
+        ...persisted,
+        state: "cancelled",
+        outcome: "cancelled",
+        updatedAt: nowIso(),
+      } as unknown as JsonValue);
+      return;
+    }
+    const session = this.sessions.get(dispatch.agentId);
+    if (!session || !agent.harness) {
+      const error = "The retained native session disappeared before the queued follow-up could be dispatched.";
+      this.store.setMetadata(this.followUpKey(dispatch.agentId), {
+        ...persisted,
+        state: "failed",
+        error,
+        updatedAt: nowIso(),
+      } as unknown as JsonValue);
+      const interrupted = this.update(agent, { status: "interrupted", error, finishedAt: nowIso() });
+      this.event(interrupted, "agent.interrupted", { error, phase: "follow-up-dispatch" });
+      return;
+    }
+
+    let resolveTerminal!: () => void;
+    const terminal = new Promise<void>((resolvePromise) => { resolveTerminal = resolvePromise; });
+    this.terminalResolvers.set(agent.id, resolveTerminal);
+    const dispatching = FollowUpDispatchSchema.parse({
+      ...persisted,
+      state: "dispatching",
+      updatedAt: nowIso(),
+    });
+    this.store.durableTransaction(() => {
+      this.store.setMetadata(this.followUpKey(agent.id), dispatching as unknown as JsonValue);
+      agent = this.update(agent, { status: "starting", error: null, finishedAt: null });
+      this.event(agent, "agent.message.dispatching", {
+        content: dispatch.content,
+        receiptId: dispatch.attemptId,
+        scheduler: "bounded",
+      });
+    });
+
+    try {
+      const delivery = this.drivers.get(agent.harness).sendMessage(session, dispatch.content);
+      const first = await Promise.race([
+        delivery.then((result) => ({ kind: "delivery" as const, result })),
+        terminal.then(() => ({ kind: "terminal" as const })),
+      ]);
+      if (first.kind === "terminal") return;
+      const result = first.result;
+      if (result.terminalBoundary) {
+        const current = this.followUpDispatch(agent.id);
+        const latest = this.get(agent.id);
+        const requeueableState = current?.state === "dispatching"
+          || current?.state === "delivered"
+          || (current?.state === "settled" && current.outcome === "completed");
+        const requeueableAgent = !["failed", "cancelled", "interrupted", "lost"].includes(latest.status);
+        if (current?.attemptId === dispatch.attemptId && requeueableState && requeueableAgent) {
+          const requeued = FollowUpDispatchSchema.parse({
+            ...dispatching,
+            state: "queued",
+            receiptId: null,
+            updatedAt: nowIso(),
+          });
+          this.store.durableTransaction(() => {
+            this.store.setMetadata(this.followUpKey(agent.id), requeued as unknown as JsonValue);
+            const waiting = this.update(latest, { status: "waiting", output: null, error: null, finishedAt: null });
+            this.event(waiting, "agent.message.boundary", {
+              receiptId: dispatch.attemptId,
+              nativeReceiptId: result.receiptId,
+              continuity: "terminal-boundary-requeued",
+            });
+            this.queue.push({ kind: "follow-up", dispatch: requeued });
+          });
+        }
+        return;
+      }
+      const updatedSession = this.applyMessageSessionUpdate(agent.id, session, result.session);
+      const latest = this.get(agent.id);
+      const delivered = FollowUpDispatchSchema.parse({
+        ...dispatching,
+        state: "delivered",
+        receiptId: result.receiptId,
+        updatedAt: nowIso(),
+      });
+      const current = this.followUpDispatch(agent.id);
+      if (current?.attemptId === dispatch.attemptId && current.state === "dispatching") {
+        this.store.setMetadata(this.followUpKey(agent.id), delivered as unknown as JsonValue);
+      }
+      if (!isTerminalAgentStatus(latest.status) && latest.status !== "cancel-requested") {
+        const running = this.update(latest, { status: "running", error: null, finishedAt: null });
+        this.event(running, "agent.message.sent", {
+          content: dispatch.content,
+          receiptId: dispatch.attemptId,
+          nativeReceiptId: result.receiptId,
+          nativeQueued: result.queued,
+          nativeSessionId: updatedSession.nativeSessionId,
+          nativeRunId: updatedSession.nativeRunId,
+          steering: false,
+        });
+      } else if (latest.status === "completed") {
+        this.settleFollowUpDispatch(agent.id, "completed");
+      }
+      await terminal;
+    } catch (error) {
+      const latest = this.get(agent.id);
+      if (!isTerminalAgentStatus(latest.status)) {
+        const message = error instanceof Error ? error.message : String(error);
+        const failure = `The follow-up message may have reached the native session, but its delivery could not be confirmed: ${message}`;
+        this.store.setMetadata(this.followUpKey(agent.id), {
+          ...dispatching,
+          state: "outcome-unknown",
+          error: failure,
+          updatedAt: nowIso(),
+        } as unknown as JsonValue);
+        const interrupted = this.update(latest, { status: "interrupted", error: failure, finishedAt: nowIso() });
+        this.sessions.delete(agent.id);
+        this.event(interrupted, "agent.interrupted", {
+          error: failure,
+          phase: "follow-up-dispatch",
+          deliveryState: "unknown",
+          receiptId: dispatch.attemptId,
+        });
+      }
+      this.resolveTerminal(agent.id);
+    } finally {
+      // A synchronous terminal event may have resolved and removed the waiter
+      // before sendMessage itself returned. Deleting is safe in both orders.
+      this.terminalResolvers.delete(agent.id);
+    }
+  }
+
+  private async launch(entry: StartQueueEntry): Promise<void> {
     let current = this.get(entry.record.id);
     try {
+      if (isTerminalAgentStatus(current.status)) return;
       current = this.update(current, { status: "routing" });
-      const route = await this.router.route(entry.order);
+      const route = await this.withLifecycleDeadline(
+        current.id,
+        "routing",
+        this.loaded.config.agents.routingTimeoutMs ?? 30_000,
+        (signal) => this.router.route(entry.order, signal),
+      );
+      current = this.get(current.id);
+      if (current.status === "cancel-requested") {
+        const cancelled = this.update(current, { status: "cancelled", finishedAt: nowIso() });
+        this.event(cancelled, "agent.cancelled", { phase: "before-native-start" });
+        return;
+      }
+      if (isTerminalAgentStatus(current.status)) return;
       current = this.update(current, { status: "starting", harness: route.harness, model: route.model, startedAt: nowIso() });
       this.event(current, "agent.routed", { harness: route.harness, model: route.model, traceId: route.trace.id });
       const driver = this.drivers.get(route.harness);
       let resolveTerminal!: () => void;
       const terminal = new Promise<void>((resolvePromise) => { resolveTerminal = resolvePromise; });
       this.terminalResolvers.set(current.id, resolveTerminal);
-      const session = await driver.start(this.startRequest(current.id, entry.order, route.model), (event) => this.onDriverEvent(current.id, event));
+      let acceptingStartupEvents = true;
+      const session = await this.withLifecycleDeadline(
+        current.id,
+        "startup",
+        this.loaded.config.agents.startupTimeoutMs ?? 60_000,
+        (signal) => driver.start(
+          this.startRequest(current.id, entry.order, route.model),
+          (event) => {
+            if (acceptingStartupEvents && !signal.aborted) this.onDriverEvent(current.id, event);
+          },
+          {
+            signal,
+            processSupervisor: this.processSupervisor(current.id, ulid(), route.harness),
+          },
+        ),
+        {
+          onTimeout: () => { acceptingStartupEvents = false; },
+          onLate: (lateSession) => driver.forceTerminate?.(lateSession),
+        },
+      );
+      this.persistSession(current.id, session);
       this.sessions.set(current.id, session);
       const afterStart = this.get(current.id);
-      this.update(afterStart, {
-        ...(isTerminalAgentStatus(afterStart.status) ? {} : { status: "running" as const }),
+      const attached = this.update(afterStart, {
+        ...(!isTerminalAgentStatus(afterStart.status) && afterStart.status !== "cancel-requested"
+          ? { status: "running" as const }
+          : {}),
         nativeSessionId: session.nativeSessionId,
         nativeRunId: session.nativeRunId,
       });
+      if (isTerminalAgentStatus(attached.status) && attached.status !== "completed") {
+        await this.retireSession(current.id, driver, session);
+        return;
+      }
+      if (attached.status === "cancel-requested") {
+        await this.cancelNativeSession(current.id, driver, session, "late-native-start");
+      }
       await terminal;
     } catch (error) {
       this.terminalResolvers.delete(current.id);
-      this.update(this.get(current.id), { status: "failed", error: error instanceof Error ? error.message : String(error), finishedAt: nowIso() });
-      this.event(current, "agent.failed", { error: error instanceof Error ? error.message : String(error) });
+      const latest = this.get(current.id);
+      if (isTerminalAgentStatus(latest.status)) return;
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof AgentLifecycleTimeoutError && error.phase === "routing") {
+        if (latest.status === "cancel-requested") {
+          const cancelled = this.update(latest, { status: "cancelled", error: null, finishedAt: nowIso() });
+          this.event(cancelled, "agent.cancelled", { phase: "routing", continuity: "cancelled-before-native-start" });
+        } else {
+          const failure = `Routing timed out after ${error.timeoutMs}ms before any native work was dispatched.`;
+          const failed = this.update(latest, { status: "failed", error: failure, finishedAt: nowIso() });
+          this.event(failed, "agent.failed", {
+            error: failure,
+            phase: "routing",
+            continuity: "routing-timeout-before-dispatch",
+            timeoutMs: error.timeoutMs,
+          });
+        }
+        return;
+      }
+      if (error instanceof AgentLifecycleTimeoutError && error.phase === "startup") {
+        const failure = `Native startup timed out after ${error.timeoutMs}ms. The work may have reached ${latest.harness ?? "the native harness"}, so Symphony will not retry it automatically.`;
+        const interrupted = this.update(latest, { status: "interrupted", error: failure, finishedAt: nowIso() });
+        this.event(interrupted, "agent.interrupted", {
+          error: failure,
+          phase: "native-start",
+          continuity: "native-start-timeout",
+          deliveryState: "unknown",
+          timeoutMs: error.timeoutMs,
+        });
+        return;
+      }
+      const failed = this.update(latest, { status: "failed", error: message, finishedAt: nowIso() });
+      this.event(failed, "agent.failed", { error: message });
     }
+  }
+
+  private async withLifecycleDeadline<T>(
+    agentId: string,
+    phase: AgentLifecyclePhase,
+    timeoutMs: number,
+    operation: (signal: AbortSignal) => Promise<T>,
+    hooks: {
+      onTimeout?: () => void;
+      onLate?: (value: T) => void | Promise<void>;
+    } = {},
+  ): Promise<T> {
+    const controller = new AbortController();
+    const timeoutError = new AgentLifecycleTimeoutError(agentId, phase, timeoutMs);
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const pending = Promise.resolve().then(() => operation(controller.signal));
+    void pending.then((value) => {
+      if (!timedOut || !hooks.onLate) return;
+      void Promise.resolve(hooks.onLate(value)).catch(() => undefined);
+    }, () => undefined);
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        timedOut = true;
+        hooks.onTimeout?.();
+        // Reject the deadline first so an abort-induced provider rejection
+        // cannot replace the authoritative timeout classification.
+        reject(timeoutError);
+        controller.abort(timeoutError);
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([pending, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private persistSession(agentId: string, session: DriverSession): void {
+    const parsed = DriverSessionSchema.parse(session);
+    this.store.setMetadata(`driver-session:${agentId}`, parsed as unknown as JsonValue);
+    const leaseId = this.processLeaseIds.get(agentId);
+    if (leaseId) {
+      this.store.touchWorkerProcessLease(leaseId, {
+        nativeSessionId: parsed.nativeSessionId,
+        nativeRunId: parsed.nativeRunId,
+        activeTurnId: parsed.state === "running" || parsed.state === "starting" ? parsed.nativeRunId : null,
+      });
+    }
+  }
+
+  private applyMessageSessionUpdate(
+    agentId: string,
+    current: DriverSession,
+    update: DriverSession | undefined,
+  ): DriverSession {
+    if (!update) return current;
+    const parsed = DriverSessionSchema.parse(update);
+    if (parsed.driver !== current.driver || parsed.nativeSessionId !== current.nativeSessionId) {
+      throw new Error("Native message receipt attempted to replace the retained session identity.");
+    }
+    // This durable checkpoint is intentionally committed before the caller
+    // records native delivery. A daemon crash after provider acceptance can
+    // therefore recover/fence the new run instead of replaying the old turn.
+    this.store.durableTransaction(() => {
+      this.persistSession(agentId, parsed);
+      const latest = this.get(agentId);
+      this.update(latest, {
+        nativeSessionId: parsed.nativeSessionId,
+        nativeRunId: parsed.nativeRunId,
+      });
+    });
+    this.sessions.set(agentId, parsed);
+    return parsed;
+  }
+
+  private processSupervisor(agentId: string, attemptId: string, driver: ResolvedHarness): DriverProcessSupervisor {
+    const retainedProcess = this.adoptableProcessLeases.has(agentId);
+    const hosted = isReconnectableHostedDriver(driver)
+      && (this.loaded.config.workerHosts.enabled || retainedProcess);
+    const supervisor: DriverProcessSupervisor = {
+      retainedProcess,
+      reserveProcess: (spec) => {
+        const adoptable = this.adoptableProcessLeases.get(agentId);
+        if (adoptable) {
+          const exactSpec = adoptable.driver === driver
+            && adoptable.role === spec.role
+            && adoptable.command === spec.command
+            && JSON.stringify(adoptable.args) === JSON.stringify(spec.args)
+            && adoptable.cwd === spec.cwd;
+          if (!exactSpec) {
+            throw new Error(`Retained worker-host lease ${adoptable.id} does not match the requested native process. Symphony will not spawn a duplicate.`);
+          }
+          this.adoptableProcessLeases.delete(agentId);
+          const current = this.store.getWorkerProcessLease(adoptable.id) ?? adoptable;
+          this.processLeaseIds.set(agentId, current.id);
+          return current;
+        }
+        const agent = this.get(agentId);
+        const now = nowIso();
+        const leaseId = ulid();
+        let transport: WorkerProcessLease["transport"] = { kind: "direct" };
+        if (hosted) {
+          if (!this.daemonCredential.allowNewCredentials) {
+            throw new Error("Symphony cannot launch a new worker host while preserving a legacy daemon credential for retained work.");
+          }
+          const namespace = createHash("sha256").update(this.loaded.dataDirectory).digest("hex").slice(0, 12);
+          const socketDirectory = join("/tmp", `symphony-hosts-${namespace}`);
+          const spoolDirectory = resolve(this.loaded.dataDirectory, "worker-hosts");
+          mkdirSync(socketDirectory, { recursive: true, mode: 0o700 });
+          mkdirSync(spoolDirectory, { recursive: true, mode: 0o700 });
+          chmodSync(socketDirectory, 0o700);
+          chmodSync(spoolDirectory, 0o700);
+          transport = {
+            kind: "worker-host",
+            protocolVersion: 1,
+            endpoint: join(socketDirectory, `${leaseId}.sock`),
+            spoolPath: join(spoolDirectory, `${leaseId}.jsonl`),
+            hostInstanceId: ulid(),
+            hostIdentity: null,
+            workerIdentity: null,
+            controllerOwnerId: this.controllerOwnerId,
+            ownerEpoch: this.controllerEpoch,
+            processedOutputSeq: 0,
+            ackedOutputSeq: 0,
+            producedOutputSeq: 0,
+            spoolBytes: 0,
+            spoolState: "healthy",
+          };
+        }
+        const lease: WorkerProcessLease = {
+          id: leaseId,
+          daemonOwnerId: this.daemonOwnerId,
+          agentId,
+          attemptId,
+          driver,
+          role: spec.role,
+          command: spec.command,
+          args: spec.args,
+          cwd: spec.cwd,
+          workspacePath: agent.workspacePath,
+          permission: agent.permissions,
+          adapterVersion: spec.adapterVersion,
+          transport,
+          adapterState: {},
+          identity: null,
+          nativeSessionId: null,
+          nativeRunId: null,
+          activeTurnId: null,
+          lastEventCursor: null,
+          state: "reserved",
+          reservedAt: now,
+          attachedAt: null,
+          updatedAt: now,
+          releasedAt: null,
+          exitCode: null,
+          signal: null,
+          error: null,
+          revision: 0,
+        };
+        this.store.saveWorkerProcessLease(lease);
+        this.processLeaseIds.set(agentId, lease.id);
+        this.processEvent(lease, "supervisor.process.reserved", {
+          role: lease.role,
+          command: lease.command,
+          attemptId: lease.attemptId,
+        });
+        return lease;
+      },
+      attachProcess: (leaseId, identity) => {
+        const current = this.store.getWorkerProcessLease(leaseId);
+        if (!current || current.daemonOwnerId !== this.daemonOwnerId) {
+          throw new Error(`Current daemon does not own worker process lease: ${leaseId}`);
+        }
+        const attached = this.store.transitionWorkerProcessLease(
+          leaseId,
+          ["reserved"],
+          { state: "running", identity, attachedAt: nowIso() },
+        );
+        if (!attached) throw new Error(`Worker process lease could not be attached: ${leaseId}`);
+        this.processEvent(attached, "supervisor.process.registered", {
+          role: attached.role,
+          pid: identity.pid,
+          processGroupId: identity.processGroupId,
+          verification: identity.verification,
+        });
+        return attached;
+      },
+      updateProcess: (leaseId, patch) => {
+        const current = this.store.getWorkerProcessLease(leaseId);
+        if (!current || current.daemonOwnerId !== this.daemonOwnerId) {
+          throw new Error(`Current daemon does not own worker process lease: ${leaseId}`);
+        }
+        const advancesProcessedCursor = current.transport.kind === "worker-host"
+          && patch.transport?.kind === "worker-host"
+          && patch.transport.processedOutputSeq > current.transport.processedOutputSeq;
+        const persistsNativeDispatch = patch.nativeSessionId !== undefined
+          || patch.nativeRunId !== undefined
+          || patch.activeTurnId !== undefined;
+        const updated = advancesProcessedCursor || persistsNativeDispatch
+          ? this.store.durablyTouchWorkerProcessLease(leaseId, patch)
+          : this.store.touchWorkerProcessLease(leaseId, patch);
+        if (!updated) throw new Error(`Worker process lease is unavailable: ${leaseId}`);
+        return updated;
+      },
+      releaseProcess: (leaseId, result) => {
+        const current = this.store.getWorkerProcessLease(leaseId);
+        if (!current || current.daemonOwnerId !== this.daemonOwnerId) {
+          throw new Error(`Current daemon does not own worker process lease: ${leaseId}`);
+        }
+        const released = this.store.transitionWorkerProcessLease(
+          leaseId,
+          ["reserved", "running"],
+          {
+            state: "exited",
+            releasedAt: nowIso(),
+            exitCode: result.exitCode,
+            signal: result.signal,
+            error: result.error ?? null,
+            activeTurnId: null,
+          },
+        );
+        const existing = released ?? this.store.getWorkerProcessLease(leaseId);
+        if (!existing) throw new Error(`Worker process lease is unavailable: ${leaseId}`);
+        if (released) this.processEvent(released, "supervisor.process.exited", {
+          exitCode: result.exitCode,
+          signal: result.signal,
+          error: result.error ?? null,
+        });
+        if (this.processLeaseIds.get(agentId) === leaseId) this.processLeaseIds.delete(agentId);
+        return existing;
+      },
+    };
+    if (hosted) {
+      supervisor.workerHostPlan = (leaseId) => {
+        const lease = this.store.getWorkerProcessLease(leaseId);
+        if (!lease || lease.transport.kind !== "worker-host") return null;
+        const ownerEpoch = lease.state === "reserved"
+          ? this.controllerEpoch
+          : Math.max(this.controllerEpoch, lease.transport.ownerEpoch + 1);
+        const builtHost = resolve(this.loaded.rootDirectory, "apps", "worker-host", "dist", "index.js");
+        const sourceHost = resolve(this.loaded.rootDirectory, "apps", "worker-host", "src", "index.ts");
+        const tsx = resolve(this.loaded.rootDirectory, "node_modules", ".bin", "tsx");
+        return {
+          mode: lease.state === "reserved" ? "launch" : "reconnect",
+          protocolVersion: 1,
+          hostCommand: existsSync(builtHost) ? process.execPath : tsx,
+          hostArgs: [existsSync(builtHost) ? builtHost : sourceHost],
+          capability: createHmac("sha256", this.daemonSecret)
+            .update(`worker-host-capability:v1:${lease.id}`)
+            .digest("hex"),
+          controllerOwnerId: this.controllerOwnerId,
+          ownerEpoch,
+          endpoint: lease.transport.endpoint,
+          spoolPath: lease.transport.spoolPath,
+          afterSeq: lease.transport.processedOutputSeq,
+          maxSpoolBytes: this.loaded.config.workerHosts.maxSpoolBytes,
+          maxSpoolFrames: this.loaded.config.workerHosts.maxSpoolFrames,
+        };
+      };
+      supervisor.adoptProcess = (leaseId, expectedRevision, transport) => {
+        if (transport.kind !== "worker-host") throw new Error("Only worker-host leases can be adopted.");
+        const adopted = this.store.adoptWorkerProcessLease(
+          leaseId,
+          expectedRevision,
+          this.daemonOwnerId,
+          {
+            ...transport,
+            controllerOwnerId: this.controllerOwnerId,
+            ownerEpoch: Math.max(this.controllerEpoch, transport.ownerEpoch),
+          },
+        );
+        if (!adopted) throw new Error(`Worker-host lease adoption lost its compare-and-swap race: ${leaseId}`);
+        this.processLeaseIds.set(agentId, adopted.id);
+        this.processEvent(adopted, "supervisor.host.adopted", {
+          hostInstanceId: adopted.transport.kind === "worker-host" ? adopted.transport.hostInstanceId : null,
+          ownerEpoch: adopted.transport.kind === "worker-host" ? adopted.transport.ownerEpoch : null,
+          continuity: "authenticated-worker-host-reattached",
+        });
+        return this.store.getWorkerProcessLease(adopted.id) ?? adopted;
+      };
+    }
+    return supervisor;
+  }
+
+  private processEvent(lease: WorkerProcessLease, type: string, payload: JsonValue): void {
+    const agent = this.store.getAgent(lease.agentId);
+    const event = this.store.appendEvent({
+      type,
+      workflowId: agent?.workflowId ?? null,
+      runId: agent?.runId ?? null,
+      agentId: lease.agentId,
+      occurredAt: nowIso(),
+      payload: {
+        processLeaseId: lease.id,
+        attemptId: lease.attemptId,
+        driver: lease.driver,
+        role: lease.role,
+        ...payload as Record<string, JsonValue>,
+      },
+      provenance: { source: "daemon" },
+    });
+    this.store.touchWorkerProcessLease(lease.id, { lastEventCursor: event.cursor });
   }
 
   private startRequest(agentId: string, order: AgentWorkOrder, model: string) {
@@ -731,55 +2996,246 @@ export class AgentCoordinator {
   }
 
   private onDriverEvent(agentId: string, driverEvent: DriverEvent): void {
+    if (!this.acceptingDriverEvents) return;
+    if (!driverEvent.nativeEventId) {
+      this.applyDriverEvent(agentId, driverEvent);
+      return;
+    }
+    this.store.transaction(() => {
+      const claimed = this.store.claimNativeDriverEvent({
+        agentId,
+        eventKind: driverEvent.kind,
+        nativeEventId: driverEvent.nativeEventId as string,
+        claimedAt: driverEvent.occurredAt,
+      });
+      if (claimed) this.applyDriverEvent(agentId, driverEvent);
+    });
+  }
+
+  private applyDriverEvent(agentId: string, driverEvent: DriverEvent): void {
     const agent = this.get(agentId);
-    if (driverEvent.kind === "output.completed") {
+    this.persistDriverToolState(agentId, driverEvent);
+    const terminalEvidence = ["output.completed", "run.completed", "run.failed", "run.cancelled"].includes(driverEvent.kind);
+    const preserveTerminalState = terminalEvidence && isTerminalAgentStatus(agent.status);
+    const suppressEscalationExit = driverEvent.kind === "run.failed"
+      && agent.status === "cancel-requested"
+      && this.escalatingCancellation.has(agentId);
+    if (preserveTerminalState || suppressEscalationExit) {
+      // Driver transports can replay, reorder, or report a late process exit
+      // after a run has already settled. Keep the raw evidence below, but do
+      // not let a conflicting late event or force-termination transport exit
+      // rewrite the durable terminal result.
+    } else if (driverEvent.kind === "output.completed") {
       const payload = driverEvent.payload as Record<string, JsonValue>;
       const structured = payload.structuredOutput ?? (typeof payload.text === "string" ? extractStructuredOutput(payload.text) : driverEvent.payload);
-      const rawOrder = this.store.getMetadata<JsonValue>(`work-order:${agentId}`);
-      const order = rawOrder ? AgentWorkOrderSchema.parse(rawOrder) : null;
-      if (order) {
-        const validationError = this.validateOutput(order, structured);
-        if (validationError) {
-          const failed = this.update(agent, { status: "failed", output: structured, error: validationError, finishedAt: nowIso() });
-          this.event(failed, "agent.failed", { error: validationError });
-          this.resolveTerminal(agentId);
-        } else this.update(agent, { output: structured });
-      } else this.update(agent, { output: structured });
+      // An output frame is evidence, not an authoritative terminal result. Some
+      // harnesses emit an empty or partial output immediately before reporting a
+      // provider/transport failure. Persist it for inspection, then wait for the
+      // native terminal event so a secondary schema diagnostic cannot overwrite
+      // the actual failure cause.
+      this.update(agent, { output: structured });
     } else if (driverEvent.kind === "run.completed") {
       const latest = this.get(agentId);
-      if (latest.status !== "failed") {
-        const rawOrder = this.store.getMetadata<JsonValue>(`work-order:${agentId}`);
-        const order = rawOrder ? AgentWorkOrderSchema.parse(rawOrder) : null;
-        const validationError = order ? this.validateOutput(order, latest.output) : "Persisted work order is unavailable at completion.";
-        if (validationError) {
-          const failed = this.update(latest, { status: "failed", error: validationError, finishedAt: nowIso() });
-          this.event(failed, "agent.failed", { error: validationError });
-        } else this.update(latest, { status: "completed", finishedAt: nowIso() });
-      }
+      const rawOrder = this.store.getMetadata<JsonValue>(`work-order:${agentId}`);
+      const order = rawOrder ? AgentWorkOrderSchema.parse(rawOrder) : null;
+      const validationError = order ? this.validateOutput(order, latest.output) : "Persisted work order is unavailable at completion.";
+      if (validationError) {
+        const failed = this.update(latest, { status: "failed", error: validationError, finishedAt: nowIso() });
+        this.event(failed, "agent.failed", { error: validationError });
+        void this.retireSession(agentId);
+      } else this.update(latest, { status: "completed", finishedAt: nowIso() });
+      this.settleRecoveryDispatch(agentId, "completed");
+      this.settleFollowUpDispatch(agentId, validationError ? "failed" : "completed");
       this.resolveTerminal(agentId);
     } else if (driverEvent.kind === "run.failed") {
       const latest = this.get(agentId);
-      if (latest.status !== "failed") {
-        const failed = this.update(latest, { status: "failed", error: JSON.stringify(driverEvent.payload), finishedAt: nowIso() });
-        this.event(failed, "agent.failed", { error: failed.error ?? "Native run failed." });
-      }
+      const rawOrder = this.store.getMetadata<JsonValue>(`work-order:${agentId}`);
+      const order = rawOrder ? AgentWorkOrderSchema.parse(rawOrder) : null;
+      const outputValidationError = order && latest.output !== null
+        ? this.validateOutput(order, latest.output)
+        : null;
+      const failed = this.update(latest, { status: "failed", error: driverFailureMessage(driverEvent.payload), finishedAt: nowIso() });
+      this.event(failed, "agent.failed", {
+        error: failed.error ?? "Native run failed.",
+        ...(outputValidationError ? { outputValidationError } : {}),
+      });
+      this.settleRecoveryDispatch(agentId, "failed");
+      this.settleFollowUpDispatch(agentId, "failed");
+      void this.retireSession(agentId);
       this.resolveTerminal(agentId);
     } else if (driverEvent.kind === "run.cancelled") {
-      this.update(agent, { status: "cancelled", finishedAt: nowIso() });
+      const cancelled = this.update(agent, { status: "cancelled", finishedAt: nowIso() });
+      this.event(cancelled, "agent.cancelled", driverEvent.payload);
+      this.settleRecoveryDispatch(agentId, "cancelled");
+      this.settleFollowUpDispatch(agentId, "cancelled");
+      void this.retireSession(agentId);
       this.resolveTerminal(agentId);
     } else if (driverEvent.kind === "usage.recorded") {
       this.recordUsage(agent, driverEvent.payload);
     }
-    this.store.appendEvent({
+    const rawEvent = this.store.appendEvent({
       type: `driver.${driverEvent.kind}`, workflowId: agent.workflowId, runId: agent.runId, agentId,
       occurredAt: driverEvent.occurredAt, payload: driverEvent.payload,
       provenance: { source: "driver", driver: agent.harness ?? undefined, ...(driverEvent.nativeEventId ? { nativeEventId: driverEvent.nativeEventId } : {}) },
     });
+    const leaseId = this.processLeaseIds.get(agentId);
+    if (leaseId) {
+      const terminalRun = ["run.completed", "run.failed", "run.cancelled"].includes(driverEvent.kind);
+      this.store.touchWorkerProcessLease(leaseId, {
+        lastEventCursor: rawEvent.cursor,
+        ...(terminalRun ? { activeTurnId: null } : {}),
+      });
+    }
+  }
+
+  private persistDriverToolState(agentId: string, driverEvent: DriverEvent): void {
+    const tracksTool = driverEvent.kind === "tool.started" || driverEvent.kind === "tool.completed";
+    const terminalRun = driverEvent.kind === "run.completed" || driverEvent.kind === "run.failed" || driverEvent.kind === "run.cancelled";
+    if (!tracksTool && !terminalRun) return;
+    const persisted = DriverSessionSchema.safeParse(this.store.getMetadata<JsonValue>(`driver-session:${agentId}`));
+    const retained = this.store.getMetadata<JsonValue>(`driver-active-tools:${agentId}`);
+    const activeToolIds = new Set(
+      Array.isArray(retained)
+        ? retained.filter((value): value is string => typeof value === "string")
+        : persisted.success && Array.isArray(persisted.data.metadata.activeToolIds)
+          ? persisted.data.metadata.activeToolIds.filter((value): value is string => typeof value === "string")
+        : [],
+    );
+    if (tracksTool) {
+      const payload = driverEvent.payload !== null && typeof driverEvent.payload === "object" && !Array.isArray(driverEvent.payload)
+        ? driverEvent.payload as Record<string, JsonValue>
+        : {};
+      const toolCallId = typeof payload.toolCallId === "string" ? payload.toolCallId : driverEvent.nativeEventId;
+      if (toolCallId) {
+        if (driverEvent.kind === "tool.started") activeToolIds.add(toolCallId);
+        else activeToolIds.delete(toolCallId);
+      }
+    }
+    if (terminalRun) activeToolIds.clear();
+    this.store.setMetadata(`driver-active-tools:${agentId}`, [...activeToolIds]);
+    if (!persisted.success) return;
+    const session = DriverSessionSchema.parse({
+      ...persisted.data,
+      metadata: { ...persisted.data.metadata, activeToolIds: [...activeToolIds] },
+    });
+    this.store.setMetadata(`driver-session:${agentId}`, session as unknown as JsonValue);
+    if (this.sessions.has(agentId)) this.sessions.set(agentId, session);
   }
 
   private resolveTerminal(agentId: string): void {
     this.terminalResolvers.get(agentId)?.();
     this.terminalResolvers.delete(agentId);
+  }
+
+  private retireSession(
+    agentId: string,
+    knownDriver?: ReturnType<DriverRegistry["get"]>,
+    knownSession?: DriverSession,
+  ): Promise<void> {
+    const existing = this.sessionRetirements.get(agentId);
+    if (existing) return existing;
+    const session = knownSession ?? this.sessions.get(agentId);
+    this.sessions.delete(agentId);
+    const agent = this.store.getAgent(agentId);
+    if (!session || (!knownDriver && !agent?.harness)) return Promise.resolve();
+    const driver = knownDriver ?? this.drivers.get(agent?.harness as ResolvedHarness);
+    const intent = this.sessionRetirementIntent(agentId);
+    const matchingIntent = intent?.state === "requested"
+      && intent.driver === session.driver
+      && intent.nativeSessionId === session.nativeSessionId
+      ? intent
+      : null;
+    if (matchingIntent) {
+      this.store.durableTransaction(() => {
+        this.store.setMetadata(this.sessionRetirementKey(agentId), {
+          ...matchingIntent,
+          attempts: matchingIntent.attempts + 1,
+          error: null,
+          updatedAt: nowIso(),
+        } as unknown as JsonValue);
+      });
+    }
+    const retirement = Promise.resolve().then(async () => {
+      if (driver.forceTerminate) await driver.forceTerminate(session);
+      else if (driver.detach) await driver.detach(session);
+      else if (matchingIntent) throw new Error(`${session.driver} cannot retire a retained native session.`);
+      if (matchingIntent) {
+        const timestamp = nowIso();
+        const latestIntent = this.sessionRetirementIntent(agentId) ?? matchingIntent;
+        this.store.durableTransaction(() => {
+          this.store.setMetadata(this.sessionRetirementKey(agentId), {
+            ...latestIntent,
+            state: "retired",
+            error: null,
+            updatedAt: timestamp,
+            retiredAt: timestamp,
+          } as unknown as JsonValue);
+          const latestAgent = this.store.getAgent(agentId);
+          if (latestAgent) this.event(latestAgent, "agent.session.retired", {
+            reason: latestIntent.reason,
+            nativeSessionId: session.nativeSessionId,
+            attempts: latestIntent.attempts,
+          });
+        });
+      }
+    }).catch((error: unknown) => {
+      const latest = this.store.getAgent(agentId);
+      const message = error instanceof Error ? error.message : String(error);
+      const pendingIntent = this.sessionRetirementIntent(agentId);
+      if (pendingIntent?.state === "requested") {
+        this.recordSessionRetirementFailure(pendingIntent, message, "terminal-session-retirement");
+      } else if (latest) {
+        this.event(latest, "agent.session.retirement-failed", {
+          error: message,
+          phase: "terminal-session-retirement",
+        });
+      }
+    }).finally(() => {
+      if (this.sessionRetirements.get(agentId) === retirement) this.sessionRetirements.delete(agentId);
+    });
+    this.sessionRetirements.set(agentId, retirement);
+    return retirement;
+  }
+
+  private sessionRetirementKey(agentId: string): string {
+    return `agent-session-retirement:${agentId}`;
+  }
+
+  private sessionRetirementIntent(agentId: string): SessionRetirementIntent | null {
+    const raw = this.store.getMetadata<JsonValue>(this.sessionRetirementKey(agentId));
+    if (!raw) return null;
+    const parsed = SessionRetirementIntentSchema.safeParse(raw);
+    return parsed.success ? parsed.data : null;
+  }
+
+  private pendingSessionRetirementIntents(): SessionRetirementIntent[] {
+    return this.store.listMetadata<JsonValue>("agent-session-retirement:")
+      .flatMap((entry) => {
+        const parsed = SessionRetirementIntentSchema.safeParse(entry.value);
+        return parsed.success && parsed.data.state === "requested" ? [parsed.data] : [];
+      });
+  }
+
+  private recordSessionRetirementFailure(
+    intent: SessionRetirementIntent,
+    error: string,
+    phase: string,
+  ): void {
+    this.store.durableTransaction(() => {
+      this.store.setMetadata(this.sessionRetirementKey(intent.agentId), {
+        ...intent,
+        state: "requested",
+        error,
+        updatedAt: nowIso(),
+      } as unknown as JsonValue);
+      const latest = this.store.getAgent(intent.agentId);
+      if (latest) this.event(latest, "agent.session.retirement-failed", {
+        error,
+        phase,
+        reason: intent.reason,
+        nativeSessionId: intent.nativeSessionId,
+      });
+    });
   }
 
   private validateOutput(order: AgentWorkOrder, output: JsonValue): string | null {

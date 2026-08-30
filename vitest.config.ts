@@ -17,6 +17,10 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    setupFiles: [source("./tests/setup.ts")],
+    env: {
+      SYMPHONY_DAEMON_SECRET: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    },
     include: ["tests/**/*.test.ts", "packages/**/*.test.ts"],
     testTimeout: 15_000,
     hookTimeout: 15_000,

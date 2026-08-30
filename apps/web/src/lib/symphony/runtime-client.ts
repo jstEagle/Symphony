@@ -1,5 +1,6 @@
 import type {
   AgentObservation,
+  AgentSessionLog,
   AgentRecord,
   BootstrapEnvelope,
   ChatAttachment,
@@ -9,6 +10,7 @@ import type {
   ConversationMessage,
   CostSummary,
   DriverReport,
+  DriverAuthenticationResult,
   EventEnvelope,
   JsonValue,
   ModelDescriptor,
@@ -23,6 +25,10 @@ import { previewEnvelope } from "./preview";
 import { symphonyConfig } from "@/symphony.config";
 
 export type RuntimeMode = "preview" | "runtime";
+export type RuntimeCatalog = {
+  drivers: DriverReport[];
+  models: ModelDescriptor[];
+};
 
 type DaemonBootstrap = {
   cursor: number;
@@ -39,6 +45,24 @@ type DaemonBootstrap = {
   settings: RuntimeSettings;
   daemon: BootstrapEnvelope["daemon"];
 };
+
+export class RuntimeRequestError extends Error {
+  readonly status: number;
+
+  constructor(status: number, message: string) {
+    super(message);
+    this.name = "RuntimeRequestError";
+    this.status = status;
+  }
+}
+
+export function isRetryableRuntimeRequestError(error: unknown): boolean {
+  if (!(error instanceof RuntimeRequestError)) return true;
+  return error.status === 408
+    || error.status === 425
+    || error.status === 429
+    || error.status >= 500;
+}
 
 async function request<T>(
   path: string,
@@ -59,7 +83,7 @@ async function request<T>(
   const value = text ? (JSON.parse(text) as T) : (undefined as T);
   if (!response.ok) {
     const error = typeof value === "object" && value && "error" in value ? String((value as { error: unknown }).error) : text;
-    throw new Error(error || `${response.status} ${response.statusText}`);
+    throw new RuntimeRequestError(response.status, error || `${response.status} ${response.statusText}`);
   }
   return value;
 }
@@ -86,11 +110,9 @@ export async function fetchBootstrap(
 ): Promise<BootstrapEnvelope> {
   if (mode === "preview") return previewEnvelope();
 
-  const [bootstrap, threads, drivers, models] = await Promise.all([
+  const [bootstrap, threads] = await Promise.all([
     request<DaemonBootstrap>("/bootstrap", { signal }),
     request<ChatThreadRecord[]>("/threads", { signal }).catch(() => [] as ChatThreadRecord[]),
-    request<DriverReport[]>("/drivers", { signal }).catch(() => [] as DriverReport[]),
-    request<ModelDescriptor[]>("/models", { signal }).catch(() => [] as ModelDescriptor[]),
   ]);
 
   return {
@@ -110,27 +132,47 @@ export async function fetchBootstrap(
     runCosts: normalizeCostMap(bootstrap.runCosts),
     agentCosts: normalizeCostMap(bootstrap.agentCosts),
     plugins: bootstrap.plugins ?? [],
-    drivers,
-    models,
+    drivers: [],
+    models: [],
     settings: bootstrap.settings,
     inbox: [],
     daemon: bootstrap.daemon,
   };
 }
 
+export async function fetchRuntimeCatalog(signal?: AbortSignal): Promise<RuntimeCatalog> {
+  const [drivers, models] = await Promise.all([
+    request<DriverReport[]>("/drivers", { signal }).catch(() => [] as DriverReport[]),
+    request<ModelDescriptor[]>("/models", { signal }).catch(() => [] as ModelDescriptor[]),
+  ]);
+  return { drivers, models };
+}
+
 export async function fetchThread(id: string, signal?: AbortSignal) {
   return request<{ thread: ChatThreadRecord; messages: ConversationMessage[] }>(`/threads/${id}`, { signal });
 }
 
-export async function createThread(input: {
+export type ChatSearchResponse = {
+  method: "openrouter-rerank" | "fuzzy";
+  results: Array<{ threadId: string; title: string; groupId: string | null; score: number; snippet: string }>;
+};
+
+export async function searchChats(query: string, signal?: AbortSignal) {
+  return request<ChatSearchResponse>(`/search/chats?q=${encodeURIComponent(query)}`, { signal });
+}
+
+export type ChatThreadCreateInput = {
   title?: string;
   projectId?: string;
   groupId?: string | null;
   workspacePath?: string;
   mission?: { statement: string; keyResults?: string[] };
-}) {
+};
+
+export async function createThread(input: ChatThreadCreateInput, idempotencyKey: string) {
   return request<ChatThreadRecord>("/threads", {
     method: "POST",
+    headers: { "idempotency-key": idempotencyKey },
     body: JSON.stringify(input),
   });
 }
@@ -167,16 +209,24 @@ export async function sendThreadMessage(
   );
 }
 
-export async function updateRuntimeSettings(patch: Partial<Pick<RuntimeSettings, "conductor" | "agents">>) {
+export async function updateRuntimeSettings(patch: Partial<Pick<RuntimeSettings, "conductor" | "agents" | "uiUtilities">>) {
   return request<RuntimeSettings>("/settings", {
     method: "PATCH",
     body: JSON.stringify(patch),
   });
 }
 
-export async function updateNativeHarness(driver: string) {
+export async function updateNativeHarness(driver: string, idempotencyKey: string) {
   return request<{ report: DriverReport; output: string }>(`/drivers/${encodeURIComponent(driver)}/update`, {
     method: "POST",
+    headers: { "idempotency-key": idempotencyKey },
+  });
+}
+
+export async function authenticateNativeHarness(driver: string, idempotencyKey: string) {
+  return request<DriverAuthenticationResult>(`/drivers/${encodeURIComponent(driver)}/authenticate`, {
+    method: "POST",
+    headers: { "idempotency-key": idempotencyKey },
   });
 }
 
@@ -188,13 +238,48 @@ export async function observeAgent(agentId: string, level: ObservationLevel, sig
   return request<AgentObservation | JsonValue>(`/agents/${agentId}/observe?level=${level}`, { signal });
 }
 
+export async function fetchAgentMessages(agentId: string, signal?: AbortSignal) {
+  return request<{ agentId: string; messages: ConversationMessage[] }>(
+    `/agents/${encodeURIComponent(agentId)}/messages`,
+    { signal },
+  );
+}
+
+export async function fetchAgentLogs(agentId: string, after = 0, limit = 500, signal?: AbortSignal) {
+  const tail = after === 0 ? "&tail=true" : "";
+  return request<AgentSessionLog>(`/agents/${encodeURIComponent(agentId)}/logs?after=${after}&limit=${limit}${tail}`, { signal });
+}
+
+export async function fetchRunEvents(runId: string, signal?: AbortSignal): Promise<EventEnvelope[]> {
+  const events: EventEnvelope[] = [];
+  let cursor = 0;
+  let hasMore = true;
+  while (hasMore) {
+    const page = await request<{
+      runId: string;
+      cursor: number;
+      hasMore: boolean;
+      events: EventEnvelope[];
+    }>(`/runs/${encodeURIComponent(runId)}/events?after=${cursor}&limit=2000`, { signal });
+    events.push(...page.events);
+    hasMore = page.hasMore;
+    if (page.cursor <= cursor) break;
+    cursor = page.cursor;
+  }
+  return events;
+}
+
 export async function cancelAgent(agentId: string) {
-  return request<void>(`/agents/${agentId}/cancel`, { method: "POST" });
+  return request<void>(`/agents/${agentId}/cancel`, {
+    method: "POST",
+    headers: { "idempotency-key": `web:cancel-agent:${crypto.randomUUID()}` },
+  });
 }
 
 export async function steerAgent(agentId: string, content: string) {
   return request<JsonValue>(`/agents/${agentId}/messages`, {
     method: "POST",
+    headers: { "idempotency-key": `web:message-agent:${crypto.randomUUID()}` },
     body: JSON.stringify({ content }),
   });
 }

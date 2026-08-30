@@ -24,7 +24,9 @@ import {
   formatClock,
   formatElapsed,
   harnessTitle,
+  isActivelyWorkingAgent,
   isLiveAgentState,
+  isSettledAgent,
   loaderForHarness,
   relativeTime,
 } from "./format";
@@ -36,6 +38,10 @@ const ACTIVITY_EVENT_TYPES = new Set([
   "agent.message.sent",
   "agent.cancelled",
   "agent.failed",
+  "agent.recovered",
+  "agent.recovery.continued",
+  "agent.cancel.reissued",
+  "agent.interrupted",
   "driver.run.started",
   "driver.tool.started",
   "driver.usage.recorded",
@@ -99,11 +105,12 @@ export function threadToSummary(
 ): ConversationSummary {
   const related = agentsForThread(thread, agents);
   const conductor = related.find((agent) => agent.id === thread.conductorAgentId) ?? related.find((agent) => agent.depth === 0);
-  const live = related.filter((agent) => isLiveAgentState(compactAgentState(agent.status)));
-  const failed = related.some((agent) => agent.status === "failed" || agent.status === "lost");
+  const live = related.filter((agent) => isActivelyWorkingAgent(compactAgentState(agent.status)));
+  const failed = related.some((agent) => compactAgentState(agent.status) === "failed");
+  const cancellationPending = related.some((agent) => agent.status === "cancel-requested");
   const state: ConversationState = live.length
     ? "running"
-    : failed
+    : failed || cancellationPending
       ? "attention"
       : related.some((agent) => agent.status === "completed") && related.every((agent) => !isLiveAgentState(compactAgentState(agent.status)))
         ? "completed"
@@ -139,20 +146,26 @@ export function snapshotForThread(
   const mission = readMission(thread.mission);
   const { nodes, edges } = layoutFromAgents(relatedAgents);
   const activity = eventsToActivity(events, relatedAgents);
-  const liveCount = relatedAgents.filter((agent) => isLiveAgentState(agent.state)).length;
+  const liveCount = relatedAgents.filter((agent) => isActivelyWorkingAgent(agent.state)).length;
+  const relatedIds = new Set(relatedAgents.map((agent) => agent.id));
+  const traceEvents = events.filter((event) =>
+    (event.agentId !== null && relatedIds.has(event.agentId))
+    || event.runId === (run?.id ?? `chat-run:${thread.id}`)
+    || event.workflowId === (run?.workflowId ?? `chat:${thread.id}`),
+  );
   return {
     runId: run?.id ?? `chat-run:${thread.id}`,
     workflowId: run?.workflowId ?? `chat:${thread.id}`,
     workspace: thread.workspacePath,
     mode: envelope.mode === "preview" ? "preview" : "live",
     mission,
-    phase: phaseFor(run?.status, liveCount, relatedAgents.length),
+    phase: phaseForChat(relatedAgents, liveCount),
     cost: run ? (envelope.runCosts[run.id] ?? unavailableCost()) : unavailableCost(),
     agents: relatedAgents,
     nodes,
     edges,
     events: activity,
-    runStatus: run?.status,
+    traceEvents,
     cancelRequested: run?.cancelRequested,
   };
 }
@@ -292,36 +305,78 @@ function sanitizeLegacyAgentObjective(objective: string): string {
   return objective.replace(LEGACY_REVIEW_DIRECTIVE, NEUTRAL_COORDINATION_DIRECTIVE);
 }
 
-function layoutFromAgents(agents: Agent[]): { nodes: WorkNode[]; edges: WorkEdge[] } {
+export function layoutFromAgents(agents: Agent[]): { nodes: WorkNode[]; edges: WorkEdge[] } {
   if (agents.length === 0) return { nodes: [], edges: [] };
-  const byParent = new Map<string | undefined, Agent[]>();
+  const agentIds = new Set(agents.map((agent) => agent.id));
+  const byParent = new Map<string, Agent[]>();
   for (const agent of agents) {
+    if (!agent.parentId || agent.parentId === agent.id || !agentIds.has(agent.parentId)) continue;
     const key = agent.parentId;
     const list = byParent.get(key) ?? [];
     list.push(agent);
     byParent.set(key, list);
   }
+  for (const children of byParent.values()) children.sort(compareAgentsForLayout);
+
   const nodes: WorkNode[] = [];
   const edges: WorkEdge[] = [];
-  const place = (agent: Agent, x: number, y: number) => {
+  const placed = new Set<string>();
+  const visiting = new Set<string>();
+  const rowGap = 96;
+  const columnGap = 356;
+
+  const leafSpan = (agent: Agent): number => {
+    if (visiting.has(agent.id)) return 1;
+    visiting.add(agent.id);
+    const children = (byParent.get(agent.id) ?? []).filter((child) => !visiting.has(child.id));
+    const span = Math.max(1, children.reduce((total, child) => total + leafSpan(child), 0));
+    visiting.delete(agent.id);
+    return span;
+  };
+
+  const place = (agent: Agent, depth: number, topRow: number): number => {
+    if (placed.has(agent.id)) return 1;
+    placed.add(agent.id);
+    const children = (byParent.get(agent.id) ?? []).filter((child) => !placed.has(child.id));
+    const childSpans = children.map((child) => leafSpan(child));
+    const span = Math.max(1, childSpans.reduce((total, childSpan) => total + childSpan, 0));
+    const centerRow = children.length
+      ? topRow + (span - 1) / 2
+      : topRow;
     nodes.push({
       id: agent.id,
       label: agent.name,
       detail: `${agent.harness} · ${agent.access}`,
       agentId: agent.id,
       state: agent.state,
-      x,
-      y,
+      x: depth * columnGap,
+      y: centerRow * rowGap,
     });
-    const children = byParent.get(agent.id) ?? [];
+    let childTop = topRow;
     children.forEach((child, index) => {
       edges.push({ from: agent.id, to: child.id, kind: "delegation" });
-      place(child, x + 210, y + index * 96 - ((children.length - 1) * 48));
+      place(child, depth + 1, childTop);
+      childTop += childSpans[index] ?? 1;
     });
+    return span;
   };
-  const roots = agents.filter((agent) => !agent.parentId || !agents.some((item) => item.id === agent.parentId));
-  roots.forEach((root, index) => place(root, 36, 80 + index * 140));
+
+  const roots = agents
+    .filter((agent) => !agent.parentId || agent.parentId === agent.id || !agentIds.has(agent.parentId))
+    .sort(compareAgentsForLayout);
+  let nextRow = 0;
+  for (const root of roots) nextRow += place(root, 0, nextRow) + 1;
+  // Malformed persisted parent cycles should remain visible instead of disappearing.
+  for (const agent of agents) {
+    if (!placed.has(agent.id)) nextRow += place(agent, 0, nextRow) + 1;
+  }
   return { nodes, edges };
+}
+
+function compareAgentsForLayout(left: Agent, right: Agent): number {
+  const leftAt = left.startedAt ?? left.updatedAt ?? "";
+  const rightAt = right.startedAt ?? right.updatedAt ?? "";
+  return leftAt.localeCompare(rightAt) || left.id.localeCompare(right.id);
 }
 
 function eventsToActivity(events: EventEnvelope[], agents: Agent[]): ActivityEvent[] {
@@ -339,7 +394,7 @@ function eventsToActivity(events: EventEnvelope[], agents: Agent[]): ActivityEve
       title: activityTitle(event, event.agentId ? byId.get(event.agentId) : undefined),
       detail: activityDetail(event),
       agentId: event.agentId ?? undefined,
-      source: event.provenance?.source === "observer" || event.provenance?.source === "driver" ? "runtime-observed" : "agent-reported",
+      source: activitySource(event),
       cursor: event.cursor,
     }));
 }
@@ -355,6 +410,10 @@ function activityTitle(event: EventEnvelope, agent: Agent | undefined): string {
     case "agent.routed": return `${name} routed`;
     case "agent.message.sent": return "Follow-up delivered";
     case "agent.cancelled": return `${name} cancelled`;
+    case "agent.recovered": return `${name} recovered`;
+    case "agent.recovery.continued": return `${name} recovery continued`;
+    case "agent.cancel.reissued": return `${name} cancellation reissued`;
+    case "agent.interrupted": return `${name} interrupted`;
     case "agent.failed":
     case "driver.run.failed": return `${name} failed`;
     case "driver.run.started": return `${name} started`;
@@ -377,6 +436,36 @@ function activityDetail(event: EventEnvelope): string {
     }
     case "agent.message.sent":
       return "Sent to the agent's active native session.";
+    case "agent.recovered": {
+      const continuity = payloadString(event, "continuity");
+      const recoveredStatus = payloadString(event, "recoveredStatus");
+      switch (continuity) {
+        case "native-run-reattached":
+          return "Reattached to the active native run after the daemon restarted.";
+        case "checkpoint-continuation":
+          return "Restored the native session and continued from its durable checkpoint.";
+        case "session-restored":
+          return "Restored the reusable native session after the daemon restarted.";
+        case "cancellation-reissued":
+          return "Restored the native run and reissued its pending cancellation request.";
+        case "cancellation-settled":
+          return "Recovered the native session and confirmed its cancellation.";
+        case "terminal-event-observed":
+          return `Recovered after observing the native terminal event${recoveredStatus ? ` · ${recoveredStatus}` : ""}.`;
+        case "native-terminal-state":
+          return `Recovered the native terminal state${recoveredStatus ? ` · ${recoveredStatus}` : ""}.`;
+        default:
+          return recoveredStatus ? `Recovered native session · ${recoveredStatus}.` : "Recovered the native session after the daemon restarted.";
+      }
+    }
+    case "agent.recovery.continued":
+      return payloadRecord(event)?.queued === true
+        ? "Queued a checkpoint-aware continuation in the recovered native session."
+        : "Delivered a checkpoint-aware continuation to the recovered native session.";
+    case "agent.cancel.reissued":
+      return "Reissued the durable cancellation request to the recovered native run.";
+    case "agent.interrupted":
+      return clipDetail(payloadString(event, "error") ?? "The native run could not be recovered safely.");
     case "driver.run.started": {
       const model = payloadString(event, "model");
       const toolCount = payloadArrayLength(event, "tools");
@@ -435,6 +524,15 @@ function activityKind(type: string): ActivityEvent["kind"] {
   return "system";
 }
 
+function activitySource(event: EventEnvelope): ActivityEvent["source"] {
+  return event.provenance?.source === "driver"
+    || event.provenance?.source === "observer"
+    || event.provenance?.source === "daemon"
+    || event.provenance?.source === "workflow"
+    ? "runtime-observed"
+    : "agent-reported";
+}
+
 function eventTitle(event: EventEnvelope): string {
   return event.type.replaceAll(".", " · ").replaceAll("_", " ");
 }
@@ -469,12 +567,12 @@ function dedupeInbox(items: InboxItem[]): InboxItem[] {
   });
 }
 
-function phaseFor(status: string | undefined, liveCount: number, total: number): string {
-  if (status === "completed") return "Completed";
-  if (status === "failed") return "Failed";
-  if (status === "cancelled") return "Cancelled";
+function phaseForChat(agents: Agent[], liveCount: number): string {
+  const total = agents.length;
   if (liveCount > 0) return `${liveCount} active · ${total} agents`;
-  if (total > 0) return `${total} agents`;
+  if (agents.some((agent) => agent.nativeStatus === "cancel-requested")) return "Cancellation requested";
+  if (agents.some((agent) => agent.state === "failed")) return "Needs attention";
+  if (total > 0) return "Ready";
   return "Ready";
 }
 
@@ -501,6 +599,7 @@ export function emptyRunSnapshot(
     nodes: [],
     edges: [],
     events: [],
+    traceEvents: [],
   };
 }
 
@@ -512,15 +611,18 @@ export function messagesForThread(
 }
 
 export function progressCopy(snapshot: RunSnapshot): string {
-  const live = snapshot.agents.filter((agent) => isLiveAgentState(agent.state)).length;
+  const live = snapshot.agents.filter((agent) => isActivelyWorkingAgent(agent.state)).length;
   const total = snapshot.agents.length;
   if (total === 0 && snapshot.nodes.length <= 1) {
     return snapshot.phase === "Ready" ? "Ready" : snapshot.phase;
   }
   if (snapshot.nodes.length > 1) {
-    const done = snapshot.nodes.filter((node) => node.state === "succeeded").length;
-    const finite = `${done} / ${snapshot.nodes.length} steps`;
-    return finite;
+    const agentsById = new Map(snapshot.agents.map((agent) => [agent.id, agent]));
+    const settled = snapshot.nodes.filter((node) => {
+      const agent = node.agentId ? agentsById.get(node.agentId) : agentsById.get(node.id);
+      return isSettledAgent(agent?.state ?? node.state, agent?.nativeStatus);
+    }).length;
+    return `${settled} / ${snapshot.nodes.length} settled`;
   }
   return [`${live} live`, total ? `${total} agents` : null]
     .filter(Boolean)

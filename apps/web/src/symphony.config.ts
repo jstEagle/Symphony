@@ -1,5 +1,5 @@
 export const symphonyConfig = {
-  dataMode: "auto" as "auto" | "preview" | "runtime",
+  dataMode: "runtime" as "auto" | "preview" | "runtime",
   apiBasePath: "/v1",
   staleAfterMs: 15_000,
   reconnect: {

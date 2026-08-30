@@ -27,6 +27,7 @@ import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 import { AgentLoader } from "@/components/symphony/agent-tool";
 import { cn } from "@/lib/utils";
+import { DotmSquare3 } from "@/components/ui/dotm-square-3";
 import {
   ActionBarMorePrimitive,
   ActionBarPrimitive,
@@ -436,7 +437,11 @@ const AssistantMessage: FC = () => {
                 );
               }
               case "text":
-                return <MarkdownText />;
+                return (
+                  <div data-slot="aui_assistant-text-part" className="my-3 first:mt-0 last:mb-0">
+                    <MarkdownText />
+                  </div>
+                );
               case "reasoning":
                 return <Reasoning {...part} />;
               case "tool-call":
@@ -459,10 +464,10 @@ const AssistantMessage: FC = () => {
                 return (
                   <span
                     data-slot="aui_assistant-message-indicator"
-                    className="animate-pulse font-sans"
+                    className="ms-2 inline-flex size-4 translate-y-1 items-center justify-center align-baseline text-muted-foreground"
                     aria-label="Assistant is working"
                   >
-                    {"●"}
+                    <DotmSquare3 size={16} dotSize={2.5} color="currentColor" ariaLabel="Assistant is working" animated />
                   </span>
                 );
               default:

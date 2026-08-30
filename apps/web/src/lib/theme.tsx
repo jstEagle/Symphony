@@ -32,12 +32,18 @@ export function ThemeRuntime() {
   useEffect(() => {
     let active = true;
     let controller = new AbortController();
+    let appliedSignature = JSON.stringify(defaultTheme);
     const refresh = () => {
       controller.abort();
       controller = new AbortController();
       void fetch("/v1/theme", { cache: "no-store", signal: controller.signal })
         .then((response) => response.ok ? response.json() as Promise<SymphonyTheme> : Promise.reject(new Error("Theme unavailable")))
-        .then((theme) => { if (active) applyTheme(theme); })
+        .then((theme) => {
+          const signature = JSON.stringify(theme);
+          if (!active || signature === appliedSignature) return;
+          appliedSignature = signature;
+          applyTheme(theme);
+        })
         .catch(() => undefined);
     };
     refresh();

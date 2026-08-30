@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { LoadedConfig } from "@symphony/config";
+import { environmentWithoutDaemonSecret, type LoadedConfig } from "@symphony/config";
 import type { DriverDoctorResult, ResolvedHarness } from "@symphony/protocol";
 import type { DriverRegistry } from "@symphony/drivers";
 
@@ -14,11 +14,22 @@ export class HarnessMaintenance {
   constructor(private readonly loaded: LoadedConfig, private readonly drivers: DriverRegistry) {}
 
   async reports(forceLatest = false): Promise<DriverDoctorResult[]> {
-    return await Promise.all(this.drivers.list().map(async (driver) => {
-      const report = await driver.doctor();
-      if (!isMaintained(driver.id)) return { ...report, updateSupported: false, updateAvailable: null, latestVersion: null, checkedAt: new Date().toISOString() };
-      return await this.enrich(driver.id, report, forceLatest);
-    }));
+    return await Promise.all(this.drivers.list().map(async (driver) => await this.report(driver.id, forceLatest)));
+  }
+
+  async report(id: ResolvedHarness, forceLatest = false): Promise<DriverDoctorResult> {
+    const driver = this.drivers.get(id);
+    const report = await driver.doctor();
+    if (!isMaintained(id)) {
+      return {
+        ...report,
+        updateSupported: false,
+        updateAvailable: null,
+        latestVersion: null,
+        checkedAt: new Date().toISOString(),
+      };
+    }
+    return await this.enrich(id, report, forceLatest);
   }
 
   async update(id: ResolvedHarness): Promise<{ report: DriverDoctorResult; output: string }> {
@@ -31,7 +42,7 @@ export class HarnessMaintenance {
     }
     const result = await execFileAsync(update.command, update.args, {
       cwd: this.loaded.rootDirectory,
-      env: process.env,
+      env: environmentWithoutDaemonSecret(),
       timeout: 5 * 60_000,
       maxBuffer: 2_000_000,
     });

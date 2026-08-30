@@ -1,28 +1,39 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import type { DotMatrixPhase } from "@/lib/dotmatrix-core";
 
+const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
+const reducedMotionListeners = new Set<() => void>();
+let reducedMotionMedia: MediaQueryList | null = null;
+
+function getReducedMotionMedia(): MediaQueryList | null {
+  if (typeof window === "undefined") return null;
+  reducedMotionMedia ??= window.matchMedia(REDUCED_MOTION_QUERY);
+  return reducedMotionMedia;
+}
+
+function emitReducedMotionChange() {
+  reducedMotionListeners.forEach((listener) => listener());
+}
+
+function subscribeReducedMotion(listener: () => void): () => void {
+  const media = getReducedMotionMedia();
+  reducedMotionListeners.add(listener);
+  if (media && reducedMotionListeners.size === 1) media.addEventListener("change", emitReducedMotionChange);
+  return () => {
+    reducedMotionListeners.delete(listener);
+    if (media && reducedMotionListeners.size === 0) media.removeEventListener("change", emitReducedMotionChange);
+  };
+}
+
+function reducedMotionSnapshot(): boolean {
+  return getReducedMotionMedia()?.matches ?? false;
+}
+
 export function usePrefersReducedMotion(): boolean {
-  const [prefersReducedMotion, setPrefersReducedMotion] = useState(false);
-
-  useEffect(() => {
-    const query = window.matchMedia("(prefers-reduced-motion: reduce)");
-
-    const update = () => {
-      setPrefersReducedMotion(query.matches);
-    };
-
-    update();
-    query.addEventListener("change", update);
-
-    return () => {
-      query.removeEventListener("change", update);
-    };
-  }, []);
-
-  return prefersReducedMotion;
+  return useSyncExternalStore(subscribeReducedMotion, reducedMotionSnapshot, () => false);
 }
 
 export interface UseCyclePhaseOptions {

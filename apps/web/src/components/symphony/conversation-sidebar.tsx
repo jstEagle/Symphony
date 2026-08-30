@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useDeferredValue, useMemo, useState, type FormEvent } from "react";
+import { memo, useMemo, useState, type DragEvent, type FormEvent } from "react";
 import {
   Archive,
   Bell,
@@ -15,6 +15,7 @@ import {
   PencilSimpleLine,
   Plus,
   PushPin,
+  PushPinSlash,
 } from "@phosphor-icons/react";
 import { PluginSlot } from "@/components/symphony/plugin-slots";
 import type {
@@ -35,11 +36,14 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
+  DialogTrigger,
+  type DialogHandle,
 } from "@/components/ui/dialog";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
   DropdownMenuContent,
+  DropdownMenuGroup,
   DropdownMenuItem,
   DropdownMenuLabel,
   DropdownMenuSub,
@@ -48,6 +52,18 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import {
+  readConversationOrder,
+  readPinnedConversationOrder,
+  writeConversationOrder,
+  writePinnedConversationOrder,
+} from "@/lib/symphony/ui-prefs";
+import {
+  currentConversationOrder,
+  moveIdBefore,
+  orderGroupConversations,
+  orderPinnedConversations,
+} from "@/lib/symphony/sidebar-order";
 import {
   Sidebar,
   SidebarContent,
@@ -59,7 +75,9 @@ import {
   SidebarMenu,
   SidebarMenuButton,
   SidebarMenuItem,
+  SidebarRail,
   SidebarSeparator,
+  SidebarTrigger,
   useSidebar,
 } from "@/components/ui/sidebar";
 
@@ -78,6 +96,7 @@ type ConversationSidebarProps = {
   onOpenSettings?: () => void;
   onOpenUsage?: () => void;
   onOpenInbox?: () => void;
+  commandPaletteHandle: DialogHandle;
 };
 
 export const ConversationSidebar = memo(function ConversationSidebar({
@@ -95,29 +114,35 @@ export const ConversationSidebar = memo(function ConversationSidebar({
   onOpenSettings,
   onOpenUsage,
   onOpenInbox,
+  commandPaletteHandle,
 }: ConversationSidebarProps) {
-  const [query, setQuery] = useState("");
   const [renameId, setRenameId] = useState<string | null>(null);
-  const deferredQuery = useDeferredValue(query);
   const [collapsedGroupIds, setCollapsedGroupIds] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
   const [createGroupOpen, setCreateGroupOpen] = useState(false);
+  const [conversationOrder, setConversationOrder] = useState<string[]>(() => readConversationOrder());
+  const [pinnedOrder, setPinnedOrder] = useState<string[]>(() => readPinnedConversationOrder());
+  const [draggingConversationId, setDraggingConversationId] = useState<string | null>(null);
   const { isMobile, setOpenMobile } = useSidebar();
 
-  const normalizedQuery = deferredQuery.trim().toLowerCase();
+  const normalizedQuery = "";
   const { pinned, visibleGroups } = useMemo(() => {
     const matches = (conversation: ConversationSummary) =>
       normalizedQuery.length === 0 ||
       conversation.title.toLowerCase().includes(normalizedQuery);
-    const nextPinned = directory.groups
-      .flatMap((group) => group.conversations)
-      .filter((item) => item.pinned && matches(item));
+    const nextPinned = orderPinnedConversations(
+      directory.groups
+        .flatMap((group) => group.conversations)
+        .filter((item) => item.pinned && matches(item)),
+      pinnedOrder,
+    );
     const nextGroups = directory.groups
       .map((group) => ({
         ...group,
-        conversations: group.conversations.filter(
-          (conversation) => !conversation.pinned && matches(conversation),
+        conversations: orderGroupConversations(
+          group.conversations.filter((conversation) => !conversation.pinned && matches(conversation)),
+          conversationOrder,
         ),
       }))
       .filter(
@@ -127,7 +152,52 @@ export const ConversationSidebar = memo(function ConversationSidebar({
           group.conversations.length > 0,
       );
     return { pinned: nextPinned, visibleGroups: nextGroups };
-  }, [directory.groups, normalizedQuery]);
+  }, [conversationOrder, directory.groups, normalizedQuery, pinnedOrder]);
+
+  const commitConversationOrder = (ids: string[]) => {
+    setConversationOrder(ids);
+    writeConversationOrder(ids);
+  };
+
+  const commitPinnedOrder = (ids: string[]) => {
+    setPinnedOrder(ids);
+    writePinnedConversationOrder(ids);
+  };
+
+  const dropConversation = (conversationId: string, groupId: string, beforeId?: string) => {
+    const current = directory.groups.find((candidate) => candidate.conversations.some((item) => item.id === conversationId));
+    const dragged = current?.conversations.find((item) => item.id === conversationId);
+    if (!current || dragged?.pinned) {
+      setDraggingConversationId(null);
+      return;
+    }
+    const order = currentConversationOrder(directory.groups, conversationOrder).filter((id) => id !== conversationId);
+    const group = directory.groups.find((candidate) => candidate.id === groupId);
+    const beforeIndex = beforeId ? order.indexOf(beforeId) : -1;
+    const targetIds = orderGroupConversations(
+      (group?.conversations ?? []).filter((item) => item.id !== conversationId && !item.pinned),
+      conversationOrder,
+    ).map((item) => item.id);
+    const lastTargetIndex = targetIds.reduce((last, id) => Math.max(last, order.indexOf(id)), -1);
+    const insertAt = beforeIndex >= 0 ? beforeIndex : lastTargetIndex >= 0 ? lastTargetIndex + 1 : order.length;
+    order.splice(insertAt, 0, conversationId);
+    commitConversationOrder(order);
+    if (current?.id !== groupId) onMoveConversation(conversationId, groupId);
+    setDraggingConversationId(null);
+  };
+
+  const dropPinnedConversation = (conversationId: string, beforeId?: string) => {
+    const pinnedIds = orderPinnedConversations(
+      directory.groups.flatMap((group) => group.conversations).filter((item) => item.pinned),
+      pinnedOrder,
+    ).map((item) => item.id);
+    if (!pinnedIds.includes(conversationId)) {
+      setDraggingConversationId(null);
+      return;
+    }
+    commitPinnedOrder(moveIdBefore(pinnedIds, conversationId, beforeId));
+    setDraggingConversationId(null);
+  };
 
   const activeConversation = directory.groups
     .flatMap((group) => group.conversations)
@@ -150,10 +220,12 @@ export const ConversationSidebar = memo(function ConversationSidebar({
     if (isMobile) setOpenMobile(false);
   };
 
-  const toggleGroup = (groupId: string) => {
+  const setGroupOpen = (groupId: string, open: boolean) => {
     setCollapsedGroupIds((current) => {
+      const currentlyOpen = !current.has(groupId);
+      if (currentlyOpen === open) return current;
       const next = new Set(current);
-      if (next.has(groupId)) next.delete(groupId);
+      if (open) next.delete(groupId);
       else next.add(groupId);
       return next;
     });
@@ -188,23 +260,27 @@ export const ConversationSidebar = memo(function ConversationSidebar({
             >
               <FolderSimplePlus />
             </Button>
-          </div>
-          <div className="relative">
-            <MagnifyingGlass className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground" />
-            <Input
-              type="search"
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              placeholder="Search chats"
-              aria-label="Search chats"
-              className="h-7 rounded-md border-transparent bg-sidebar-accent/40 pl-7 text-xs shadow-none focus-visible:border-sidebar-border focus-visible:ring-0"
+            <SidebarTrigger
+              className="size-7 shrink-0 text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
+              aria-label="Collapse sidebar"
+              title="Collapse sidebar"
             />
           </div>
+          <DialogTrigger
+            handle={commandPaletteHandle}
+            aria-label="Open command palette"
+            render={<button type="button" />}
+            className="flex h-7 w-full cursor-pointer items-center gap-2 rounded-md bg-sidebar-accent/40 px-2 text-left text-xs text-muted-foreground outline-none transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+          >
+            <MagnifyingGlass className="size-3.5 shrink-0" />
+            <span className="min-w-0 flex-1 truncate">Search or run a command</span>
+            <kbd className="text-[8px] text-muted-foreground/60">⌘K</kbd>
+          </DialogTrigger>
         </SidebarHeader>
 
         <SidebarContent className="py-1">
           {pinned.length > 0 && (
-            <SidebarGroup className="px-1 py-0.5">
+            <SidebarGroup className="px-2 py-1">
               <SidebarGroupLabel className="h-6 px-2 text-[10px] font-normal uppercase tracking-wide text-muted-foreground/65">
                 <span className="min-w-0 flex-1">Pinned</span>
                 <span className="tabular-nums">{pinned.length}</span>
@@ -222,6 +298,9 @@ export const ConversationSidebar = memo(function ConversationSidebar({
                       onTogglePinned={onTogglePinned}
                       onRename={onRenameConversation ? () => setRenameId(conversation.id) : undefined}
                       onArchive={onArchiveConversation}
+                      dragging={draggingConversationId === conversation.id}
+                      onDragStart={setDraggingConversationId}
+                      onDropConversation={(draggedId) => dropPinnedConversation(draggedId, conversation.id)}
                     />
                   ))}
                 </SidebarMenu>
@@ -237,10 +316,23 @@ export const ConversationSidebar = memo(function ConversationSidebar({
               <Collapsible
                 key={group.id}
                 open={!collapsed}
-                onOpenChange={() => toggleGroup(group.id)}
+                onOpenChange={(open) => setGroupOpen(group.id, open)}
               >
-                <SidebarGroup className="group/project px-1 py-0.5">
-                  <div className="flex h-6 items-center gap-0.5 px-1">
+                <SidebarGroup className="group/project px-2 py-1">
+                  <div
+                    className="flex h-6 items-center gap-0.5 rounded-md px-1 transition-colors data-[drag-over=true]:bg-sidebar-accent/70"
+                    onDragOver={(event) => {
+                      if (!draggingConversationId) return;
+                      event.preventDefault();
+                      event.currentTarget.dataset.dragOver = "true";
+                    }}
+                    onDragLeave={(event) => { delete event.currentTarget.dataset.dragOver; }}
+                    onDrop={(event) => {
+                      event.preventDefault();
+                      delete event.currentTarget.dataset.dragOver;
+                      if (draggingConversationId) dropConversation(draggingConversationId, group.id);
+                    }}
+                  >
                     <CollapsibleTrigger className="group/group flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-0.5 text-left text-[11px] font-medium text-muted-foreground hover:text-foreground">
                       <CaretDown className="size-3 shrink-0 transition-transform group-data-[state=closed]/group:-rotate-90" />
                       <FolderSimple className="size-3 shrink-0 opacity-70" />
@@ -259,7 +351,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
                       <Plus className="size-3" />
                     </button>
                   </div>
-                  <CollapsibleContent>
+                  <CollapsibleContent className="data-open:pb-3">
                     <SidebarGroupContent>
                       {group.conversations.length > 0 ? (
                         <SidebarMenu>
@@ -274,6 +366,9 @@ export const ConversationSidebar = memo(function ConversationSidebar({
                               onTogglePinned={onTogglePinned}
                               onRename={onRenameConversation ? () => setRenameId(conversation.id) : undefined}
                               onArchive={onArchiveConversation}
+                              dragging={draggingConversationId === conversation.id}
+                              onDragStart={setDraggingConversationId}
+                              onDropConversation={(draggedId) => dropConversation(draggedId, group.id, conversation.id)}
                             />
                           ))}
                         </SidebarMenu>
@@ -316,6 +411,7 @@ export const ConversationSidebar = memo(function ConversationSidebar({
             </span>
           </div>
         </SidebarFooter>
+        <SidebarRail />
       </Sidebar>
 
       <CreateGroupDialog
@@ -348,6 +444,9 @@ function ConversationRow({
   onTogglePinned,
   onRename,
   onArchive,
+  dragging,
+  onDragStart,
+  onDropConversation,
 }: {
   conversation: ConversationSummary;
   groups: ConversationGroup[];
@@ -357,14 +456,38 @@ function ConversationRow({
   onTogglePinned: (conversationId: string) => void;
   onRename?: () => void;
   onArchive?: (conversationId: string) => void;
+  dragging: boolean;
+  onDragStart: (conversationId: string | null) => void;
+  onDropConversation: (conversationId: string) => void;
 }) {
   return (
-    <SidebarMenuItem>
+    <SidebarMenuItem
+      draggable
+      aria-grabbed={dragging}
+      onDragStart={(event: DragEvent<HTMLLIElement>) => {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("application/x-symphony-conversation", conversation.id);
+        onDragStart(conversation.id);
+      }}
+      onDragEnd={() => onDragStart(null)}
+      onDragOver={(event: DragEvent<HTMLLIElement>) => {
+        event.preventDefault();
+        event.stopPropagation();
+        event.dataTransfer.dropEffect = "move";
+      }}
+      onDrop={(event: DragEvent<HTMLLIElement>) => {
+        event.preventDefault();
+        event.stopPropagation();
+        const id = event.dataTransfer.getData("application/x-symphony-conversation");
+        if (id && id !== conversation.id) onDropConversation(id);
+      }}
+      className={dragging ? "opacity-45" : undefined}
+    >
       <SidebarMenuButton
         isActive={active}
         size="sm"
         onClick={() => onSelect(conversation.id)}
-        className="group/chat-row h-7 gap-1.5 px-2 pr-7 text-[12px] data-active:bg-sidebar-accent/80 data-active:font-medium"
+        className="group/chat-row h-7 gap-1.5 px-2 pr-12 text-[12px] data-active:bg-sidebar-accent/80 data-active:font-medium"
         tooltip={conversation.title}
       >
         {conversation.state === "running" ? (
@@ -379,20 +502,36 @@ function ConversationRow({
         >
           {conversation.title}
         </span>
-        {conversation.pinned && <PushPin className="size-2.5 shrink-0 text-muted-foreground/65" />}
-        {conversation.state !== "running" && !conversation.pinned && (
+        {conversation.state !== "running" && (
           <span className="w-7 shrink-0 truncate text-right text-[9px] tabular-nums text-muted-foreground/50 group-hover/chat-row:opacity-0">
             {conversation.updatedLabel}
           </span>
         )}
       </SidebarMenuButton>
 
+      <button
+        type="button"
+        onClick={() => onTogglePinned(conversation.id)}
+        className={`group/pin absolute top-1 right-1 grid size-5 cursor-pointer place-items-center rounded-md text-muted-foreground outline-none transition-[opacity,color,background-color] hover:bg-sidebar-accent hover:text-foreground focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-sidebar-ring ${conversation.pinned ? "opacity-100" : "opacity-0 group-hover/menu-item:opacity-100"}`}
+        aria-label={conversation.pinned ? `Unpin ${conversation.title}` : `Pin ${conversation.title}`}
+        title={conversation.pinned ? "Unpin chat" : "Pin chat"}
+      >
+        {conversation.pinned ? (
+          <>
+            <PushPin className="size-3 group-hover/pin:hidden" weight="fill" />
+            <PushPinSlash className="hidden size-3 group-hover/pin:block" />
+          </>
+        ) : (
+          <PushPin className="size-3" />
+        )}
+      </button>
+
       <DropdownMenu>
         <DropdownMenuTrigger
           render={
             <button
               type="button"
-              className="absolute top-1 right-1 grid size-5 place-items-center rounded-md text-muted-foreground opacity-0 outline-none hover:bg-sidebar-accent focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-sidebar-ring group-hover/menu-item:opacity-100 data-popup-open:opacity-100"
+              className="absolute top-1 right-6 grid size-5 cursor-pointer place-items-center rounded-md text-muted-foreground opacity-0 outline-none hover:bg-sidebar-accent focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-sidebar-ring group-hover/menu-item:opacity-100 data-popup-open:opacity-100"
               aria-label={`Chat options for ${conversation.title}`}
             />
           }
@@ -415,17 +554,19 @@ function ConversationRow({
           <DropdownMenuSub>
             <DropdownMenuSubTrigger>Move to group</DropdownMenuSubTrigger>
             <DropdownMenuSubContent className="w-44">
-              <DropdownMenuLabel>Groups</DropdownMenuLabel>
-              {groups.map((group) => (
-                <DropdownMenuItem
-                  key={group.id}
-                  disabled={group.id === conversation.groupId}
-                  onClick={() => onMove(conversation.id, group.id)}
-                >
-                  <FolderSimple className="size-3.5" />
-                  <span className="truncate">{group.title}</span>
-                </DropdownMenuItem>
-              ))}
+              <DropdownMenuGroup>
+                <DropdownMenuLabel>Groups</DropdownMenuLabel>
+                {groups.map((group) => (
+                  <DropdownMenuItem
+                    key={group.id}
+                    disabled={group.id === conversation.groupId}
+                    onClick={() => onMove(conversation.id, group.id)}
+                  >
+                    <FolderSimple className="size-3.5" />
+                    <span className="truncate">{group.title}</span>
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuGroup>
             </DropdownMenuSubContent>
           </DropdownMenuSub>
           {onArchive && (
@@ -440,7 +581,7 @@ function ConversationRow({
   );
 }
 
-function CreateGroupDialog({
+export function CreateGroupDialog({
   open,
   onOpenChange,
   onCreate,

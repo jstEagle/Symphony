@@ -3,18 +3,30 @@
   "dataDirectory": ".symphony",
   "server": {
     "host": "127.0.0.1",
-    "port": 3210,
+    "port": 3000,
     "openBrowser": true,
-    "webDirectory": "apps/web/out"
+    "webDirectory": "apps/web/out",
+    "shutdownTimeoutMs": 10000
   },
   "conductor": {
     "harness": "codex",
     "model": "gpt-5.6-sol"
   },
   "agents": {
-    "maxDepth": 3,
-    "maxConcurrent": 8,
-    "defaultPermissions": "full-access"
+    "maxDepth": null,
+    "maxConcurrent": null,
+    "defaultPermissions": "full-access",
+    "routingTimeoutMs": 30000,
+    "startupTimeoutMs": 60000,
+    "recoveryTimeoutMs": 30000,
+    "recoveryConcurrency": 4,
+    "cancellationAcknowledgementTimeoutMs": 3000,
+    "cancellationTerminationGraceMs": 5000
+  },
+  "workerHosts": {
+    "enabled": true,
+    "maxSpoolBytes": 67108864,
+    "maxSpoolFrames": 100000
   },
   "harnesses": {
     "codex": {
@@ -67,11 +79,61 @@
   "harnessUpdates": {
     "checkIntervalMinutes": 10,
     "harnesses": {
-      "codex": { "command": "codex", "args": ["update"], "latest": { "source": "npm", "packageName": "@openai/codex" } },
-      "claude": { "command": "claude", "args": ["update"], "latest": { "source": "npm", "packageName": "@anthropic-ai/claude-code" } },
-      "cursor": { "command": "cursor-agent", "args": ["update"], "latest": { "source": "installer", "url": "https://cursor.com/install", "versionPattern": "TEMP_EXTRACT_DIR=.*?\\.tmp-([0-9]{4}\\.[0-9]{2}\\.[0-9]{2}-[A-Za-z0-9]+)-" } },
-      "opencode": { "command": "opencode", "args": ["upgrade"], "latest": { "source": "npm", "packageName": "opencode-ai" } },
-      "pi": { "command": "pnpm", "args": ["--filter", "@symphony/drivers", "update", "@earendil-works/pi-coding-agent", "--latest"], "latest": { "source": "npm", "packageName": "@earendil-works/pi-coding-agent" } }
+      "codex": {
+        "command": "codex",
+        "args": [
+          "update"
+        ],
+        "latest": {
+          "source": "npm",
+          "packageName": "@openai/codex"
+        }
+      },
+      "claude": {
+        "command": "claude",
+        "args": [
+          "update"
+        ],
+        "latest": {
+          "source": "npm",
+          "packageName": "@anthropic-ai/claude-code"
+        }
+      },
+      "cursor": {
+        "command": "cursor-agent",
+        "args": [
+          "update"
+        ],
+        "latest": {
+          "source": "installer",
+          "url": "https://cursor.com/install",
+          "versionPattern": "TEMP_EXTRACT_DIR=.*?\\.tmp-([0-9]{4}\\.[0-9]{2}\\.[0-9]{2}-[A-Za-z0-9]+)-"
+        }
+      },
+      "opencode": {
+        "command": "opencode",
+        "args": [
+          "upgrade"
+        ],
+        "latest": {
+          "source": "npm",
+          "packageName": "opencode-ai"
+        }
+      },
+      "pi": {
+        "command": "pnpm",
+        "args": [
+          "--filter",
+          "@symphony/drivers",
+          "update",
+          "@earendil-works/pi-coding-agent",
+          "--latest"
+        ],
+        "latest": {
+          "source": "npm",
+          "packageName": "@earendil-works/pi-coding-agent"
+        }
+      }
     }
   },
   "observer": {
@@ -86,7 +148,15 @@
     "model": "z-ai/glm-5.3-flash",
     "baseUrl": "https://openrouter.ai/api/v1",
     "chatTitles": true,
-    "maxInputCharacters": 12000
+    "maxInputCharacters": 12000,
+    "chatSearch": {
+      "rerankEnabled": true,
+      "reranker": "cohere/rerank-v3.5",
+      "prefilterLimit": 30,
+      "maxDocumentCharacters": 4000,
+      "cacheTtlSeconds": 300,
+      "requestTimeoutMs": 10000
+    }
   },
   "router": {
     "provider": "openrouter",

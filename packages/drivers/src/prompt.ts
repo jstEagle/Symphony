@@ -10,6 +10,10 @@ export function isConductor(workOrder: AgentWorkOrder): boolean {
     && typeof metadata.threadId === "string";
 }
 
+export function hasStructuredOutputSchema(workOrder: AgentWorkOrder): boolean {
+  return Object.keys(workOrder.outputSchema).length > 0;
+}
+
 export function buildSymphonyOperatingContract(
   workOrder: AgentWorkOrder,
   options: { agentId?: string; canCreate?: boolean } = {},
@@ -27,12 +31,13 @@ export function buildSymphonyOperatingContract(
     options.agentId ? `Your Symphony agent id is ${options.agentId}.` : "",
     "The native harness is your execution environment, not the top-level product. Do not present yourself as Codex, Claude Code, Cursor, OpenCode, Pi, or another native harness when explaining Symphony coordination.",
     "Symphony coordination tools are supplied by the MCP server named `symphony`. Their discovered names may be prefixed, such as `symphony.create_agent` or `mcp__symphony__create_agent`; use the exact discovered tool name.",
-    "Available Symphony primitives include list_agents, create_agent (when delegation depth permits), send_message, observe_agent, cancel_agent, present_ui, and workflow tools.",
+    "Available Symphony primitives include list_agents, create_agent (when delegation depth permits), send_message, observe_agent, get_session_logs, cancel_agent, present_ui, and workflow tools.",
     creation,
     "Use Symphony create_agent for durable or cross-harness delegation: parallel work, model or harness specialization, work the user should observe or steer, structured workflow outputs, and persistence beyond the current native turn.",
     "Native harness subagents remain available for short-lived, tightly coupled, harness-local assistance whose identity, progress, and result do not need to appear in Symphony's graph.",
     "If the user explicitly asks you to create, spawn, or delegate to an agent, default to Symphony create_agent when it is available. Do not substitute a native-only subagent merely because the native harness has one.",
     "Before saying a Symphony capability is unavailable, inspect the tools actually exposed to this session. When asked about orchestration, distinguish Symphony tools from native harness tools.",
+    "When a Symphony agent fails, stalls, or behaves unexpectedly, inspect get_session_logs before diagnosing the harness or changing Symphony.",
     "Symphony does not prescribe roles, review stages, tests, scores, or loop shapes. Create only the agents and workflow control flow that the user's objective actually calls for.",
     "Keep child objectives concise and concrete. The immutable workflow mission is inherited by Symphony children automatically; do not paraphrase or recursively relay it as if it were a new mission.",
   ].filter(Boolean).join("\n");
@@ -50,6 +55,7 @@ export function buildConductorTurnPrompt(message: string): string {
 
 export function buildAgentPrompt(workOrder: AgentWorkOrder): string {
   const conductor = isConductor(workOrder);
+  const structuredOutput = !conductor && hasStructuredOutputSchema(workOrder);
   const inputs = workOrder.inputs.length
     ? JSON.stringify(workOrder.inputs, null, 2)
     : "No explicit input references.";
@@ -72,11 +78,19 @@ export function buildAgentPrompt(workOrder: AgentWorkOrder): string {
     "Inputs:",
     inputs,
     "",
-    conductor ? "Response contract:" : "Required final output JSON Schema:",
-    conductor ? "Respond naturally to the user. Symphony streams this response into the chat as it is produced." : JSON.stringify(workOrder.outputSchema, null, 2),
+    conductor || !structuredOutput ? "Response contract:" : "Required final output JSON Schema:",
+    conductor
+      ? "Respond naturally to the user. Symphony streams this response into the chat as it is produced."
+      : structuredOutput
+        ? JSON.stringify(workOrder.outputSchema, null, 2)
+        : "No structured output schema was requested. Return the clearest useful final response for the objective.",
     "",
-    conductor ? "Complete the objective in the specified workspace and give the user a direct response." : "Complete the objective in the specified workspace. Your final response must satisfy the output schema.",
-    "Use Symphony's coordination tools when useful: list_agents, create_agent, send_message, observe_agent, and present_ui. Use present_ui only when a structured surface materially improves the user's understanding.",
+    conductor
+      ? "Complete the objective in the specified workspace and give the user a direct response."
+      : structuredOutput
+        ? "Complete the objective in the specified workspace. Your final response must satisfy the output schema."
+        : "Complete the objective in the specified workspace and return a direct final response.",
+    "Use Symphony's coordination tools when useful: list_agents, create_agent, send_message, observe_agent, get_session_logs, and present_ui. Use present_ui only when a structured surface materially improves the user's understanding.",
     "Keep delegated objectives short and preserve the workflow mission. Do not invent a role or rewrite the mission.",
   ].join("\n");
 }

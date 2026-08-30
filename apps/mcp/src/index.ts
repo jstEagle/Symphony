@@ -34,6 +34,14 @@ function result(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }], structuredContent };
 }
 
+function mutation(tool: string, requestId: string | number, body: unknown): RequestInit {
+  return {
+    method: "POST",
+    headers: { "idempotency-key": `mcp:${agentId}:${tool}:${String(requestId)}` },
+    body: JSON.stringify(body),
+  };
+}
+
 const server = new McpServer({ name: "symphony", version: "0.1.0" });
 
 server.registerTool("list_agents", {
@@ -56,31 +64,46 @@ if (canCreate) server.registerTool("create_agent", {
       prioritize: z.array(z.enum(["human-preference", "intelligence", "coding-success", "agentic-success", "lowest-cost-per-task", "fewest-turns", "large-context"])).optional(),
     }).optional(),
   },
-}, async (input) => result(await api("/v1/agents", { method: "POST", body: JSON.stringify(input) })));
+}, async (input, extra) => result(await api("/v1/agents", mutation("create-agent", extra.requestId, input))));
 
 server.registerTool("present_ui", {
-  description: "Present structured information in the Symphony chat when a visual surface materially improves comprehension. Kinds and core data shapes: speaker-identity {turns}; diagram {title,content}; flow-graph {nodes,edges,visibleCount}; spec-sheet {title,subtitle,rows}; timeline {events}; job-progress {title,stages,stageIndex,stageProgress,eta}; score-breakdown {verdict,total,outOf,criteria}; agent-plan {steps,activeIndex}; subagent-list {agents,completedCount,progress,showSummary,summaryAgent}; recommendation-card {question,body,confidenceLabel}; handoff {from,to,reason,carried,settled}; schedule {name,cadence,nextRun,enabled,history}; checkpoints {checkpoints,currentId}; cost-meter {runCost,sessionCost,lines}; tool-timeline {steps,stats,streaming}; generative-ui {tree} where tree uses the allowlisted assistant-ui $type vocabulary. This is optional presentation, not a workflow instruction.",
+  description: "Present structured information in the Symphony chat when a visual surface materially improves comprehension. Kinds and core data shapes: speaker-identity {turns}; diagram {title,content}; flow-graph {nodes,edges,visibleCount}; spec-sheet {title,subtitle,rows}; timeline {events}; job-progress {title,stages,stageIndex,stageProgress,eta,agentId?}; score-breakdown {verdict,total,outOf,criteria}; agent-plan {steps,activeIndex}; subagent-list {agents:[{agentId,name,model}],completedCount,progress,showSummary,summaryAgent}; recommendation-card {question,body,confidenceLabel}; handoff {from,to,reason,carried,settled}; schedule {name,cadence,nextRun,enabled,history}; checkpoints {checkpoints,currentId}; cost-meter {runCost,sessionCost,lines}; tool-timeline {steps,stats,streaming}; generative-ui {tree} where tree uses the allowlisted assistant-ui $type vocabulary. Always include the durable agentId for a surface that represents a real Symphony agent so the user can open it. This is optional presentation, not a workflow instruction.",
   inputSchema: {
     kind: z.enum(["speaker-identity", "diagram", "flow-graph", "spec-sheet", "timeline", "job-progress", "score-breakdown", "agent-plan", "subagent-list", "recommendation-card", "handoff", "schedule", "checkpoints", "cost-meter", "tool-timeline", "generative-ui"]),
     data: z.record(z.string(), z.unknown()),
   },
-}, async (input) => result(await api(`/v1/agents/${encodeURIComponent(agentId)}/present`, { method: "POST", body: JSON.stringify(input) })));
+}, async (input, extra) => result(await api(
+  `/v1/agents/${encodeURIComponent(agentId)}/present`,
+  mutation("present-ui", extra.requestId, input),
+)));
 
 server.registerTool("send_message", {
   description: "Steer or follow up with an existing durable Symphony agent without creating a new graph node.",
   inputSchema: { targetAgentId: z.string().min(1), content: z.string().min(1) },
-}, async ({ targetAgentId, content }) => result(await api(`/v1/agents/${encodeURIComponent(targetAgentId)}/messages`, { method: "POST", body: JSON.stringify({ content }) })));
+}, async ({ targetAgentId, content }, extra) => result(await api(
+  `/v1/agents/${encodeURIComponent(targetAgentId)}/messages`,
+  mutation("send-message", extra.requestId, { content }),
+)));
 
 server.registerTool("observe_agent", {
   description: "Passively summarize an agent's native event history without interrupting it. Use tldr for one sentence, paragraph for status context, or full for an evidence-linked breakdown.",
   inputSchema: { targetAgentId: z.string().min(1), level: z.enum(["tldr", "paragraph", "full"]).default("tldr") },
 }, async ({ targetAgentId, level }) => result(await api(`/v1/agents/${encodeURIComponent(targetAgentId)}/observe?level=${level}`)));
 
+server.registerTool("get_session_logs", {
+  description: "Read structured, durable native lifecycle logs for a Symphony agent without interrupting it. Use this to diagnose a failed, stalled, or unexpected session before proposing a Symphony fix.",
+  inputSchema: {
+    targetAgentId: z.string().min(1),
+    after: z.number().int().min(0).default(0),
+    limit: z.number().int().min(1).max(2_000).default(500),
+  },
+}, async ({ targetAgentId, after, limit }) => result(await api(`/v1/agents/${encodeURIComponent(targetAgentId)}/logs?after=${after}&limit=${limit}`)));
+
 server.registerTool("cancel_agent", {
   description: "Request cancellation of an active agent in its native harness.",
   inputSchema: { targetAgentId: z.string().min(1) },
-}, async ({ targetAgentId }) => {
-  await api(`/v1/agents/${encodeURIComponent(targetAgentId)}/cancel`, { method: "POST" });
+}, async ({ targetAgentId }, extra) => {
+  await api(`/v1/agents/${encodeURIComponent(targetAgentId)}/cancel`, mutation("cancel-agent", extra.requestId, {}));
   return result({ cancelled: true, targetAgentId });
 });
 
@@ -89,10 +112,31 @@ server.registerTool("list_workflows", {
   inputSchema: {},
 }, async () => result(await api("/v1/workflows")));
 
+if (canCreate) server.registerTool("register_workflow", {
+  description: "Register an immutable revision of a custom Symphony workflow. Use sequence, parallel, if, while, set, and agent steps to express the orchestration strategy that best serves the mission. Reusing the same request is idempotent; changing a definition registers a new revision. This does not start a run.",
+  inputSchema: {
+    definition: z.record(z.string(), z.unknown()).describe("A complete Symphony workflow definition with id, name, mission, workspace, steps, optional output, and optional triggers."),
+  },
+}, async ({ definition }, extra) => result(await api(
+  "/v1/workflows",
+  mutation("register-workflow", extra.requestId, definition),
+)));
+
 server.registerTool("run_workflow", {
   description: "Start a registered dynamic workflow with JSON input.",
   inputSchema: { workflowId: z.string().min(1), input: z.unknown().default({}) },
-}, async ({ workflowId, input }) => result(await api(`/v1/workflows/${encodeURIComponent(workflowId)}/runs`, { method: "POST", body: JSON.stringify(input) })));
+}, async ({ workflowId, input }, extra) => result(await api(
+  `/v1/workflows/${encodeURIComponent(workflowId)}/runs`,
+  mutation("run-workflow", extra.requestId, input),
+)));
+
+server.registerTool("cancel_run", {
+  description: "Request cancellation of a durable Symphony workflow run.",
+  inputSchema: { runId: z.string().min(1) },
+}, async ({ runId }, extra) => result(await api(
+  `/v1/runs/${encodeURIComponent(runId)}/cancel`,
+  mutation("cancel-run", extra.requestId, {}),
+)));
 
 server.registerTool("list_plugin_tools", {
   description: "List tools contributed by trusted, currently active local Symphony/Pi-compatible plugins.",
@@ -102,6 +146,9 @@ server.registerTool("list_plugin_tools", {
 server.registerTool("call_plugin_tool", {
   description: "Call a tool contributed by a trusted local plugin. List tools first and pass the plugin tool's documented JSON arguments.",
   inputSchema: { name: z.string().min(1), arguments: z.unknown().default({}) },
-}, async ({ name, arguments: toolArguments }) => result(await api(`/v1/plugin-tools/${encodeURIComponent(name)}`, { method: "POST", body: JSON.stringify(toolArguments) })));
+}, async ({ name, arguments: toolArguments }, extra) => result(await api(
+  `/v1/plugin-tools/${encodeURIComponent(name)}`,
+  mutation("call-plugin-tool", extra.requestId, toolArguments),
+)));
 
 await server.connect(new StdioServerTransport());

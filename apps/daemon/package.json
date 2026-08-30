@@ -8,7 +8,8 @@
   "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
   "bin": { "symphony-daemon": "./dist/bin.js" },
   "scripts": {
-    "dev": "tsx watch src/bin.ts",
+    "dev": "tsx src/bin.ts",
+    "dev:watch": "tsx watch src/bin.ts",
     "build": "tsup src/index.ts src/bin.ts --format esm --dts --sourcemap --clean",
     "typecheck": "tsc --noEmit"
   },

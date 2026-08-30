@@ -18,7 +18,9 @@ import { CheckpointHistory } from "@/components/assistant-ui/elements/checkpoint
 import { ScheduleCard } from "@/components/assistant-ui/elements/schedule-card";
 import { CostMeter } from "@/components/assistant-ui/elements/cost-meter";
 import { ToolTimeline } from "@/components/assistant-ui/elements/tool-timeline";
+import { FileChanges, type FileChange } from "@/components/assistant-ui/elements/file-changes";
 import { useOptionalSymphony } from "@/components/symphony/context";
+import { resolveAgentReference } from "@/lib/symphony/agent-projection";
 
 type SurfaceData = Record<string, unknown>;
 
@@ -35,10 +37,7 @@ const ScoreBreakdownUI = makeAssistantDataUI<SurfaceData>({ name: "score-breakdo
 const AgentPlanUI = makeAssistantDataUI<SurfaceData>({ name: "agent-plan", render: ({ data }) => <AgentPlan steps={strings(data.steps)} activeIndex={number(data.activeIndex, 0)} /> });
 const SubagentListUI = makeAssistantDataUI<SurfaceData>({
   name: "subagent-list",
-  render: ({ data }) => {
-    const agents = array(data.agents);
-    return <SubagentList agents={agents as never} completedCount={number(data.completedCount, 0)} progress={numbers(data.progress)} showSummary={boolean(data.showSummary)} summaryAgent={(record(data.summaryAgent) ?? agents[0] ?? { name: "Summary", model: "—" }) as never} />;
-  },
+  render: ({ data }) => <SubagentListSurface data={data} />,
 });
 const RecommendationUI = makeAssistantDataUI<SurfaceData>({ name: "recommendation-card", render: ({ data }) => <RecommendationSurface data={data} /> });
 const HandoffUI = makeAssistantDataUI<SurfaceData>({ name: "handoff", render: ({ data }) => <AgentHandoff from={text(data.from, "Agent")} to={text(data.to, "Agent")} reason={text(data.reason, "Handoff")} carried={strings(data.carried)} settled={boolean(data.settled)} /> });
@@ -46,7 +45,8 @@ const ScheduleUI = makeAssistantDataUI<SurfaceData>({ name: "schedule", render: 
 const CheckpointsUI = makeAssistantDataUI<SurfaceData>({ name: "checkpoints", render: ({ data }) => <CheckpointsSurface data={data} /> });
 const CostUI = makeAssistantDataUI<SurfaceData>({ name: "cost-meter", render: ({ data }) => <CostMeter runCost={text(data.runCost, "$0.00")} sessionCost={text(data.sessionCost, "$0.00")} lines={array(data.lines) as never} /> });
 const ToolTimelineUI = makeAssistantDataUI<SurfaceData>({ name: "tool-timeline", render: ({ data }) => <ToolTimeline steps={array(data.steps).map((step) => ({ ...record(step), verb: text(record(step)?.verb, "Worked"), chip: text(record(step)?.chip, "step"), icon: CircleIcon })) as never} visibleSteps={number(data.visibleSteps, array(data.steps).length)} streaming={boolean(data.streaming)} open={data.open !== false} onOpenChange={() => undefined} restingLabel={text(data.restingLabel, "Work complete")} activeLabel={text(data.activeLabel, "Working")} stats={array(data.stats) as never} /> });
-const registrations = [SpeakerUI, DiagramUI, FlowGraphUI, SpecSheetUI, TimelineUI, JobProgressUI, ScoreBreakdownUI, AgentPlanUI, SubagentListUI, RecommendationUI, HandoffUI, ScheduleUI, CheckpointsUI, CostUI, ToolTimelineUI];
+const FileChangesUI = makeAssistantDataUI<SurfaceData>({ name: "file-changes", render: ({ data }) => <FileChanges files={array(data.files) as unknown as FileChange[]} additions={number(data.additions, 0)} deletions={number(data.deletions, 0)} /> });
+const registrations = [SpeakerUI, DiagramUI, FlowGraphUI, SpecSheetUI, TimelineUI, JobProgressUI, ScoreBreakdownUI, AgentPlanUI, SubagentListUI, RecommendationUI, HandoffUI, ScheduleUI, CheckpointsUI, CostUI, ToolTimelineUI, FileChangesUI];
 
 export function SymphonyStructuredDataUI() {
   return <>{registrations.map((Registration, index) => <Registration key={index} />)}</>;
@@ -81,6 +81,25 @@ function JobProgressSurface({ data }: { data: SurfaceData }) {
       stageProgress={number(data.stageProgress, 0)}
       eta={text(data.eta, "—")}
       onCancel={symphony ? () => void symphony.cancelRun() : undefined}
+    />
+  );
+}
+
+function SubagentListSurface({ data }: { data: SurfaceData }) {
+  const symphony = useOptionalSymphony();
+  const agents = array(data.agents).map((agent) => enrichAgentReference(agent, symphony));
+  const summary = enrichAgentReference(
+    record(data.summaryAgent) ?? agents[0] ?? { name: "Summary", model: "—" },
+    symphony,
+  );
+  return (
+    <SubagentList
+      agents={agents as never}
+      completedCount={number(data.completedCount, 0)}
+      progress={numbers(data.progress)}
+      showSummary={boolean(data.showSummary)}
+      summaryAgent={summary as never}
+      onOpenAgent={symphony ? symphony.openAgent : undefined}
     />
   );
 }
@@ -171,3 +190,10 @@ function number(value: unknown, fallback: number): number { return typeof value 
 function boolean(value: unknown): boolean { return value === true; }
 function strings(value: unknown): string[] { return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : []; }
 function numbers(value: unknown): number[] { return Array.isArray(value) ? value.filter((item): item is number => typeof item === "number" && Number.isFinite(item)) : []; }
+
+function enrichAgentReference(
+  item: SurfaceData,
+  symphony: ReturnType<typeof useOptionalSymphony>,
+): SurfaceData {
+  return resolveAgentReference(item, symphony?.snapshot.agents ?? []);
+}

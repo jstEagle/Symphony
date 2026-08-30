@@ -549,6 +549,16 @@ export function previewEnvelope(): BootstrapEnvelope {
       configPath: "symphony.config.json",
       conductor: { harness: "pi", model: "auto" },
       agents: { maxDepth: 3, maxConcurrent: 8, defaultPermissions: "full-access" },
+      uiUtilities: {
+        chatSearch: {
+          rerankEnabled: false,
+          reranker: "cohere/rerank-v3.5",
+          prefilterLimit: 30,
+          maxDocumentCharacters: 4_000,
+          cacheTtlSeconds: 300,
+          requestTimeoutMs: 10_000,
+        },
+      },
     },
     inbox: previewInbox,
     daemon: {

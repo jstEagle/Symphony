@@ -9,6 +9,7 @@ import {
   ObservationSchema,
   RoutingTraceSchema,
   UsageEventSchema,
+  WorkerProcessLeaseSchema,
   nowIso,
   type AgentRecord,
   type CommandReceipt,
@@ -19,6 +20,8 @@ import {
   type ProjectRecord,
   type RoutingTrace,
   type UsageEvent,
+  type WorkerProcessLease,
+  type WorkerProcessLeaseState,
 } from "@symphony/protocol";
 import { ulid } from "ulid";
 
@@ -64,6 +67,24 @@ export type StepAttemptRecord = {
   finishedAt: string | null;
 };
 
+export type TriggerOccurrenceRecord = {
+  version: 1;
+  triggerId: string;
+  occurrenceKey: string;
+  workflowId: string;
+  workflowRevision: number;
+  workflowHash: string;
+  input: JsonValue;
+  scheduledAt: string;
+  runId: string;
+  state: "dispatching" | "settled";
+  attempts: number;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  settledAt: string | null;
+};
+
 export type PluginStateRecord = {
   id: string;
   version: string;
@@ -86,6 +107,43 @@ export type ChatThreadRecord = {
   archived: boolean;
   createdAt: string;
   updatedAt: string;
+};
+
+export type WorkerProcessLeaseTransitionPatch = Partial<
+  Omit<
+    WorkerProcessLease,
+    | "id"
+    | "daemonOwnerId"
+    | "agentId"
+    | "attemptId"
+    | "driver"
+    | "role"
+    | "command"
+    | "args"
+    | "cwd"
+    | "workspacePath"
+    | "permission"
+    | "reservedAt"
+    | "revision"
+  >
+> & { state: WorkerProcessLeaseState };
+
+export type WorkerProcessLeaseTouchPatch = Partial<
+  Pick<
+    WorkerProcessLease,
+    "nativeSessionId" | "nativeRunId" | "activeTurnId" | "lastEventCursor" | "error" | "transport" | "adapterState"
+  >
+>;
+
+export type AgentListCursor = {
+  updatedAt: string;
+  id: string;
+};
+
+export type AgentListOptions = {
+  runId?: string;
+  activeOnly?: boolean;
+  parentAgentId?: string;
 };
 
 const migrations: Array<{ version: number; sql: string }> = [
@@ -260,6 +318,91 @@ const migrations: Array<{ version: number; sql: string }> = [
       CREATE INDEX IF NOT EXISTS projects_updated ON projects(updated_at DESC);
     `,
   },
+  {
+    version: 4,
+    sql: `
+      UPDATE events
+      SET payload_json = json_object(
+        'threadId', json_extract(payload_json, '$.threadId'),
+        'messageId', json_extract(payload_json, '$.message.id')
+      )
+      WHERE type = 'chat.message.updated'
+        AND json_type(payload_json, '$.message') = 'object';
+    `,
+  },
+  {
+    version: 5,
+    sql: `
+      CREATE TABLE IF NOT EXISTS native_driver_events (
+        agent_id TEXT NOT NULL,
+        event_kind TEXT NOT NULL,
+        native_event_id TEXT NOT NULL,
+        claimed_at TEXT NOT NULL,
+        PRIMARY KEY (agent_id, event_kind, native_event_id)
+      );
+      INSERT OR IGNORE INTO native_driver_events(agent_id, event_kind, native_event_id, claimed_at)
+      SELECT
+        agent_id,
+        substr(type, length('driver.') + 1),
+        json_extract(provenance_json, '$.nativeEventId'),
+        occurred_at
+      FROM events
+      WHERE agent_id IS NOT NULL
+        AND type LIKE 'driver.%'
+        AND json_type(provenance_json, '$.nativeEventId') = 'text'
+        AND length(json_extract(provenance_json, '$.nativeEventId')) > 0;
+    `,
+  },
+  {
+    version: 6,
+    sql: `
+      CREATE TABLE IF NOT EXISTS worker_process_leases (
+        id TEXT PRIMARY KEY,
+        daemon_owner_id TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        driver TEXT NOT NULL,
+        role TEXT NOT NULL,
+        state TEXT NOT NULL,
+        pid INTEGER,
+        process_group_id INTEGER,
+        process_start_token TEXT,
+        revision INTEGER NOT NULL,
+        record_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(agent_id, attempt_id, role)
+      );
+      CREATE INDEX IF NOT EXISTS worker_process_leases_state_updated
+        ON worker_process_leases(state, updated_at);
+      CREATE INDEX IF NOT EXISTS worker_process_leases_agent_updated
+        ON worker_process_leases(agent_id, updated_at);
+      CREATE INDEX IF NOT EXISTS worker_process_leases_owner_state
+        ON worker_process_leases(daemon_owner_id, state, updated_at);
+    `,
+  },
+  {
+    version: 7,
+    sql: `
+      ALTER TABLE worker_process_leases ADD COLUMN transport_kind TEXT NOT NULL DEFAULT 'direct';
+      ALTER TABLE worker_process_leases ADD COLUMN transport_endpoint TEXT;
+      ALTER TABLE worker_process_leases ADD COLUMN owner_epoch INTEGER;
+      ALTER TABLE worker_process_leases ADD COLUMN processed_output_seq INTEGER;
+      ALTER TABLE worker_process_leases ADD COLUMN acked_output_seq INTEGER;
+      CREATE INDEX IF NOT EXISTS worker_process_leases_transport_state
+        ON worker_process_leases(transport_kind, state, updated_at);
+    `,
+  },
+  {
+    version: 8,
+    sql: `
+      ALTER TABLE trigger_occurrences ADD COLUMN state TEXT NOT NULL DEFAULT 'settled';
+      ALTER TABLE trigger_occurrences ADD COLUMN record_json TEXT;
+      ALTER TABLE trigger_occurrences ADD COLUMN updated_at TEXT;
+      UPDATE trigger_occurrences SET updated_at = created_at WHERE updated_at IS NULL;
+      CREATE INDEX IF NOT EXISTS trigger_occurrences_state_updated
+        ON trigger_occurrences(state, updated_at);
+    `,
+  },
 ];
 
 function serialize(value: unknown): string {
@@ -275,6 +418,9 @@ export class SymphonyStore {
   readonly path: string;
   readonly database: DatabaseSync;
   readonly emitter = new EventEmitter();
+  private transactionEvents: EventEnvelope[] | null = null;
+  private readonly committedEventQueue: EventEnvelope[] = [];
+  private deliveringCommittedEvents = false;
 
   constructor(path: string) {
     this.path = resolve(path);
@@ -298,14 +444,41 @@ export class SymphonyStore {
   }
 
   transaction<T>(callback: () => T): T {
+    // Storage helpers compose inside higher-level idempotency transactions.
+    // SQLite has no nested BEGIN, so the inner operation participates in the
+    // existing atomic boundary and lets an error roll the outer transaction
+    // back. This is required when a native terminal event updates both its
+    // dedupe claim and the worker-process lease in one projection pass.
+    if (this.database.isTransaction) return callback();
     this.database.exec("BEGIN IMMEDIATE");
+    this.transactionEvents = [];
+    let result: T;
+    let committedEvents: EventEnvelope[];
     try {
-      const result = callback();
+      result = callback();
       this.database.exec("COMMIT");
-      return result;
+      committedEvents = this.transactionEvents;
     } catch (error) {
       this.database.exec("ROLLBACK");
       throw error;
+    } finally {
+      this.transactionEvents = null;
+    }
+    this.publishCommittedEvents(committedEvents);
+    return result;
+  }
+
+  durableTransaction<T>(callback: () => T): T {
+    // An outer transaction already owns the commit boundary and synchronous
+    // mode cannot be changed while it is active.
+    if (this.database.isTransaction) return callback();
+    const row = this.database.prepare("PRAGMA synchronous").get() as Row;
+    const previous = Number(row.synchronous ?? 1);
+    this.database.exec("PRAGMA synchronous = FULL");
+    try {
+      return this.transaction(callback);
+    } finally {
+      this.database.exec(`PRAGMA synchronous = ${Number.isInteger(previous) ? previous : 1}`);
     }
   }
 
@@ -313,7 +486,10 @@ export class SymphonyStore {
     this.database.close();
   }
 
-  appendEvent(input: Omit<EventEnvelope, "id" | "cursor"> & { id?: string }): EventEnvelope {
+  appendEvent(
+    input: Omit<EventEnvelope, "id" | "cursor"> & { id?: string },
+    options: { persistedPayload?: JsonValue } = {},
+  ): EventEnvelope {
     const id = input.id ?? ulid();
     const result = this.database
       .prepare(
@@ -327,12 +503,41 @@ export class SymphonyStore {
         input.runId,
         input.agentId,
         input.occurredAt,
-        serialize(input.payload),
+        serialize(options.persistedPayload ?? input.payload),
         input.provenance ? serialize(input.provenance) : null,
       );
     const event = EventEnvelopeSchema.parse({ ...input, id, cursor: Number(result.lastInsertRowid) });
-    this.emitter.emit("event", event);
+    if (this.transactionEvents) this.transactionEvents.push(event);
+    else this.publishCommittedEvents([event]);
     return event;
+  }
+
+  private publishCommittedEvents(events: readonly EventEnvelope[]): void {
+    this.committedEventQueue.push(...events);
+    if (this.deliveringCommittedEvents) return;
+    this.deliveringCommittedEvents = true;
+    try {
+      while (this.committedEventQueue.length > 0) {
+        this.emitter.emit("event", this.committedEventQueue.shift() as EventEnvelope);
+      }
+    } finally {
+      this.deliveringCommittedEvents = false;
+    }
+  }
+
+  claimNativeDriverEvent(input: {
+    agentId: string;
+    eventKind: string;
+    nativeEventId: string;
+    claimedAt?: string;
+  }): boolean {
+    const result = this.database
+      .prepare(
+        `INSERT OR IGNORE INTO native_driver_events(agent_id, event_kind, native_event_id, claimed_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run(input.agentId, input.eventKind, input.nativeEventId, input.claimedAt ?? nowIso());
+    return Number(result.changes) === 1;
   }
 
   onEvent(listener: (event: EventEnvelope) => void): () => void {
@@ -384,10 +589,19 @@ export class SymphonyStore {
     );
   }
 
-  recentEvents(options: { limit?: number; types?: readonly string[]; typePrefixes?: readonly string[] } = {}): EventEnvelope[] {
+  recentEvents(options: { limit?: number; agentId?: string; runId?: string; types?: readonly string[]; typePrefixes?: readonly string[] } = {}): EventEnvelope[] {
     const limit = Math.min(options.limit ?? 500, 10_000);
     let sql = "SELECT * FROM events";
     const params: Array<string | number> = [];
+    const clauses: string[] = [];
+    if (options.agentId) {
+      clauses.push("agent_id = ?");
+      params.push(options.agentId);
+    }
+    if (options.runId) {
+      clauses.push("run_id = ?");
+      params.push(options.runId);
+    }
     const typeClauses: string[] = [];
     if (options.types?.length) {
       typeClauses.push(`type IN (${options.types.map(() => "?").join(",")})`);
@@ -397,7 +611,8 @@ export class SymphonyStore {
       typeClauses.push(...options.typePrefixes.map(() => "type LIKE ?"));
       params.push(...options.typePrefixes.map((prefix) => `${prefix}%`));
     }
-    if (typeClauses.length) sql += ` WHERE (${typeClauses.join(" OR ")})`;
+    if (typeClauses.length) clauses.push(`(${typeClauses.join(" OR ")})`);
+    if (clauses.length) sql += ` WHERE ${clauses.join(" AND ")}`;
     sql += " ORDER BY cursor DESC LIMIT ?";
     params.push(limit);
     return (this.database.prepare(sql).all(...params) as Row[]).reverse().map((row) =>
@@ -534,7 +749,20 @@ export class SymphonyStore {
     return row ? AgentRecordSchema.parse(parseJson(row.record_json)) : null;
   }
 
-  listAgents(options: { runId?: string; activeOnly?: boolean; parentAgentId?: string; limit?: number } = {}): AgentRecord[] {
+  getAgentByLogicalAgentId(logicalAgentId: string): AgentRecord | null {
+    const row = this.database
+      .prepare("SELECT record_json FROM agents WHERE logical_agent_id = ? ORDER BY rowid ASC LIMIT 1")
+      .get(logicalAgentId) as Row | undefined;
+    return row ? AgentRecordSchema.parse(parseJson(row.record_json)) : null;
+  }
+
+  listAgents(options: AgentListOptions & { limit?: number } = {}): AgentRecord[] {
+    return this.listAgentPage(options).agents;
+  }
+
+  listAgentPage(
+    options: AgentListOptions & { cursor?: AgentListCursor; limit?: number } = {},
+  ): { agents: AgentRecord[]; nextCursor: AgentListCursor | null } {
     let sql = "SELECT record_json FROM agents WHERE 1 = 1";
     const params: Array<string | number> = [];
     if (options.runId) {
@@ -548,11 +776,243 @@ export class SymphonyStore {
     if (options.activeOnly) {
       sql += " AND status IN ('queued','routing','starting','running','idle','waiting','cancel-requested')";
     }
-    sql += " ORDER BY updated_at DESC LIMIT ?";
-    params.push(Math.min(options.limit ?? 1_000, 10_000));
-    return (this.database.prepare(sql).all(...params) as Row[]).map((row) =>
+    if (options.cursor) {
+      sql += " AND (updated_at < ? OR (updated_at = ? AND id < ?))";
+      params.push(options.cursor.updatedAt, options.cursor.updatedAt, options.cursor.id);
+    }
+    const limit = Math.max(1, Math.min(options.limit ?? 1_000, 10_000));
+    sql += " ORDER BY updated_at DESC, id DESC LIMIT ?";
+    params.push(limit + 1);
+    const rows = this.database.prepare(sql).all(...params) as Row[];
+    const hasMore = rows.length > limit;
+    const agents = rows.slice(0, limit).map((row) =>
       AgentRecordSchema.parse(parseJson(row.record_json)),
     );
+    const last = agents.at(-1);
+    return {
+      agents,
+      nextCursor: hasMore && last ? { updatedAt: last.updatedAt, id: last.id } : null,
+    };
+  }
+
+  saveWorkerProcessLease(record: WorkerProcessLease): WorkerProcessLease {
+    const parsed = WorkerProcessLeaseSchema.parse(record);
+    this.database
+      .prepare(
+        `INSERT INTO worker_process_leases(
+           id, daemon_owner_id, agent_id, attempt_id, driver, role, state, pid,
+           process_group_id, process_start_token, transport_kind, transport_endpoint,
+           owner_epoch, processed_output_seq, acked_output_seq, revision, record_json, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           daemon_owner_id=excluded.daemon_owner_id,
+           agent_id=excluded.agent_id,
+           attempt_id=excluded.attempt_id,
+           driver=excluded.driver,
+           role=excluded.role,
+           state=excluded.state,
+           pid=excluded.pid,
+           process_group_id=excluded.process_group_id,
+           process_start_token=excluded.process_start_token,
+           transport_kind=excluded.transport_kind,
+           transport_endpoint=excluded.transport_endpoint,
+           owner_epoch=excluded.owner_epoch,
+           processed_output_seq=excluded.processed_output_seq,
+           acked_output_seq=excluded.acked_output_seq,
+           revision=excluded.revision,
+           record_json=excluded.record_json,
+           updated_at=excluded.updated_at
+         WHERE excluded.revision > worker_process_leases.revision`,
+      )
+      .run(
+        parsed.id,
+        parsed.daemonOwnerId,
+        parsed.agentId,
+        parsed.attemptId,
+        parsed.driver,
+        parsed.role,
+        parsed.state,
+        parsed.identity?.pid ?? null,
+        parsed.identity?.processGroupId ?? null,
+        parsed.identity?.startToken ?? null,
+        parsed.transport.kind,
+        parsed.transport.kind === "worker-host" ? parsed.transport.endpoint : null,
+        parsed.transport.kind === "worker-host" ? parsed.transport.ownerEpoch : null,
+        parsed.transport.kind === "worker-host" ? parsed.transport.processedOutputSeq : null,
+        parsed.transport.kind === "worker-host" ? parsed.transport.ackedOutputSeq : null,
+        parsed.revision,
+        serialize(parsed),
+        parsed.updatedAt,
+      );
+    return this.getWorkerProcessLease(parsed.id) ?? parsed;
+  }
+
+  getWorkerProcessLease(id: string): WorkerProcessLease | null {
+    const row = this.database
+      .prepare("SELECT record_json FROM worker_process_leases WHERE id = ?")
+      .get(id) as Row | undefined;
+    return row ? WorkerProcessLeaseSchema.parse(parseJson(row.record_json)) : null;
+  }
+
+  listWorkerProcessLeases(
+    options: {
+      agentId?: string;
+      states?: readonly WorkerProcessLeaseState[];
+      daemonOwnerId?: string;
+    } = {},
+  ): WorkerProcessLease[] {
+    let sql = "SELECT record_json FROM worker_process_leases WHERE 1 = 1";
+    const params: string[] = [];
+    if (options.agentId) {
+      sql += " AND agent_id = ?";
+      params.push(options.agentId);
+    }
+    if (options.states?.length) {
+      sql += ` AND state IN (${options.states.map(() => "?").join(",")})`;
+      params.push(...options.states);
+    }
+    if (options.daemonOwnerId) {
+      sql += " AND daemon_owner_id = ?";
+      params.push(options.daemonOwnerId);
+    }
+    sql += " ORDER BY updated_at ASC, id ASC";
+    return (this.database.prepare(sql).all(...params) as Row[]).map((row) =>
+      WorkerProcessLeaseSchema.parse(parseJson(row.record_json)),
+    );
+  }
+
+  transitionWorkerProcessLease(
+    id: string,
+    expectedStates: readonly WorkerProcessLeaseState[],
+    patch: WorkerProcessLeaseTransitionPatch,
+  ): WorkerProcessLease | null {
+    if (expectedStates.length === 0) return null;
+    return this.transaction(() => {
+      const current = this.getWorkerProcessLease(id);
+      if (!current || !expectedStates.includes(current.state)) return null;
+      const next = WorkerProcessLeaseSchema.parse({
+        ...current,
+        ...patch,
+        id: current.id,
+        daemonOwnerId: current.daemonOwnerId,
+        agentId: current.agentId,
+        attemptId: current.attemptId,
+        driver: current.driver,
+        role: current.role,
+        command: current.command,
+        args: current.args,
+        cwd: current.cwd,
+        workspacePath: current.workspacePath,
+        permission: current.permission,
+        reservedAt: current.reservedAt,
+        revision: current.revision + 1,
+        updatedAt: patch.updatedAt ?? nowIso(),
+      });
+      const result = this.database
+        .prepare(
+          `UPDATE worker_process_leases SET
+             state = ?, pid = ?, process_group_id = ?, process_start_token = ?,
+             transport_kind = ?, transport_endpoint = ?, owner_epoch = ?, processed_output_seq = ?, acked_output_seq = ?,
+             revision = ?, record_json = ?, updated_at = ?
+           WHERE id = ? AND state = ? AND revision = ?`,
+        )
+        .run(
+          next.state,
+          next.identity?.pid ?? null,
+          next.identity?.processGroupId ?? null,
+          next.identity?.startToken ?? null,
+          next.transport.kind,
+          next.transport.kind === "worker-host" ? next.transport.endpoint : null,
+          next.transport.kind === "worker-host" ? next.transport.ownerEpoch : null,
+          next.transport.kind === "worker-host" ? next.transport.processedOutputSeq : null,
+          next.transport.kind === "worker-host" ? next.transport.ackedOutputSeq : null,
+          next.revision,
+          serialize(next),
+          next.updatedAt,
+          current.id,
+          current.state,
+          current.revision,
+        );
+      return Number(result.changes) === 1 ? next : null;
+    });
+  }
+
+  touchWorkerProcessLease(id: string, patch: WorkerProcessLeaseTouchPatch = {}): WorkerProcessLease | null {
+    return this.transaction(() => {
+      const current = this.getWorkerProcessLease(id);
+      if (!current) return null;
+      const next = WorkerProcessLeaseSchema.parse({
+        ...current,
+        ...patch,
+        revision: current.revision + 1,
+        updatedAt: nowIso(),
+      });
+      const result = this.database
+        .prepare(
+          `UPDATE worker_process_leases SET
+             transport_kind = ?, transport_endpoint = ?, owner_epoch = ?, processed_output_seq = ?, acked_output_seq = ?,
+             revision = ?, record_json = ?, updated_at = ?
+           WHERE id = ? AND revision = ?`,
+        )
+        .run(
+          next.transport.kind,
+          next.transport.kind === "worker-host" ? next.transport.endpoint : null,
+          next.transport.kind === "worker-host" ? next.transport.ownerEpoch : null,
+          next.transport.kind === "worker-host" ? next.transport.processedOutputSeq : null,
+          next.transport.kind === "worker-host" ? next.transport.ackedOutputSeq : null,
+          next.revision,
+          serialize(next),
+          next.updatedAt,
+          current.id,
+          current.revision,
+        );
+      return Number(result.changes) === 1 ? next : null;
+    });
+  }
+
+  durablyTouchWorkerProcessLease(id: string, patch: WorkerProcessLeaseTouchPatch = {}): WorkerProcessLease | null {
+    return this.durableTransaction(() => this.touchWorkerProcessLease(id, patch));
+  }
+
+  adoptWorkerProcessLease(
+    id: string,
+    expectedRevision: number,
+    nextDaemonOwnerId: string,
+    transport: WorkerProcessLease["transport"],
+  ): WorkerProcessLease | null {
+    return this.durableTransaction(() => {
+      const current = this.getWorkerProcessLease(id);
+      if (!current || current.revision !== expectedRevision || current.state !== "running") return null;
+      const next = WorkerProcessLeaseSchema.parse({
+        ...current,
+        daemonOwnerId: nextDaemonOwnerId,
+        transport,
+        revision: current.revision + 1,
+        updatedAt: nowIso(),
+      });
+      const result = this.database
+        .prepare(
+          `UPDATE worker_process_leases SET
+             daemon_owner_id = ?, transport_kind = ?, transport_endpoint = ?,
+             owner_epoch = ?, processed_output_seq = ?, acked_output_seq = ?, revision = ?, record_json = ?, updated_at = ?
+           WHERE id = ? AND state = 'running' AND daemon_owner_id = ? AND revision = ?`,
+        )
+        .run(
+          next.daemonOwnerId,
+          next.transport.kind,
+          next.transport.kind === "worker-host" ? next.transport.endpoint : null,
+          next.transport.kind === "worker-host" ? next.transport.ownerEpoch : null,
+          next.transport.kind === "worker-host" ? next.transport.processedOutputSeq : null,
+          next.transport.kind === "worker-host" ? next.transport.ackedOutputSeq : null,
+          next.revision,
+          serialize(next),
+          next.updatedAt,
+          current.id,
+          current.daemonOwnerId,
+          current.revision,
+        );
+      return Number(result.changes) === 1 ? next : null;
+    });
   }
 
   addAgentMessage(input: {
@@ -673,17 +1133,76 @@ export class SymphonyStore {
       .run(parsed.idempotencyKey, serialize(parsed), parsed.createdAt);
   }
 
-  claimTriggerOccurrence(triggerId: string, occurrenceKey: string): boolean {
+  claimCommandReceipt(receipt: CommandReceipt): boolean {
+    const parsed = CommandReceiptSchema.parse(receipt);
     const result = this.database
-      .prepare("INSERT OR IGNORE INTO trigger_occurrences(trigger_id, occurrence_key, created_at) VALUES (?, ?, ?)")
-      .run(triggerId, occurrenceKey, nowIso());
+      .prepare("INSERT OR IGNORE INTO command_receipts(idempotency_key, record_json, created_at) VALUES (?, ?, ?)")
+      .run(parsed.idempotencyKey, serialize(parsed), parsed.createdAt);
     return result.changes === 1;
   }
 
-  attachTriggerRun(triggerId: string, occurrenceKey: string, runId: string): void {
+  replaceCommandReceipt(receipt: CommandReceipt): void {
+    const parsed = CommandReceiptSchema.parse(receipt);
     this.database
-      .prepare("UPDATE trigger_occurrences SET run_id = ? WHERE trigger_id = ? AND occurrence_key = ?")
-      .run(runId, triggerId, occurrenceKey);
+      .prepare("UPDATE command_receipts SET record_json = ? WHERE idempotency_key = ?")
+      .run(serialize(parsed), parsed.idempotencyKey);
+  }
+
+  claimTriggerOccurrence(record: TriggerOccurrenceRecord): boolean {
+    const result = this.database
+      .prepare(
+        `INSERT OR IGNORE INTO trigger_occurrences(
+          trigger_id, occurrence_key, run_id, created_at, state, record_json, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.triggerId,
+        record.occurrenceKey,
+        record.runId,
+        record.createdAt,
+        record.state,
+        serialize(record),
+        record.updatedAt,
+      );
+    return result.changes === 1;
+  }
+
+  getTriggerOccurrence(triggerId: string, occurrenceKey: string): TriggerOccurrenceRecord | null {
+    const row = this.database
+      .prepare("SELECT record_json FROM trigger_occurrences WHERE trigger_id = ? AND occurrence_key = ?")
+      .get(triggerId, occurrenceKey) as Row | undefined;
+    return row?.record_json ? parseJson<TriggerOccurrenceRecord>(row.record_json) : null;
+  }
+
+  listTriggerOccurrences(options: { state?: TriggerOccurrenceRecord["state"] } = {}): TriggerOccurrenceRecord[] {
+    const rows = options.state
+      ? this.database
+          .prepare("SELECT record_json FROM trigger_occurrences WHERE state = ? AND record_json IS NOT NULL ORDER BY updated_at ASC")
+          .all(options.state) as Row[]
+      : this.database
+          .prepare("SELECT record_json FROM trigger_occurrences WHERE record_json IS NOT NULL ORDER BY updated_at ASC")
+          .all() as Row[];
+    return rows.map((row) => parseJson<TriggerOccurrenceRecord>(row.record_json));
+  }
+
+  replaceTriggerOccurrence(record: TriggerOccurrenceRecord): void {
+    const result = this.database
+      .prepare(
+        `UPDATE trigger_occurrences
+         SET run_id = ?, state = ?, record_json = ?, updated_at = ?
+         WHERE trigger_id = ? AND occurrence_key = ?`,
+      )
+      .run(
+        record.runId,
+        record.state,
+        serialize(record),
+        record.updatedAt,
+        record.triggerId,
+        record.occurrenceKey,
+      );
+    if (result.changes !== 1) {
+      throw new Error(`Trigger occurrence not found: ${record.triggerId}/${record.occurrenceKey}`);
+    }
   }
 
   savePluginState(record: PluginStateRecord): void {
@@ -707,6 +1226,13 @@ export class SymphonyStore {
       .run(message.id, message.threadId, serialize(message), message.createdAt);
   }
 
+  getConversationMessage(id: string): ConversationMessage | null {
+    const row = this.database
+      .prepare("SELECT record_json FROM conversation_messages WHERE id = ?")
+      .get(id) as Row | undefined;
+    return row ? parseJson<ConversationMessage>(row.record_json) : null;
+  }
+
   listConversationMessages(threadId?: string, limit = 1_000): ConversationMessage[] {
     if (threadId) {
       return (this.database
@@ -716,6 +1242,13 @@ export class SymphonyStore {
     return (this.database
       .prepare("SELECT record_json FROM conversation_messages ORDER BY created_at DESC LIMIT ?")
       .all(limit) as Row[]).map((row) => parseJson<ConversationMessage>(row.record_json));
+  }
+
+  listRecentConversationMessages(threadId: string, limit = 40): ConversationMessage[] {
+    const rows = this.database
+      .prepare("SELECT record_json FROM conversation_messages WHERE thread_id = ? ORDER BY created_at DESC LIMIT ?")
+      .all(threadId, limit) as Row[];
+    return rows.reverse().map((row) => parseJson<ConversationMessage>(row.record_json));
   }
 
   saveThread(record: ChatThreadRecord): void {
@@ -779,9 +1312,22 @@ export class SymphonyStore {
       .run(key, serialize(value), nowIso());
   }
 
+  hasMetadata(key: string): boolean {
+    return Boolean(this.database.prepare("SELECT 1 FROM metadata WHERE key = ?").get(key));
+  }
+
   getMetadata<T extends JsonValue>(key: string): T | null {
     const row = this.database.prepare("SELECT value_json FROM metadata WHERE key = ?").get(key) as Row | undefined;
     return row ? parseJson<T>(row.value_json) : null;
+  }
+
+  listMetadata<T extends JsonValue>(prefix: string): Array<{ key: string; value: T }> {
+    return (this.database
+      .prepare("SELECT key, value_json FROM metadata WHERE key LIKE ? ORDER BY key ASC")
+      .all(`${prefix}%`) as Row[]).map((row) => ({
+      key: String(row.key),
+      value: parseJson<T>(row.value_json),
+    }));
   }
 }
 

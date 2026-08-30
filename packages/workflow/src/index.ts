@@ -12,13 +12,20 @@ import {
   PermissionSchema,
   RoutingIntentSchema,
   WorkspaceSpecSchema,
+  isTerminalAgentStatus,
   nowIso,
   type AgentRecord,
   type JsonValue,
   type WorkflowMission,
 } from "@symphony/protocol";
 import { AgentCoordinator, idempotencyKey } from "@symphony/runtime";
-import type { StepAttemptRecord, SymphonyStore, WorkflowRevisionRecord, WorkflowRunRecord } from "@symphony/storage";
+import type {
+  StepAttemptRecord,
+  SymphonyStore,
+  TriggerOccurrenceRecord,
+  WorkflowRevisionRecord,
+  WorkflowRunRecord,
+} from "@symphony/storage";
 
 const OutputSchema = z.record(z.string(), JsonValueSchema);
 const CommonStepSchema = z.object({ id: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/u) });
@@ -181,6 +188,7 @@ type ExecutionContext = { input: JsonValue; steps: Record<string, JsonValue>; it
 
 export class WorkflowEngine {
   private readonly running = new Map<string, Promise<WorkflowRunRecord>>();
+  private readonly cancelling = new Map<string, Promise<void>>();
 
   constructor(
     private readonly loaded: LoadedConfig,
@@ -198,42 +206,186 @@ export class WorkflowEngine {
     return record;
   }
 
-  async run(workflowId: string, input: JsonValue = {}, options: { runId?: string } = {}): Promise<WorkflowRunRecord> {
+  async run(
+    workflowId: string,
+    input: JsonValue = {},
+    options: { runId?: string; workflowRevision?: number; workflowHash?: string } = {},
+  ): Promise<WorkflowRunRecord> {
     const record = this.start(workflowId, input, options);
-    return this.running.get(record.id) as Promise<WorkflowRunRecord>;
+    return this.running.get(record.id) ?? Promise.resolve(record);
   }
 
-  start(workflowId: string, input: JsonValue = {}, options: { runId?: string } = {}): WorkflowRunRecord {
-    const saved = this.store.getWorkflow(workflowId);
-    if (!saved) throw new Error(`Workflow not found: ${workflowId}`);
-    const ir = saved.ir as unknown as WorkflowIr;
+  start(
+    workflowId: string,
+    input: JsonValue = {},
+    options: { runId?: string; workflowRevision?: number; workflowHash?: string } = {},
+  ): WorkflowRunRecord {
     const runId = options.runId ?? ulid();
     const existing = this.store.getRun(runId);
+    if (existing && existing.workflowId !== workflowId) {
+      throw new Error(`Workflow run ${runId} belongs to ${existing.workflowId}, not ${workflowId}.`);
+    }
+    if (existing && options.workflowRevision !== undefined && existing.workflowRevision !== options.workflowRevision) {
+      throw new Error(`Workflow run ${runId} is pinned to ${workflowId}@${existing.workflowRevision}, not revision ${options.workflowRevision}.`);
+    }
+    // A run is authorized against one immutable workflow revision. Recovery
+    // must never fall forward to a newer definition just because the workflow
+    // file changed while native work was still in flight.
+    const requiredRevision = existing?.workflowRevision ?? options.workflowRevision;
+    const saved = requiredRevision === undefined
+      ? this.store.getWorkflow(workflowId)
+      : this.store.getWorkflow(workflowId, requiredRevision);
+    if (!saved) {
+      const error = existing
+        ? `Workflow ${existing.workflowId} revision ${existing.workflowRevision} required by run ${runId} is unavailable; recovery is blocked.`
+        : `Workflow not found: ${workflowId}`;
+      if (existing) {
+        const blocked = { ...existing, status: "interrupted" as const, error, updatedAt: nowIso(), finishedAt: null };
+        this.store.saveRun(blocked);
+        this.event(blocked, "workflow.run.recovery-blocked", {
+          error,
+          requiredRevision: existing.workflowRevision,
+        });
+      }
+      throw new Error(error);
+    }
+    const ir = saved.ir as unknown as WorkflowIr;
+    if (ir.definition.id !== saved.id || ir.revision !== saved.revision) {
+      throw new Error(`Stored workflow revision ${saved.id}@${saved.revision} has inconsistent compiled identity.`);
+    }
+    if (options.workflowHash !== undefined && saved.hash !== options.workflowHash) {
+      throw new Error(`Workflow ${workflowId}@${saved.revision} hash does not match the pinned trigger occurrence.`);
+    }
+    // A terminal run ID is an immutable execution receipt. Reusing it must
+    // return the recorded outcome rather than replaying steps, even if an API
+    // command receipt was lost after the run itself durably settled. Resolve
+    // the pinned revision/hash first so trigger recovery cannot attach an
+    // occurrence to an unrelated terminal receipt.
+    if (existing && ["completed", "failed", "cancelled"].includes(existing.status)) return existing;
     const now = nowIso();
     const record: WorkflowRunRecord = existing ?? {
       id: runId, workflowId, workflowRevision: saved.revision, status: "queued", input, output: null,
       error: null, startedAt: null, updatedAt: now, finishedAt: null, cancelRequested: false,
     };
     this.store.saveRun(record);
-    if (!this.running.has(runId)) this.running.set(runId, this.execute(record, ir).finally(() => this.running.delete(runId)));
+    if (!this.running.has(runId)) {
+      const execution = this.execute(record, ir).finally(() => this.running.delete(runId));
+      this.running.set(runId, execution);
+      // `start()` is deliberately fire-and-observe: callers may use `run()` to
+      // await the terminal result, while daemon recovery only needs to restore
+      // supervision and then expose the authoritative projection. Attach a
+      // rejection observer so a later workflow failure never becomes an
+      // unhandled rejection when no caller is awaiting this particular run.
+      void execution.catch(() => undefined);
+    }
     return record;
   }
 
   async recover(): Promise<void> {
-    await Promise.allSettled(this.store.listRuns({ status: ["queued", "running", "waiting", "interrupted"] }).map((run) => this.run(run.workflowId, run.input, { runId: run.id })));
+    // Recovery must restore supervision, not wait for every recovered workflow
+    // to finish. Long-running native agents can remain active for hours; the
+    // daemon still needs to become ready so clients can inspect, steer, cancel,
+    // and observe those runs while they continue in the background.
+    for (const run of this.store.listRuns({ status: ["queued", "running", "waiting", "interrupted"] })) {
+      // Chat runs are durable conversation containers, not compiled workflow
+      // executions. They intentionally have no WorkflowRevisionRecord: native
+      // conductor recovery is owned by AgentCoordinator. Older daemons fed
+      // these records through start(), which rewrote every healthy chat run to
+      // `interrupted` and emitted a false recovery-blocked event on each
+      // restart. Repair that legacy projection once and leave execution to the
+      // conductor supervisor.
+      if (isChatContainerRun(run)) {
+        if (run.status !== "running" || run.error !== null || run.finishedAt !== null) {
+          this.store.saveRun({
+            ...run,
+            status: "running",
+            error: null,
+            updatedAt: nowIso(),
+            finishedAt: null,
+          });
+        }
+        continue;
+      }
+      try {
+        this.start(run.workflowId, run.input, { runId: run.id });
+        if (run.cancelRequested) this.propagateCancellation(run.id);
+      } catch (cause) {
+        // `start()` persists an explicit recovery-blocked state/event for a
+        // missing pinned revision. Persist any other synchronous failure here
+        // as well, while isolating runs so one malformed record cannot hold
+        // daemon startup.
+        const error = cause instanceof Error ? cause.message : String(cause);
+        const latest = this.store.getRun(run.id) ?? run;
+        if (latest.status === "interrupted" && latest.error === error) continue;
+        const blocked = { ...latest, status: "interrupted" as const, error, updatedAt: nowIso(), finishedAt: null };
+        this.store.saveRun(blocked);
+        this.event(blocked, "workflow.run.recovery-blocked", { error });
+      }
+    }
   }
 
   cancel(runId: string): WorkflowRunRecord {
     const run = this.requireRun(runId);
+    if (["completed", "failed", "cancelled"].includes(run.status)) return run;
+    if (run.cancelRequested) {
+      // The durable intent is authoritative. A restart or reconstructed API
+      // receipt may re-enter here solely to resume bounded cancellation fanout;
+      // do not append a second request event or mutate the receipt identity.
+      this.propagateCancellation(runId);
+      return run;
+    }
     const updated = { ...run, cancelRequested: true, updatedAt: nowIso() };
-    this.store.saveRun(updated);
+    this.store.durableTransaction(() => {
+      this.store.saveRun(updated);
+      this.event(updated, "workflow.run.cancel-requested", {});
+    });
+    this.propagateCancellation(runId);
     return updated;
   }
 
+  private propagateCancellation(runId: string): void {
+    if (this.cancelling.has(runId)) return;
+    const cancellation = this.cancelAgentsForRun(runId).finally(() => {
+      if (this.cancelling.get(runId) === cancellation) this.cancelling.delete(runId);
+    });
+    this.cancelling.set(runId, cancellation);
+    void cancellation.catch((cause) => {
+      const run = this.store.getRun(runId);
+      if (!run) return;
+      this.event(run, "workflow.run.cancel-propagation-failed", {
+        error: cause instanceof Error ? cause.message : String(cause),
+      });
+    });
+  }
+
+  private async cancelAgentsForRun(runId: string): Promise<void> {
+    // Persisting the run intent happens first. This asynchronous fan-out keeps
+    // the API responsive while native cancellation remains bounded by each
+    // driver's acknowledgement and termination deadlines. Recovery invokes
+    // the same method, so a crash between intent and fan-out cannot revive the
+    // run or leave its durable agents working indefinitely.
+    const agents = this.agents.list({ runId, activeOnly: true });
+    const results = await Promise.allSettled(agents.map((agent) => this.agents.cancel(agent.id)));
+    const failures = results.flatMap((result, index) => result.status === "rejected"
+      ? [{
+          agentId: agents[index]?.id ?? "unknown",
+          error: result.reason instanceof Error ? result.reason.message : String(result.reason),
+        }]
+      : []);
+    if (failures.length) throw new Error(`Failed to propagate workflow cancellation: ${JSON.stringify(failures)}`);
+  }
+
   private async execute(run: WorkflowRunRecord, ir: WorkflowIr): Promise<WorkflowRunRecord> {
+    const hasStartedEvent = this.store.recentEvents({
+      runId: run.id,
+      types: ["workflow.run.started"],
+      limit: 1,
+    }).length > 0;
     let current: WorkflowRunRecord = { ...run, status: "running", startedAt: run.startedAt ?? nowIso(), updatedAt: nowIso(), error: null };
-    this.store.saveRun(current);
-    this.event(current, "workflow.run.started", { revision: ir.revision, hash: ir.hash });
+    this.store.durableTransaction(() => {
+      this.store.saveRun(current);
+      if (!hasStartedEvent) this.event(current, "workflow.run.started", { revision: ir.revision, hash: ir.hash });
+    });
     const context: ExecutionContext = { input: current.input, steps: {}, iteration: {} };
     for (const attempt of this.store.listStepAttempts(current.id)) if (attempt.status === "completed" && attempt.output !== null) context.steps[attempt.stepId] = attempt.output;
     try {
@@ -247,6 +399,7 @@ export class WorkflowEngine {
     } catch (error) {
       const latest = this.requireRun(current.id);
       const cancelled = latest.cancelRequested;
+      if (cancelled) await this.cancelling.get(current.id)?.catch(() => undefined);
       current = { ...latest, status: cancelled ? "cancelled" : "failed", error: error instanceof Error ? error.message : String(error), updatedAt: nowIso(), finishedAt: nowIso() };
       this.store.saveRun(current);
       this.event(current, cancelled ? "workflow.run.cancelled" : "workflow.run.failed", { error: current.error });
@@ -335,6 +488,12 @@ export class WorkflowEngine {
       });
       this.store.saveStepAttempt({ ...attempt, input: { ...context, agentId: agentRecord.id } as unknown as JsonValue, updatedAt: nowIso() });
     }
+    // Cancellation can race native routing/start after the initial fan-out
+    // snapshot. Fence the newly materialized agent against the durable run
+    // intent before waiting for its terminal result.
+    if (this.requireRun(run.id).cancelRequested && !isTerminalAgentStatus(agentRecord.status)) {
+      await this.agents.cancel(agentRecord.id);
+    }
     agentRecord = await this.waitForAgent(agentRecord.id);
     if (agentRecord.status !== "completed") throw new Error(`Agent ${agentRecord.id} ended with ${agentRecord.status}: ${agentRecord.error ?? "unknown error"}`);
     return agentRecord.output ?? { agentId: agentRecord.id, status: agentRecord.status };
@@ -342,12 +501,14 @@ export class WorkflowEngine {
 
   private waitForAgent(agentId: string): Promise<AgentRecord> {
     const initial = this.agents.get(agentId);
-    if (["completed", "failed", "cancelled", "interrupted", "lost"].includes(initial.status)) return Promise.resolve(initial);
+    if (isTerminalAgentStatus(initial.status)) return Promise.resolve(initial);
     return new Promise((resolvePromise) => {
       const unsubscribe = this.store.onEvent((event) => {
-        if (event.agentId !== agentId || !["driver.run.completed", "driver.run.failed", "driver.run.cancelled", "agent.failed"].includes(event.type)) return;
+        if (event.agentId !== agentId) return;
+        const current = this.agents.get(agentId);
+        if (!isTerminalAgentStatus(current.status)) return;
         unsubscribe();
-        resolvePromise(this.agents.get(agentId));
+        resolvePromise(current);
       });
     });
   }
@@ -368,26 +529,177 @@ export class WorkflowEngine {
 }
 
 export class TriggerManager {
-  private readonly jobs: Cron[] = [];
+  private readonly jobs = new Map<string, Cron[]>();
+  private active: boolean;
 
-  constructor(private readonly store: SymphonyStore, private readonly engine: WorkflowEngine) {}
+  constructor(
+    private readonly store: SymphonyStore,
+    private readonly engine: WorkflowEngine,
+    options: { paused?: boolean } = {},
+  ) {
+    this.active = options.paused !== true;
+  }
 
   register(ir: WorkflowIr): void {
+    for (const job of this.jobs.get(ir.definition.id) ?? []) job.stop();
+    const registered: Cron[] = [];
     for (const trigger of ir.definition.triggers) {
       if (trigger.type !== "cron") continue;
-      const job = new Cron(trigger.expression, trigger.timezone ? { timezone: trigger.timezone } : {}, async () => {
-        const occurrenceKey = `${ir.definition.id}:${trigger.id}:${new Date().toISOString().slice(0, 16)}`;
-        if (!this.store.claimTriggerOccurrence(trigger.id, occurrenceKey)) return;
-        const run = this.engine.start(ir.definition.id, trigger.input);
-        this.store.attachTriggerRun(trigger.id, occurrenceKey, run.id);
-      });
-      this.jobs.push(job);
+      const job = new Cron(
+        trigger.expression,
+        { ...(trigger.timezone ? { timezone: trigger.timezone } : {}), paused: !this.active },
+        async (self) => {
+          const scheduledAt = (self.currentRun() ?? new Date()).toISOString();
+          try {
+            await this.dispatch(ir, trigger, scheduledAt);
+          } catch {
+            // dispatch() durably records the failure while leaving the intent
+            // recoverable. Cron callbacks must not become unhandled rejections.
+          }
+        },
+      );
+      registered.push(job);
+    }
+    this.jobs.set(ir.definition.id, registered);
+  }
+
+  activeTriggerCount(workflowId?: string): number {
+    if (workflowId) return this.jobs.get(workflowId)?.length ?? 0;
+    return [...this.jobs.values()].reduce((total, jobs) => total + jobs.length, 0);
+  }
+
+  async recover(): Promise<void> {
+    for (const occurrence of this.store.listTriggerOccurrences({ state: "dispatching" })) {
+      try {
+        await this.dispatchOccurrence(occurrence);
+      } catch {
+        // One malformed or temporarily unavailable pinned revision must not
+        // block reconciliation of other durable occurrences or daemon startup.
+      }
     }
   }
 
+  activate(): void {
+    if (this.active) return;
+    this.active = true;
+    for (const jobs of this.jobs.values()) for (const job of jobs) job.resume();
+  }
+
   stop(): void {
-    for (const job of this.jobs) job.stop();
-    this.jobs.length = 0;
+    for (const jobs of this.jobs.values()) for (const job of jobs) job.stop();
+    this.jobs.clear();
+    this.active = false;
+  }
+
+
+  private async dispatch(
+    ir: WorkflowIr,
+    trigger: Extract<WorkflowDefinition["triggers"][number], { type: "cron" }>,
+    scheduledAt: string,
+  ): Promise<void> {
+    const occurrenceKey = `${ir.definition.id}:${trigger.id}:${scheduledAt}`;
+    const timestamp = nowIso();
+    const planned = {
+      version: 1 as const,
+      triggerId: trigger.id,
+      occurrenceKey,
+      workflowId: ir.definition.id,
+      workflowRevision: ir.revision,
+      workflowHash: ir.hash,
+      input: trigger.input,
+      scheduledAt,
+      runId: `cron-${createHash("sha256").update(occurrenceKey).digest("hex")}`,
+      state: "dispatching" as const,
+      attempts: 0,
+      error: null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      settledAt: null,
+    } satisfies TriggerOccurrenceRecord;
+    const claimed = this.store.durableTransaction(() => this.store.claimTriggerOccurrence(planned));
+    const occurrence = claimed
+      ? planned
+      : this.store.getTriggerOccurrence(trigger.id, occurrenceKey);
+    if (!occurrence) {
+      throw new Error(`Trigger occurrence ${occurrenceKey} was claimed without a recoverable dispatch intent.`);
+    }
+    if (
+      occurrence.workflowId !== planned.workflowId
+      || occurrence.workflowRevision !== planned.workflowRevision
+      || occurrence.workflowHash !== planned.workflowHash
+      || occurrence.runId !== planned.runId
+      || stableStringify(occurrence.input) !== stableStringify(planned.input)
+    ) {
+      throw new Error(`Trigger occurrence ${occurrenceKey} is already bound to a different durable dispatch.`);
+    }
+    if (occurrence.state === "settled") return;
+    await this.dispatchOccurrence(occurrence);
+  }
+
+  private async dispatchOccurrence(occurrence: TriggerOccurrenceRecord): Promise<void> {
+    if (occurrence.state === "settled") return;
+    const attempting: TriggerOccurrenceRecord = {
+      ...occurrence,
+      attempts: occurrence.attempts + 1,
+      error: null,
+      updatedAt: nowIso(),
+    };
+    this.store.durableTransaction(() => this.store.replaceTriggerOccurrence(attempting));
+    try {
+      const run = this.engine.start(occurrence.workflowId, occurrence.input, {
+        runId: occurrence.runId,
+        workflowRevision: occurrence.workflowRevision,
+        workflowHash: occurrence.workflowHash,
+      });
+      const settledAt = nowIso();
+      this.store.durableTransaction(() => {
+        this.store.replaceTriggerOccurrence({
+          ...attempting,
+          state: "settled",
+          error: null,
+          updatedAt: settledAt,
+          settledAt,
+        });
+        this.store.appendEvent({
+          type: "workflow.trigger.dispatched",
+          workflowId: occurrence.workflowId,
+          runId: run.id,
+          agentId: null,
+          occurredAt: settledAt,
+          payload: {
+            triggerId: occurrence.triggerId,
+            occurrenceKey: occurrence.occurrenceKey,
+            scheduledAt: occurrence.scheduledAt,
+            workflowRevision: occurrence.workflowRevision,
+            workflowHash: occurrence.workflowHash,
+            attempts: attempting.attempts,
+          },
+          provenance: { source: "workflow" },
+        });
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const updatedAt = nowIso();
+      this.store.durableTransaction(() => {
+        this.store.replaceTriggerOccurrence({ ...attempting, error: message, updatedAt });
+        this.store.appendEvent({
+          type: "workflow.trigger.dispatch-failed",
+          workflowId: occurrence.workflowId,
+          runId: occurrence.runId,
+          agentId: null,
+          occurredAt: updatedAt,
+          payload: {
+            triggerId: occurrence.triggerId,
+            occurrenceKey: occurrence.occurrenceKey,
+            scheduledAt: occurrence.scheduledAt,
+            workflowRevision: occurrence.workflowRevision,
+            error: message,
+          },
+          provenance: { source: "workflow" },
+        });
+      });
+      throw error;
+    }
   }
 }
 
@@ -405,6 +717,11 @@ export async function loadWorkflowDirectory(loaded: LoadedConfig, store: Symphon
     results.push(effective);
   }
   return results;
+}
+
+function isChatContainerRun(run: WorkflowRunRecord): boolean {
+  if (!run.workflowId.startsWith("chat:")) return false;
+  return run.id === `chat-run:${run.workflowId.slice("chat:".length)}`;
 }
 
 function interpolate(template: string, context: ExecutionContext): string {

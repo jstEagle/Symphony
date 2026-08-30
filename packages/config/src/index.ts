@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -28,6 +28,7 @@ export const SymphonyConfigSchema = z.object({
       port: z.number().int().min(1).max(65_535).default(3210),
       openBrowser: z.boolean().default(true),
       webDirectory: z.string().default("apps/web/out"),
+      shutdownTimeoutMs: z.number().int().min(100).max(120_000).default(10_000),
     })
     .prefault({}),
   conductor: z
@@ -41,6 +42,19 @@ export const SymphonyConfigSchema = z.object({
       maxDepth: z.number().int().min(0).max(16).nullable().default(3),
       maxConcurrent: z.number().int().min(1).max(128).nullable().default(8),
       defaultPermissions: z.enum(["read-only", "full-access"]).default("full-access"),
+      routingTimeoutMs: z.number().int().min(10).max(600_000).default(30_000),
+      startupTimeoutMs: z.number().int().min(10).max(600_000).default(60_000),
+      recoveryTimeoutMs: z.number().int().min(10).max(600_000).default(30_000),
+      recoveryConcurrency: z.number().int().min(1).max(32).default(4),
+      cancellationAcknowledgementTimeoutMs: z.number().int().min(10).max(600_000).default(3_000),
+      cancellationTerminationGraceMs: z.number().int().min(10).max(600_000).default(5_000),
+    })
+    .prefault({}),
+  workerHosts: z
+    .object({
+      enabled: z.boolean().default(true),
+      maxSpoolBytes: z.number().int().min(1_048_576).max(1_073_741_824).default(67_108_864),
+      maxSpoolFrames: z.number().int().min(1_000).max(1_000_000).default(100_000),
     })
     .prefault({}),
   harnesses: z
@@ -117,6 +131,16 @@ export const SymphonyConfigSchema = z.object({
       baseUrl: z.string().url().default("https://openrouter.ai/api/v1"),
       chatTitles: z.boolean().default(true),
       maxInputCharacters: z.number().int().positive().default(12_000),
+      chatSearch: z
+        .object({
+          rerankEnabled: z.boolean().default(false),
+          reranker: z.string().min(1).default("cohere/rerank-v3.5"),
+          prefilterLimit: z.number().int().min(1).max(100).default(30),
+          maxDocumentCharacters: z.number().int().min(256).max(50_000).default(4_000),
+          cacheTtlSeconds: z.number().int().min(1).max(3_600).default(300),
+          requestTimeoutMs: z.number().int().min(250).max(60_000).default(10_000),
+        })
+        .prefault({}),
     })
     .prefault({}),
   router: z
@@ -226,69 +250,207 @@ const secretEnvironmentNames: Record<string, string> = {
   "anthropic.apiKey": "ANTHROPIC_API_KEY",
   "openai.apiKey": "OPENAI_API_KEY",
   "opencode.apiKey": "OPENCODE_API_KEY",
+  "opencode.serverMasterKey": "SYMPHONY_OPENCODE_SERVICE_KEY",
+};
+
+export const DAEMON_SECRET_KEY_PREFIX = "daemon.secret";
+export const DAEMON_SECRET_ENVIRONMENT_VARIABLE = "SYMPHONY_DAEMON_SECRET";
+
+export function isDaemonSecretKey(key: string): boolean {
+  return key === DAEMON_SECRET_KEY_PREFIX || key.startsWith(`${DAEMON_SECRET_KEY_PREFIX}.`);
+}
+
+export function environmentWithoutDaemonSecret(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const childEnvironment = { ...environment };
+  for (const key of Object.keys(childEnvironment)) {
+    if (key.toUpperCase() === DAEMON_SECRET_ENVIRONMENT_VARIABLE) delete childEnvironment[key];
+  }
+  return childEnvironment;
+}
+
+export function removeDaemonSecretFromProcessEnvironment(): void {
+  for (const key of Object.keys(process.env)) {
+    if (key.toUpperCase() === DAEMON_SECRET_ENVIRONMENT_VARIABLE) delete process.env[key];
+  }
+}
+
+function secretEnvironmentName(key: string): string | undefined {
+  return isDaemonSecretKey(key) ? DAEMON_SECRET_ENVIRONMENT_VARIABLE : secretEnvironmentNames[key];
+}
+
+export interface NativeSecretBackend {
+  get(service: string, account: string): string | null;
+  set(service: string, account: string, value: string): void;
+  delete(service: string, account: string): boolean;
+}
+
+export type KeychainCommandRunner = (
+  args: string[],
+  options: { input?: string; output: "capture" | "capture-error" | "ignore"; timeoutMs: number },
+) => string;
+
+const KEYCHAIN_COMMAND_TIMEOUT_MS = 5_000;
+const MAX_KEYCHAIN_INTERACTIVE_COMMAND_BYTES = 4_095;
+
+const runKeychainCommand: KeychainCommandRunner = (args, options) => {
+  const result = spawnSync(
+    "/usr/bin/security",
+    args,
+    {
+      encoding: "utf8",
+      ...(options.input === undefined ? {} : { input: options.input }),
+      stdio: [
+        "pipe",
+        options.output === "capture" ? "pipe" : "ignore",
+        options.output === "capture-error" ? "pipe" : "ignore",
+      ],
+      timeout: options.timeoutMs,
+      killSignal: "SIGKILL",
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  if (result.error || result.status !== 0) {
+    const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
+    throw new Error(timedOut ? "macOS Keychain operation timed out." : "macOS Keychain operation failed.");
+  }
+  const output = options.output === "capture-error" ? result.stderr : result.stdout;
+  return typeof output === "string" ? output : "";
+};
+
+function quoteKeychainInteractiveArgument(value: string, label: string): string {
+  if (/[\u0000\r\n]/u.test(value)) throw new Error(`macOS Keychain ${label} contains an unsupported control character.`);
+  return `'${value.replaceAll("\\", "\\\\").replaceAll("'", "\\'")}'`;
+}
+
+function decodeKeychainPassword(output: string): string {
+  const line = output.replace(/\r?\n$/u, "");
+  const quotedPrefix = "password: \"";
+  if (line.startsWith(quotedPrefix) && line.endsWith("\"")) {
+    return line.slice(quotedPrefix.length, -1);
+  }
+  const hexMatch = /^password: 0x([0-9a-fA-F]*)(?: {2}".*")?$/us.exec(line);
+  if (!hexMatch || hexMatch[1]!.length % 2 !== 0) {
+    throw new Error("macOS Keychain returned an unsupported password representation.");
+  }
+  const bytes = Buffer.from(hexMatch[1]!, "hex");
+  const value = bytes.toString("utf8");
+  if (!Buffer.from(value, "utf8").equals(bytes)) {
+    throw new Error("macOS Keychain password is not valid UTF-8 text.");
+  }
+  return value;
+}
+
+export class MacOsKeychainBackend implements NativeSecretBackend {
+  constructor(
+    private readonly run: KeychainCommandRunner = runKeychainCommand,
+    private readonly keychainPath?: string,
+  ) {}
+
+  get(service: string, account: string): string | null {
+    const output = this.run(
+      ["find-generic-password", "-a", account, "-s", service, "-g", ...this.keychainArgs()],
+      { output: "capture-error", timeoutMs: KEYCHAIN_COMMAND_TIMEOUT_MS },
+    );
+    return decodeKeychainPassword(output);
+  }
+
+  set(service: string, account: string, value: string): void {
+    const command = [
+      "add-generic-password",
+      "-U",
+      "-a",
+      quoteKeychainInteractiveArgument(account, "account"),
+      "-s",
+      quoteKeychainInteractiveArgument(service, "service"),
+      "-X",
+      quoteKeychainInteractiveArgument(Buffer.from(value, "utf8").toString("hex"), "password bytes"),
+      ...this.keychainArgs().map((path) => quoteKeychainInteractiveArgument(path, "path")),
+    ].join(" ") + "\n";
+    if (Buffer.byteLength(command, "utf8") > MAX_KEYCHAIN_INTERACTIVE_COMMAND_BYTES) {
+      throw new Error("macOS Keychain interactive command exceeds the supported length.");
+    }
+    // Interactive mode reads the complete command from stdin. Only the
+    // non-secret `-i` selector appears in the child process argument vector.
+    this.run(
+      ["-i"],
+      { input: command, output: "ignore", timeoutMs: KEYCHAIN_COMMAND_TIMEOUT_MS },
+    );
+  }
+
+  delete(service: string, account: string): boolean {
+    this.run(
+      ["delete-generic-password", "-a", account, "-s", service, ...this.keychainArgs()],
+      { output: "ignore", timeoutMs: KEYCHAIN_COMMAND_TIMEOUT_MS },
+    );
+    return true;
+  }
+
+  private keychainArgs(): string[] {
+    return this.keychainPath ? [this.keychainPath] : [];
+  }
+}
+
+export type SecretStoreOptions = {
+  platform?: NodeJS.Platform;
+  environment?: NodeJS.ProcessEnv;
+  nativeBackend?: NativeSecretBackend;
+  account?: string;
 };
 
 export class SecretStore {
   readonly servicePrefix: string;
+  private readonly environment: NodeJS.ProcessEnv;
+  private readonly nativeBackend: NativeSecretBackend | null;
+  private readonly account: string;
+  private readonly platform: NodeJS.Platform;
 
-  constructor(servicePrefix = "dev.symphony") {
+  constructor(servicePrefix = "dev.symphony", options: SecretStoreOptions = {}) {
     this.servicePrefix = servicePrefix;
+    const platform = options.platform ?? process.platform;
+    this.platform = platform;
+    this.environment = { ...(options.environment ?? process.env) };
+    this.nativeBackend = options.nativeBackend ?? (platform === "darwin" ? new MacOsKeychainBackend() : null);
+    this.account = options.account ?? userInfo().username;
   }
 
   get(key: string): string | null {
-    const environmentName = secretEnvironmentNames[key];
-    if (environmentName && process.env[environmentName]) return process.env[environmentName] ?? null;
-    if (process.platform !== "darwin") return null;
+    const environmentName = secretEnvironmentName(key);
+    if (environmentName) {
+      const environmentValue = this.environment[environmentName]
+        ?? (this.platform === "win32"
+          ? Object.entries(this.environment).find(([name]) => name.toUpperCase() === environmentName)?.[1]
+          : undefined);
+      if (environmentValue) return environmentValue;
+    }
+    if (!this.nativeBackend) return null;
     try {
-      return execFileSync(
-        "security",
-        ["find-generic-password", "-a", userInfo().username, "-s", `${this.servicePrefix}.${key}`, "-w"],
-        { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-      ).trim();
+      return this.nativeBackend.get(`${this.servicePrefix}.${key}`, this.account);
     } catch {
       return null;
     }
   }
 
   set(key: string, value: string): void {
-    if (process.platform !== "darwin") {
-      const environmentName = secretEnvironmentNames[key] ?? key.toUpperCase().replaceAll(".", "_");
+    if (!this.nativeBackend) {
+      const environmentName = secretEnvironmentName(key) ?? key.toUpperCase().replaceAll(".", "_");
       throw new Error(`No OS keychain adapter is available. Supply the secret as ${environmentName}.`);
     }
-    execFileSync(
-      "security",
-      [
-        "add-generic-password",
-        "-U",
-        "-a",
-        userInfo().username,
-        "-s",
-        `${this.servicePrefix}.${key}`,
-        "-w",
-        value,
-      ],
-      { stdio: "ignore" },
-    );
+    this.nativeBackend.set(`${this.servicePrefix}.${key}`, this.account, value);
   }
 
   delete(key: string): boolean {
-    if (process.platform !== "darwin") return false;
+    if (!this.nativeBackend) return false;
     try {
-      execFileSync(
-        "security",
-        ["delete-generic-password", "-a", userInfo().username, "-s", `${this.servicePrefix}.${key}`],
-        { stdio: "ignore" },
-      );
-      return true;
+      return this.nativeBackend.delete(`${this.servicePrefix}.${key}`, this.account);
     } catch {
       return false;
     }
   }
 
   describeLocation(key: string): string {
-    const environmentName = secretEnvironmentNames[key];
-    if (environmentName && process.env[environmentName]) return `environment:${environmentName}`;
-    if (process.platform === "darwin" && this.get(key)) return `keychain:${this.servicePrefix}.${key}`;
+    const environmentName = secretEnvironmentName(key);
+    if (environmentName && this.environment[environmentName]) return `environment:${environmentName}`;
+    if (this.nativeBackend && this.get(key)) return `keychain:${this.servicePrefix}.${key}`;
     return "missing";
   }
 }

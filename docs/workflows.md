@@ -21,7 +21,7 @@ The default is useful for a first review iteration: no score is treated as zero.
 
 ## Triggers
 
-Manual triggers are always supported. Cron uses standard Croner expressions and an optional IANA timezone. Trigger occurrences are claimed transactionally before a run is created, so restart or duplicate scheduling does not create the same occurrence twice.
+Manual triggers are always supported. Cron uses standard Croner expressions and an optional IANA timezone. Before launch, each scheduled occurrence durably records its exact scheduled time, input, deterministic run ID, and pinned workflow revision/hash. If the daemon stops before creating the run—or after creating it but before linking the occurrence—startup reuses that run ID to reconcile the intent exactly once. Daemon-owned cron callbacks remain paused until retained agents, workflow runs, and pending occurrences have recovered.
 
 ```ts
 triggers: [

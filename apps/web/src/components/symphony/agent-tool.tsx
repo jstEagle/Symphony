@@ -1,6 +1,6 @@
 "use client";
 
-import { CaretDown, Check, XCircle } from "@phosphor-icons/react";
+import { CaretDown, Check, FileText, MagnifyingGlass, PencilLine, TerminalWindow, Wrench, XCircle } from "@phosphor-icons/react";
 import type { ToolCallMessagePartComponent } from "@assistant-ui/react";
 import { memo } from "react";
 import { CollapsibleTrigger } from "@/components/ui/collapsible";
@@ -9,36 +9,44 @@ import { DotmCircular5 } from "@/components/ui/dotm-circular-5";
 import { DotmTriangle2 } from "@/components/ui/dotm-triangle-2";
 import { ToolFallback } from "@/components/assistant-ui/elements/tool-fallback.aui";
 import { useOptionalSymphony } from "@/components/symphony/context";
-import { loaderForHarness } from "@/lib/symphony/format";
+import { isActivelyWorkingAgent, loaderForHarness } from "@/lib/symphony/format";
 import { cn } from "@/lib/utils";
 
 export const AgentToolFallback: ToolCallMessagePartComponent = (props) => {
   const { toolName, argsText, result, status } = props;
   const args = "args" in props ? props.args : undefined;
   const symphony = useOptionalSymphony();
-  const resultState = readResultState(result);
-  const active = status?.type === "running" || resultState === "running";
-  const failed = status?.type === "incomplete";
-  const label = toolLabels[toolName] ?? toolName.replaceAll("_", " ");
+  const label = toolLabel(toolName);
   const summary = toolSummary(toolName, args, result);
   const agentId = readAgentId(args, result);
+  const authoritativeAgent = agentId
+    ? symphony?.snapshot.agents.find((agent) => agent.id === agentId)
+    : undefined;
+  const active = authoritativeAgent
+    ? isActivelyWorkingAgent(authoritativeAgent.state)
+    : status?.type === "running";
+  const failed = status?.type === "incomplete"
+    || authoritativeAgent?.state === "failed"
+    || authoritativeAgent?.state === "cancelled"
+    || authoritativeAgent?.state === "stale";
+  const ToolIcon = toolIcon(toolName);
 
   return (
     <ToolFallback.Root defaultOpen={failed}>
-      <CollapsibleTrigger className="group/agent-tool flex w-fit origin-left items-center gap-2 py-1.5 text-sm text-muted-foreground transition hover:text-foreground active:scale-[0.98]">
+      <CollapsibleTrigger className="group/agent-tool flex min-h-8 w-full origin-left cursor-pointer items-center gap-2 rounded-lg px-2 py-1 text-sm text-muted-foreground transition-[color,background-color,scale] hover:bg-muted/38 hover:text-foreground active:scale-[0.995]">
         {active ? (
           <AgentLoader kind={loaderForTool(toolName, argsText)} size={18} label={`${label} active`} />
         ) : failed ? (
           <XCircle className="size-4 text-destructive" />
         ) : (
-          <Check className="size-4" />
+          <Check className="size-3.5 text-success" />
         )}
-        <span className={cn(active && "shimmer motion-reduce:animate-none")}>
-          {active ? "Working: " : ""}
-          <b>{label}</b>
-          {summary ? <span className="font-normal"> · {summary}</span> : null}
+        <ToolIcon className="size-3.5 shrink-0 opacity-70" />
+        <span className={cn("min-w-0 flex-1 truncate text-left", active && "shimmer motion-reduce:animate-none")}>
+          <b className="font-medium text-foreground/85">{label}</b>
+          {summary ? <span className="ml-2 font-mono text-[10px] font-normal text-muted-foreground">{summary}</span> : null}
         </span>
-        <CaretDown className="size-4 -rotate-90 transition-transform group-data-open/agent-tool:rotate-0" />
+        <CaretDown className="size-3.5 shrink-0 -rotate-90 opacity-65 transition-transform group-data-open/agent-tool:rotate-0" />
       </CollapsibleTrigger>
       {agentId && symphony && (
         <button
@@ -49,7 +57,7 @@ export const AgentToolFallback: ToolCallMessagePartComponent = (props) => {
           Open agent
         </button>
       )}
-      <ToolFallback.Content>
+      <ToolFallback.Content className="max-h-80 overflow-y-auto">
         <ToolFallback.Error status={status} />
         <ToolFallback.Args argsText={argsText} />
         <ToolFallback.Result result={result} />
@@ -66,20 +74,48 @@ const toolLabels: Record<string, string> = {
   cancel_agent: "cancelled an agent",
 };
 
+function toolLabel(toolName: string): string {
+  const normalized = toolName.replace(/^mcp[_\s-]*symphony[_\s-]*/iu, "").replace(/^symphony[_\s-]*/iu, "");
+  return toolLabels[normalized]
+    ?? ({ bash: "Ran command", command_execution: "Ran command", read: "Read file", grep: "Searched files", glob: "Listed files", file_change: "Changed files", edit: "Edited file", write: "Wrote file", apply_patch: "Applied patch", toolsearch: "Found tools" } as Record<string, string>)[normalized.toLocaleLowerCase()]
+    ?? normalized.replaceAll("_", " ").replace(/\b\w/gu, (letter) => letter.toUpperCase());
+}
+
+function toolIcon(toolName: string) {
+  const normalized = toolName.toLocaleLowerCase();
+  if (/bash|command|shell|terminal/u.test(normalized)) return TerminalWindow;
+  if (/read|file/u.test(normalized) && !/edit|write|patch|change/u.test(normalized)) return FileText;
+  if (/grep|glob|search|find|list/u.test(normalized)) return MagnifyingGlass;
+  if (/edit|write|patch|change/u.test(normalized)) return PencilLine;
+  return Wrench;
+}
+
 export const AgentLoader = memo(function AgentLoader({
   kind,
   size = 18,
   label = "Agent active",
+  animated = true,
+  tone = "default",
 }: {
   kind: "square" | "circular" | "triangle";
   size?: number;
   label?: string;
+  animated?: boolean;
+  tone?: "default" | "info" | "success" | "warning" | "danger";
 }) {
+  const colors = {
+    default: "currentColor",
+    info: "var(--color-info)",
+    success: "var(--color-success)",
+    warning: "var(--color-warning)",
+    danger: "var(--color-destructive)",
+  } as const;
   const shared = {
     size,
-    color: "currentColor",
+    color: colors[tone],
     ariaLabel: label,
     className: "shrink-0 text-primary",
+    animated,
   };
 
   if (kind === "triangle") return <DotmTriangle2 {...shared} dotSize={size <= 18 ? 2.4 : 3.2} />;
@@ -97,11 +133,6 @@ function loaderForTool(toolName: string, argsText?: string) {
   return "square" as const;
 }
 
-function readResultState(result: unknown) {
-  if (typeof result !== "object" || result === null || !("state" in result)) return undefined;
-  return (result as { state?: unknown }).state;
-}
-
 function readAgentId(args: unknown, result: unknown): string | undefined {
   const fromResult = recordString(result, "agentId");
   if (fromResult) return fromResult;
@@ -113,8 +144,13 @@ function toolSummary(toolName: string, args: unknown, result: unknown): string |
   if (toolName === "observe_agent") return recordString(result, "summary") ?? recordString(args, "granularity");
   if (toolName === "send_message") return recordString(args, "message");
   if (toolName === "cancel_agent") return recordString(args, "agentId");
-  return undefined;
+  const target = ["path", "file_path", "filePath", "query", "pattern", "command"]
+    .map((key) => recordString(args, key))
+    .find(Boolean);
+  return target ? clip(target) : undefined;
 }
+
+function clip(value: string): string { const normalized = value.replace(/\s+/gu, " ").trim(); return normalized.length > 78 ? `${normalized.slice(0, 75)}…` : normalized; }
 
 function recordString(value: unknown, key: string): string | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;

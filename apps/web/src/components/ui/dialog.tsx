@@ -7,6 +7,9 @@ import { cn } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
 import { X } from "@phosphor-icons/react"
 
+type DialogHandle = DialogPrimitive.Handle<unknown>
+const createDialogHandle = () => DialogPrimitive.createHandle<unknown>()
+
 function Dialog({ ...props }: DialogPrimitive.Root.Props) {
   return <DialogPrimitive.Root data-slot="dialog" {...props} />
 }
@@ -156,4 +159,6 @@ export {
   DialogPortal,
   DialogTitle,
   DialogTrigger,
+  createDialogHandle,
+  type DialogHandle,
 }

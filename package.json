@@ -11,8 +11,10 @@
     "test:watch": "vitest",
     "check": "pnpm typecheck && pnpm test && pnpm build",
     "dev": "concurrently --kill-others --names daemon,web --prefix-colors magenta,cyan \"pnpm dev:daemon\" \"pnpm dev:web\"",
-    "start": "pnpm --filter @symphony/cli dev -- start",
+    "dev:watch": "concurrently --kill-others --names daemon,web --prefix-colors magenta,cyan \"pnpm dev:daemon:watch\" \"pnpm dev:web\"",
+    "start": "node apps/cli/dist/index.js start",
     "dev:daemon": "pnpm --filter @symphony/daemon dev",
+    "dev:daemon:watch": "pnpm --filter @symphony/daemon dev:watch",
     "dev:web": "pnpm --filter symphony-web dev",
     "symphony": "pnpm --filter @symphony/cli dev --"
   },

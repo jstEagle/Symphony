@@ -174,6 +174,7 @@ export type RunSnapshot = {
   nodes: WorkNode[];
   edges: WorkEdge[];
   events: ActivityEvent[];
+  traceEvents?: EventEnvelope[];
   runStatus?: string;
   cancelRequested?: boolean;
 };
@@ -193,6 +194,31 @@ export type AgentDetail = Agent & {
   parent?: Agent;
   files: Array<{ path: string; detail?: string }>;
   artifacts: Array<{ id: string; label: string }>;
+};
+
+export type AgentLogEntry = {
+  cursor: number;
+  at: string;
+  level: "debug" | "info" | "warn" | "error";
+  source: string;
+  type: string;
+  message: string;
+  data: JsonValue;
+};
+
+export type AgentSessionLog = {
+  agent: {
+    id: string;
+    status: NativeAgentStatus;
+    harness: string;
+    model: string;
+    nativeSessionId: string | null;
+    nativeRunId: string | null;
+    workspacePath: string;
+    error: string | null;
+  };
+  cursor: number;
+  entries: AgentLogEntry[];
 };
 
 export type InboxItem = {
@@ -230,6 +256,12 @@ export type DriverReport = {
   };
 };
 
+export type DriverAuthenticationResult = {
+  authenticated: boolean;
+  detail: string;
+  loginUrl?: string;
+};
+
 export type PluginState = {
   id: string;
   version: string;
@@ -257,6 +289,16 @@ export type RuntimeSettings = {
     maxDepth: number | null;
     maxConcurrent: number | null;
     defaultPermissions: AgentAccess;
+  };
+  uiUtilities: {
+    chatSearch: {
+      rerankEnabled: boolean;
+      reranker: string;
+      prefilterLimit: number;
+      maxDocumentCharacters: number;
+      cacheTtlSeconds: number;
+      requestTimeoutMs: number;
+    };
   };
 };
 
@@ -400,14 +442,21 @@ export type CommandType =
   | "agent.message"
   | "agent.observe"
   | "agent.cancel"
+  | "agent.present"
+  | "workflow.register"
   | "workflow.run"
-  | "workflow.cancel";
+  | "workflow.cancel"
+  | "plugin.invoke"
+  | "driver.update"
+  | "driver.authenticate";
 
 export type CommandReceipt = {
   idempotencyKey: string;
   accepted: boolean;
+  state: "dispatching" | "settled" | "failed";
   result: JsonValue;
   createdAt: string;
+  updatedAt?: string;
 };
 
 export type PluginSlotName =

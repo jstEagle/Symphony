@@ -24,15 +24,17 @@ const DEPTH_PRESETS = [0, 1, 2, 3, 4, 5, 8, 12, 16];
 const CONCURRENCY_PRESETS = [1, 2, 4, 8, 16, 32, 64, 128];
 
 export function SettingsDialog() {
-  const { settingsOpen, setSettingsOpen, envelope, connection, saveSettings, updateHarness } = useSymphony();
+  const { settingsOpen, setSettingsOpen, envelope, connection, saveSettings, updateHarness, authenticateHarness } = useSymphony();
   const [harness, setHarness] = useState<Exclude<HarnessId, "auto">>(envelope.settings.conductor.harness);
   const [model, setModel] = useState(envelope.settings.conductor.model);
   const [permissions, setPermissions] = useState<AgentAccess>(envelope.settings.agents.defaultPermissions);
   const [maxDepth, setMaxDepth] = useState(envelope.settings.agents.maxDepth);
   const [maxConcurrent, setMaxConcurrent] = useState(envelope.settings.agents.maxConcurrent);
+  const [rerankEnabled, setRerankEnabled] = useState(envelope.settings.uiUtilities.chatSearch.rerankEnabled);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [updating, setUpdating] = useState<string | null>(null);
+  const [authenticating, setAuthenticating] = useState<string | null>(null);
 
   useEffect(() => {
     setHarness(envelope.settings.conductor.harness);
@@ -40,12 +42,14 @@ export function SettingsDialog() {
     setPermissions(envelope.settings.agents.defaultPermissions);
     setMaxDepth(envelope.settings.agents.maxDepth);
     setMaxConcurrent(envelope.settings.agents.maxConcurrent);
+    setRerankEnabled(envelope.settings.uiUtilities.chatSearch.rerankEnabled);
   }, [
     envelope.settings.conductor.harness,
     envelope.settings.conductor.model,
     envelope.settings.agents.defaultPermissions,
     envelope.settings.agents.maxDepth,
     envelope.settings.agents.maxConcurrent,
+    envelope.settings.uiUtilities.chatSearch.rerankEnabled,
   ]);
 
   const harnessModels = useMemo(
@@ -85,6 +89,12 @@ export function SettingsDialog() {
       await saveSettings({
         conductor: { harness, model },
         agents: { defaultPermissions: permissions, maxDepth, maxConcurrent },
+        uiUtilities: {
+          chatSearch: {
+            ...envelope.settings.uiUtilities.chatSearch,
+            rerankEnabled,
+          },
+        },
       });
       setNotice("Saved. New chats and replacement conductors will use these settings.");
     } catch (error) {
@@ -154,6 +164,31 @@ export function SettingsDialog() {
             <p className="text-[11px] leading-4 text-muted-foreground">
               Existing healthy chats keep their native session. A failed chat automatically starts a replacement conductor using the saved selection.
             </p>
+            <div className="flex items-center justify-between gap-4 rounded-lg border border-border/55 bg-muted/20 px-3 py-2.5">
+              <div className="min-w-0">
+                <p className="text-xs font-medium">Semantic chat search</p>
+                <p className="mt-0.5 text-[10px] leading-4 text-muted-foreground">
+                  Sends a bounded, locally prefiltered set of chat text to {envelope.settings.uiUtilities.chatSearch.reranker} through OpenRouter and may incur cost. Off uses local fuzzy search only.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={rerankEnabled}
+                aria-label="Semantic chat search"
+                disabled={envelope.mode === "preview"}
+                onClick={() => setRerankEnabled((enabled) => !enabled)}
+                className={cn(
+                  "flex h-7 shrink-0 cursor-pointer items-center gap-1.5 rounded-full border px-2 text-[10px] transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                  rerankEnabled
+                    ? "border-foreground/30 bg-foreground text-background"
+                    : "border-border bg-background text-muted-foreground hover:bg-accent",
+                )}
+              >
+                <span className={cn("size-1.5 rounded-full", rerankEnabled ? "bg-background" : "bg-muted-foreground/60")} />
+                {rerankEnabled ? "On" : "Off"}
+              </button>
+            </div>
             <div className="flex items-center justify-between gap-3 pt-1">
               <span className="text-[10px] text-muted-foreground">{notice}</span>
               <Button type="submit" size="sm" disabled={busy || envelope.mode === "preview"}>
@@ -198,12 +233,31 @@ export function SettingsDialog() {
                     ok={driver.available && driver.authenticated !== false && driver.updateAvailable !== true}
                     label={driver.available
                       ? driver.authenticated === false
-                        ? "Needs auth"
+                        ? driver.driver === "cursor" ? "Needs SDK auth" : "Needs auth"
                         : driver.updateAvailable
                           ? "Update available"
                           : "Ready"
                       : "Missing"}
                   />
+                  {driver.driver === "cursor" && driver.available && driver.authenticated === false && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={authenticating !== null || envelope.mode === "preview"}
+                      onClick={() => {
+                        setAuthenticating(driver.driver);
+                        setNotice("Complete the Cursor SDK sign-in in the browser window that opens.");
+                        void authenticateHarness(driver.driver)
+                          .then((result) => setNotice(result.detail))
+                          .catch((error) => setNotice(error instanceof Error ? error.message : "Cursor SDK authentication failed."))
+                          .finally(() => setAuthenticating(null));
+                      }}
+                    >
+                      {authenticating === driver.driver ? <AgentLoader kind="square" size={14} label="Authenticating Cursor SDK" /> : null}
+                      {authenticating === driver.driver ? "Authenticating…" : "Authenticate SDK"}
+                    </Button>
+                  )}
                   {driver.updateSupported && (
                     <Button
                       type="button"
@@ -253,7 +307,7 @@ export function SettingsDialog() {
         <section className="space-y-2">
           <h3 className="text-xs font-medium text-muted-foreground">Secrets</h3>
           <p className="text-xs leading-5 text-muted-foreground">
-            Store keys with <span className="font-mono text-[11px] text-foreground">pnpm symphony -- secret set openrouter.apiKey</span> or <span className="font-mono text-[11px] text-foreground">CURSOR_API_KEY</span>. The browser never persists credentials.
+            Pipe keys through <span className="font-mono text-[11px] text-foreground">pnpm symphony -- secret set openrouter.apiKey --stdin</span> or use <span className="font-mono text-[11px] text-foreground">CURSOR_API_KEY</span>. The browser never persists credentials.
           </p>
           <Button variant="outline" size="sm" disabled>
             Keychain is managed by the daemon

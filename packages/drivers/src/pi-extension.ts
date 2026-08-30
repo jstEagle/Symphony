@@ -26,6 +26,14 @@ function response(value: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(value, null, 2) }], details: value };
 }
 
+function mutation(tool: string, toolCallId: string, body: unknown): RequestInit {
+  return {
+    method: "POST",
+    headers: { "idempotency-key": `pi:${agentId}:${tool}:${toolCallId}` },
+    body: JSON.stringify(body),
+  };
+}
+
 export default function symphonyPiExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "list_agents",
@@ -46,13 +54,13 @@ export default function symphonyPiExtension(pi: ExtensionAPI): void {
       permissions: Type.Optional(Type.Union([Type.Literal("full-access"), Type.Literal("read-only")])),
       outputSchema: Type.Record(Type.String(), Type.Unknown()),
     }),
-    async execute(_id, params) { return response(await api("/v1/agents", { method: "POST", body: JSON.stringify(params) })); },
+    async execute(id, params) { return response(await api("/v1/agents", mutation("create-agent", id, params))); },
   });
 
   pi.registerTool({
     name: "present_ui",
     label: "Present Symphony UI",
-    description: "Present optional structured UI in the current Symphony chat. Supported kinds include speaker identity, diagrams, flow graphs, spec sheets, timelines, job progress, score breakdowns, plans, subagent lists, recommendations, handoffs, schedules, checkpoints, cost meters, tool timelines, and allowlisted generative UI.",
+    description: "Present optional structured UI in the current Symphony chat. Supported kinds include speaker identity, diagrams, flow graphs, spec sheets, timelines, job progress, score breakdowns, plans, subagent lists, recommendations, handoffs, schedules, checkpoints, cost meters, tool timelines, and allowlisted generative UI. Include the durable agentId on any real Symphony agent or agent-specific job so users can open its native conversation.",
     parameters: Type.Object({
       kind: Type.Union([Type.Literal("speaker-identity"), Type.Literal("diagram"), Type.Literal("flow-graph"), Type.Literal("spec-sheet"), Type.Literal("timeline"), Type.Literal("job-progress"), Type.Literal("score-breakdown"), Type.Literal("agent-plan"), Type.Literal("subagent-list"), Type.Literal("recommendation-card"), Type.Literal("handoff"), Type.Literal("schedule"), Type.Literal("checkpoints"), Type.Literal("cost-meter"), Type.Literal("tool-timeline"), Type.Literal("generative-ui")]),
       data: Type.Record(Type.String(), Type.Unknown()),
@@ -65,7 +73,12 @@ export default function symphonyPiExtension(pi: ExtensionAPI): void {
     label: "Message Symphony agent",
     description: "Steer or follow up with an existing Symphony agent.",
     parameters: Type.Object({ targetAgentId: Type.String(), content: Type.String() }),
-    async execute(_id, params) { return response(await api(`/v1/agents/${encodeURIComponent(params.targetAgentId)}/messages`, { method: "POST", body: JSON.stringify({ content: params.content }) })); },
+    async execute(id, params) {
+      return response(await api(
+        `/v1/agents/${encodeURIComponent(params.targetAgentId)}/messages`,
+        mutation("send-message", id, { content: params.content }),
+      ));
+    },
   });
 
   pi.registerTool({
@@ -80,12 +93,24 @@ export default function symphonyPiExtension(pi: ExtensionAPI): void {
   });
 
   pi.registerTool({
+    name: "get_session_logs",
+    label: "Inspect Symphony session logs",
+    description: "Read durable native lifecycle logs for a Symphony agent without interrupting it. Use this to diagnose failures or stalled sessions.",
+    parameters: Type.Object({
+      targetAgentId: Type.String(),
+      after: Type.Optional(Type.Number({ minimum: 0, default: 0 })),
+      limit: Type.Optional(Type.Number({ minimum: 1, maximum: 2000, default: 500 })),
+    }),
+    async execute(_id, params) { return response(await api(`/v1/agents/${encodeURIComponent(params.targetAgentId)}/logs?after=${params.after ?? 0}&limit=${params.limit ?? 500}`)); },
+  });
+
+  pi.registerTool({
     name: "cancel_agent",
     label: "Cancel Symphony agent",
     description: "Cancel an active Symphony agent in its native harness.",
     parameters: Type.Object({ targetAgentId: Type.String() }),
-    async execute(_id, params) {
-      await api(`/v1/agents/${encodeURIComponent(params.targetAgentId)}/cancel`, { method: "POST" });
+    async execute(id, params) {
+      await api(`/v1/agents/${encodeURIComponent(params.targetAgentId)}/cancel`, mutation("cancel-agent", id, {}));
       return response({ cancelled: true, targetAgentId: params.targetAgentId });
     },
   });
@@ -103,7 +128,25 @@ export default function symphonyPiExtension(pi: ExtensionAPI): void {
     label: "Run Symphony workflow",
     description: "Start a registered durable workflow with JSON input. Read-only callers cannot start workflows.",
     parameters: Type.Object({ workflowId: Type.String(), input: Type.Optional(Type.Unknown({ default: {} })) }),
-    async execute(_id, params) { return response(await api(`/v1/workflows/${encodeURIComponent(params.workflowId)}/runs`, { method: "POST", body: JSON.stringify(params.input ?? {}) })); },
+    async execute(id, params) {
+      return response(await api(
+        `/v1/workflows/${encodeURIComponent(params.workflowId)}/runs`,
+        mutation("run-workflow", id, params.input ?? {}),
+      ));
+    },
+  });
+
+  pi.registerTool({
+    name: "cancel_run",
+    label: "Cancel Symphony workflow run",
+    description: "Request cancellation of a durable Symphony workflow run.",
+    parameters: Type.Object({ runId: Type.String() }),
+    async execute(id, params) {
+      return response(await api(
+        `/v1/runs/${encodeURIComponent(params.runId)}/cancel`,
+        mutation("cancel-run", id, {}),
+      ));
+    },
   });
 
   pi.registerTool({
@@ -119,6 +162,11 @@ export default function symphonyPiExtension(pi: ExtensionAPI): void {
     label: "Call Symphony plugin tool",
     description: "Call a trusted local plugin tool. Read-only callers cannot invoke plugin tools.",
     parameters: Type.Object({ name: Type.String(), arguments: Type.Optional(Type.Unknown({ default: {} })) }),
-    async execute(_id, params) { return response(await api(`/v1/plugin-tools/${encodeURIComponent(params.name)}`, { method: "POST", body: JSON.stringify(params.arguments ?? {}) })); },
+    async execute(id, params) {
+      return response(await api(
+        `/v1/plugin-tools/${encodeURIComponent(params.name)}`,
+        mutation("call-plugin-tool", id, params.arguments ?? {}),
+      ));
+    },
   });
 }

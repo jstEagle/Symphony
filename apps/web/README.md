@@ -11,7 +11,7 @@ pnpm install
 pnpm dev
 ```
 
-Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Vite proxies `/v1` and `/health` to the daemon on `127.0.0.1:3210`.
+Open [http://127.0.0.1:3001](http://127.0.0.1:3001). Vite proxies `/v1` and `/health` to the daemon on `127.0.0.1:3000`. The full production app is served directly by the daemon on port `3000`.
 
 ```bash
 pnpm lint

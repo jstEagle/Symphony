@@ -8,7 +8,7 @@ import {
   type FC,
   type PropsWithChildren,
 } from "react";
-import { CaretDown, CircleNotch } from "@phosphor-icons/react";
+import { CaretDown } from "@phosphor-icons/react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { useScrollLock } from "@assistant-ui/react";
 import {
@@ -17,6 +17,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
+import { DotmSquare3 } from "@/components/ui/dotm-square-3";
 
 const ANIMATION_DURATION = 200;
 
@@ -116,9 +117,12 @@ function ToolGroupTrigger({
       {...props}
     >
       {active && (
-        <CircleNotch
-          data-slot="tool-group-trigger-loader"
-          className="aui-tool-group-trigger-loader size-3 shrink-0 animate-spin [animation-duration:0.6s]"
+        <DotmSquare3
+          size={14}
+          dotSize={2.4}
+          color="currentColor"
+          ariaLabel={`${label} active`}
+          animated
         />
       )}
       <span

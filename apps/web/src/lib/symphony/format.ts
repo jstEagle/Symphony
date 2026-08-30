@@ -77,15 +77,17 @@ export function compactAgentState(status: NativeAgentStatus): AgentState {
     case "failed":
       return "failed";
     case "cancel-requested":
+      return "blocked";
     case "cancelled":
       return "cancelled";
     case "interrupted":
     case "lost":
-      return "stale";
+      return "failed";
   }
 }
 
 export function statusLabel(state: AgentState, native?: NativeAgentStatus): string {
+  if (native === "idle") return "idle";
   if (native === "cancel-requested") return "cancel requested";
   if (native === "interrupted") return "interrupted";
   if (native === "lost") return "lost";
@@ -120,6 +122,38 @@ export function harnessTitle(harness: string): string {
 
 export function isLiveAgentState(state: AgentState): boolean {
   return state === "running" || state === "queued" || state === "waiting";
+}
+
+/**
+ * A native session may remain available in `waiting` while no work is running.
+ * Keep that resumable state distinct from visual activity so idle conductors do
+ * not animate forever or make a settled run look live.
+ */
+export function isActivelyWorkingAgent(state: AgentState): boolean {
+  return state === "running" || state === "queued";
+}
+
+/**
+ * Settlement is an authority/lifecycle question, not an animation question.
+ * A native agent in `waiting` has durable work queued and must remain open in
+ * progress and trace projections even though its loader is intentionally still.
+ * `idle` is different: the retained native session is reusable, but its current
+ * turn has no outstanding work and may be bounded as settled.
+ */
+export function isSettledAgent(state: AgentState, nativeStatus?: NativeAgentStatus): boolean {
+  if (nativeStatus === "idle") return true;
+  if (nativeStatus === "waiting"
+    || nativeStatus === "queued"
+    || nativeStatus === "routing"
+    || nativeStatus === "starting"
+    || nativeStatus === "running"
+    || nativeStatus === "cancel-requested") return false;
+  if (nativeStatus === "completed"
+    || nativeStatus === "failed"
+    || nativeStatus === "cancelled"
+    || nativeStatus === "interrupted"
+    || nativeStatus === "lost") return true;
+  return state === "succeeded" || state === "failed" || state === "cancelled" || state === "stale";
 }
 
 export function agentDisplayName(objective: string, depth: number): string {

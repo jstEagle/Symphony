@@ -4,6 +4,7 @@ import { createContext, useContext } from "react";
 import type {
   AgentDetail,
   AgentObservation,
+  AgentSessionLog,
   BootstrapEnvelope,
   ChatAttachment,
   ConnectionState,
@@ -16,6 +17,7 @@ import type {
   ProjectRecord,
   RunSnapshot,
   RuntimeSettings,
+  DriverAuthenticationResult,
 } from "@/lib/symphony/contracts";
 import type { RuntimeMode } from "@/lib/symphony/runtime-client";
 
@@ -50,19 +52,23 @@ export type SymphonyContextValue = {
   renameConversation: (conversationId: string, title: string) => Promise<void>;
   archiveConversation: (conversationId: string) => Promise<void>;
   sendMessage: (threadId: string, input: { messageId: string; content: string; attachments: ChatAttachment[] }) => Promise<void>;
-  saveSettings: (patch: Partial<Pick<RuntimeSettings, "conductor" | "agents">>) => Promise<void>;
+  saveSettings: (patch: Partial<Pick<RuntimeSettings, "conductor" | "agents" | "uiUtilities">>) => Promise<void>;
   updateHarness: (driver: string) => Promise<void>;
+  authenticateHarness: (driver: string) => Promise<DriverAuthenticationResult>;
   cancelRun: () => Promise<void>;
   openAgent: (id: string | null) => void;
   agentDetail: (id: string) => AgentDetail | null;
   observe: (agentId: string, level: ObservationLevel) => Promise<AgentObservation>;
   steer: (agentId: string, content: string) => Promise<void>;
   cancelOne: (agentId: string) => Promise<void>;
+  loadAgentMessages: (agentId: string) => Promise<BootstrapEnvelope["messages"]>;
+  loadAgentLogs: (agentId: string, after?: number) => Promise<AgentSessionLog>;
   markInboxRead: (id: string) => void;
   loadThreadMessages: (threadId: string) => Promise<BootstrapEnvelope["messages"]>;
 };
 
 export const SymphonyContext = createContext<SymphonyContextValue | null>(null);
+export const SymphonyMessagesContext = createContext<BootstrapEnvelope["messages"]>([]);
 
 export function useSymphony(): SymphonyContextValue {
   const value = useContext(SymphonyContext);
@@ -72,4 +78,14 @@ export function useSymphony(): SymphonyContextValue {
 
 export function useOptionalSymphony(): SymphonyContextValue | null {
   return useContext(SymphonyContext);
+}
+
+/**
+ * Streamed chat messages change far more frequently than the rest of the
+ * Symphony projection. Keeping them on a narrow context prevents every
+ * sidebar, dialog, agent tile, and observability view from re-rendering for
+ * each token batch.
+ */
+export function useSymphonyMessages(): BootstrapEnvelope["messages"] {
+  return useContext(SymphonyMessagesContext);
 }

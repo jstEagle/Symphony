@@ -1,7 +1,8 @@
 "use client";
 
+import { useMemo } from "react";
 import type { Agent } from "@/lib/symphony/contracts";
-import { accessLabel, isLiveAgentState, statusLabel } from "@/lib/symphony/format";
+import { accessLabel, isActivelyWorkingAgent, statusLabel } from "@/lib/symphony/format";
 import { AgentLoader } from "@/components/symphony/agent-tool";
 import { loaderForHarness } from "@/lib/symphony/format";
 import { cn } from "@/lib/utils";
@@ -15,7 +16,21 @@ export function AgentTree({
   selectedId?: string | null;
   onSelect?: (agent: Agent) => void;
 }) {
-  const roots = agents.filter((agent) => !agent.parentId || !agents.some((item) => item.id === agent.parentId));
+  const { roots, childrenByParent } = useMemo(() => {
+    const ids = new Set(agents.map((agent) => agent.id));
+    const nextRoots: Agent[] = [];
+    const nextChildren = new Map<string, Agent[]>();
+    for (const agent of agents) {
+      if (!agent.parentId || !ids.has(agent.parentId)) {
+        nextRoots.push(agent);
+        continue;
+      }
+      const children = nextChildren.get(agent.parentId) ?? [];
+      children.push(agent);
+      nextChildren.set(agent.parentId, children);
+    }
+    return { roots: nextRoots, childrenByParent: nextChildren };
+  }, [agents]);
 
   if (agents.length === 0) {
     return <p className="text-xs text-muted-foreground">No agents in this conversation.</p>;
@@ -27,7 +42,7 @@ export function AgentTree({
         <TreeNode
           key={agent.id}
           agent={agent}
-          agents={agents}
+          childrenByParent={childrenByParent}
           selectedId={selectedId}
           onSelect={onSelect}
         />
@@ -38,18 +53,18 @@ export function AgentTree({
 
 function TreeNode({
   agent,
-  agents,
+  childrenByParent,
   selectedId,
   onSelect,
   depth = 0,
 }: {
   agent: Agent;
-  agents: Agent[];
+  childrenByParent: ReadonlyMap<string, Agent[]>;
   selectedId?: string | null;
   onSelect?: (agent: Agent) => void;
   depth?: number;
 }) {
-  const children = agents.filter((item) => item.parentId === agent.id);
+  const children = childrenByParent.get(agent.id) ?? [];
   const selected = selectedId === agent.id;
   return (
     <li>
@@ -62,21 +77,13 @@ function TreeNode({
         )}
         style={{ paddingLeft: 8 + depth * 14 }}
       >
-        {isLiveAgentState(agent.state) ? (
-          <AgentLoader kind={loaderForHarness(agent.harness)} size={14} label={`${agent.name} active`} />
-        ) : (
-          <span
-            className={cn(
-              "size-1.5 shrink-0 rounded-full",
-              agent.state === "succeeded" && "bg-foreground",
-              agent.state === "failed" && "bg-destructive",
-              agent.state === "blocked" && "bg-destructive",
-              agent.state === "cancelled" && "bg-muted-foreground/50",
-              agent.state === "stale" && "bg-muted-foreground",
-              (agent.state === "waiting" || agent.state === "queued") && "bg-muted-foreground/40",
-            )}
-          />
-        )}
+        <AgentLoader
+          kind={loaderForHarness(agent.harness)}
+          size={14}
+          label={`${agent.name} ${agent.state}`}
+          animated={isActivelyWorkingAgent(agent.state)}
+          tone={agent.state === "succeeded" ? "success" : agent.state === "failed" ? "danger" : agent.state === "running" || agent.state === "queued" ? "info" : "warning"}
+        />
         <span className="min-w-0 flex-1 truncate">{agent.objective}</span>
         <span className="shrink-0 text-[11px] text-muted-foreground">
           {statusLabel(agent.state, agent.nativeStatus)}
@@ -91,7 +98,7 @@ function TreeNode({
             <TreeNode
               key={child.id}
               agent={child}
-              agents={agents}
+              childrenByParent={childrenByParent}
               selectedId={selectedId}
               onSelect={onSelect}
               depth={depth + 1}

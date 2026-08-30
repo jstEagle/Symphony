@@ -1,11 +1,12 @@
 "use client";
 
 import { useEffect, useState, type FormEvent } from "react";
-import type { AgentDetail, AgentObservation, ObservationLevel } from "@/lib/symphony/contracts";
+import type { AgentDetail, AgentObservation, ConversationMessage, ObservationLevel } from "@/lib/symphony/contracts";
 import { accessLabel, formatCost, statusLabel } from "@/lib/symphony/format";
 import { AgentLoader } from "@/components/symphony/agent-tool";
+import { AgentConversation } from "@/components/symphony/agent-conversation";
 import { loaderForHarness } from "@/lib/symphony/format";
-import { isLiveAgentState } from "@/lib/symphony/format";
+import { isActivelyWorkingAgent, isLiveAgentState } from "@/lib/symphony/format";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import {
@@ -27,6 +28,7 @@ export function AgentSheet({
   onSteer,
   onCancel,
   onOpenChild,
+  loadMessages,
 }: {
   detail: AgentDetail | null;
   open: boolean;
@@ -35,7 +37,9 @@ export function AgentSheet({
   onSteer: (id: string, content: string) => Promise<void>;
   onCancel: (id: string) => Promise<void>;
   onOpenChild: (id: string) => void;
+  loadMessages: (id: string) => Promise<ConversationMessage[]>;
 }) {
+  const [tab, setTab] = useState<"chat" | "details">("chat");
   const [level, setLevel] = useState<ObservationLevel>("tldr");
   const [observation, setObservation] = useState<AgentObservation | null>(null);
   const [steer, setSteer] = useState("");
@@ -47,6 +51,7 @@ export function AgentSheet({
     setSteer("");
     setLevel("tldr");
     setError(null);
+    setTab("chat");
   }, [detail?.id]);
 
   if (!detail) return null;
@@ -99,14 +104,49 @@ export function AgentSheet({
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="right" className="w-full gap-0 sm:max-w-md">
+      <SheetContent side="right" className="w-full gap-0 sm:max-w-xl lg:max-w-2xl">
         <SheetHeader className="border-b border-foreground/8">
-          <SheetTitle className="font-display text-pretty">{detail.name}</SheetTitle>
-          <SheetDescription>{detail.objective}</SheetDescription>
+          <div className="flex items-center gap-2 pr-10">
+            {isActivelyWorkingAgent(detail.state) ? (
+              <AgentLoader kind={loaderForHarness(detail.harness)} size={16} label={`${detail.harness} active`} />
+            ) : null}
+            <SheetTitle className="font-display truncate">{detail.name}</SheetTitle>
+            <span className="ml-auto shrink-0 text-[11px] text-muted-foreground">
+              {statusLabel(detail.state, detail.nativeStatus)}
+            </span>
+          </div>
+          <SheetDescription className="line-clamp-2 pr-8">{detail.objective}</SheetDescription>
+          <div className="mt-3 flex items-center gap-1" role="tablist" aria-label="Agent view">
+            {(["chat", "details"] as const).map((item) => (
+              <button
+                key={item}
+                type="button"
+                role="tab"
+                aria-selected={tab === item}
+                onClick={() => setTab(item)}
+                className={cn(
+                  "cursor-pointer rounded-md px-2.5 py-1 text-xs capitalize transition-colors",
+                  tab === item
+                    ? "bg-muted text-foreground"
+                    : "text-muted-foreground hover:bg-muted/55 hover:text-foreground",
+                )}
+              >
+                {item}
+              </button>
+            ))}
+          </div>
         </SheetHeader>
+        {tab === "chat" ? (
+          <AgentConversation
+            detail={detail}
+            loadMessages={loadMessages}
+            onSteer={onSteer}
+            onCancel={onCancel}
+          />
+        ) : (
         <div className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
           <div className="flex items-center gap-2 text-xs">
-            {isLiveAgentState(detail.state) ? (
+            {isActivelyWorkingAgent(detail.state) ? (
               <AgentLoader kind={loaderForHarness(detail.harness)} size={16} label={`${detail.harness} active`} />
             ) : null}
             <span>{statusLabel(detail.state, detail.nativeStatus)}</span>
@@ -140,7 +180,7 @@ export function AgentSheet({
                     type="button"
                     onClick={() => void loadObservation(item)}
                     className={cn(
-                      "rounded-full px-2 py-0.5 text-[10px]",
+                      "cursor-pointer rounded-full px-2 py-0.5 text-[10px]",
                       level === item ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground",
                     )}
                   >
@@ -169,7 +209,7 @@ export function AgentSheet({
               {detail.parent && (
                 <button
                   type="button"
-                  className="mb-1 block text-xs text-muted-foreground hover:text-foreground"
+                  className="mb-1 block cursor-pointer text-xs text-muted-foreground hover:text-foreground"
                   onClick={() => onOpenChild(detail.parent!.id)}
                 >
                   Parent · {detail.parent.name}
@@ -179,7 +219,7 @@ export function AgentSheet({
                 <button
                   key={child.id}
                   type="button"
-                  className="block text-xs text-muted-foreground hover:text-foreground"
+                  className="block cursor-pointer text-xs text-muted-foreground hover:text-foreground"
                   onClick={() => onOpenChild(child.id)}
                 >
                   Child · {child.name}
@@ -223,6 +263,7 @@ export function AgentSheet({
             </div>
           </form>
         </div>
+        )}
       </SheetContent>
     </Sheet>
   );

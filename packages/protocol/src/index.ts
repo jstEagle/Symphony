@@ -190,11 +190,134 @@ export const DriverSessionSchema = z.object({
   driver: HarnessSchema.exclude(["auto"]),
   nativeSessionId: z.string().min(1),
   nativeRunId: z.string().nullable().default(null),
-  state: z.enum(["starting", "running", "idle", "completed", "failed", "cancelled"]),
+  state: z.enum(["starting", "running", "idle", "completed", "failed", "cancelled", "unknown"]),
   startedAt: z.string(),
   metadata: z.record(z.string(), JsonValueSchema).default({}),
 });
 export type DriverSession = z.infer<typeof DriverSessionSchema>;
+
+export const ProcessIdentitySchema = z.object({
+  pid: z.number().int().positive(),
+  processGroupId: z.number().int().positive().nullable(),
+  platform: z.string().min(1),
+  capturedAt: IsoDateSchema,
+  executable: z.string().min(1).nullable(),
+  startToken: z.string().min(1).nullable(),
+  verification: z.enum(["strong", "weak", "unverified"]),
+});
+export type ProcessIdentity = z.infer<typeof ProcessIdentitySchema>;
+
+export const WorkerTransportSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("direct") }),
+  z.object({
+    kind: z.literal("worker-host"),
+    protocolVersion: z.literal(1),
+    endpoint: z.string().min(1),
+    spoolPath: z.string().min(1),
+    hostInstanceId: z.string().min(1),
+    hostIdentity: ProcessIdentitySchema.nullable(),
+    workerIdentity: ProcessIdentitySchema.nullable(),
+    controllerOwnerId: z.string().min(1),
+    ownerEpoch: z.number().int().nonnegative(),
+    processedOutputSeq: z.number().int().nonnegative(),
+    ackedOutputSeq: z.number().int().nonnegative(),
+    producedOutputSeq: z.number().int().nonnegative(),
+    spoolBytes: z.number().int().nonnegative(),
+    spoolState: z.enum(["healthy", "overflow"]),
+  }),
+]);
+export type WorkerTransport = z.infer<typeof WorkerTransportSchema>;
+
+export const DriverProcessSpecSchema = z.object({
+  role: z.string().min(1),
+  command: z.string().min(1),
+  args: z.array(z.string()),
+  cwd: z.string().min(1).nullable(),
+  adapterVersion: z.string().min(1).nullable(),
+});
+export type DriverProcessSpec = z.infer<typeof DriverProcessSpecSchema>;
+
+export const WorkerProcessLeaseStateSchema = z.enum([
+  "reserved",
+  "running",
+  "exited",
+  "orphaned",
+  "identity-mismatch",
+  "unverified",
+]);
+export type WorkerProcessLeaseState = z.infer<typeof WorkerProcessLeaseStateSchema>;
+
+export const WorkerProcessLeaseSchema = z.object({
+  id: IdSchema,
+  daemonOwnerId: IdSchema,
+  agentId: IdSchema,
+  attemptId: IdSchema,
+  driver: HarnessSchema.exclude(["auto"]),
+  role: z.string().min(1),
+  command: z.string().min(1),
+  args: z.array(z.string()),
+  cwd: z.string().min(1).nullable(),
+  workspacePath: z.string().min(1),
+  permission: PermissionSchema,
+  adapterVersion: z.string().min(1).nullable(),
+  transport: WorkerTransportSchema.default({ kind: "direct" }),
+  adapterState: JsonValueSchema.default({}),
+  identity: ProcessIdentitySchema.nullable(),
+  nativeSessionId: z.string().min(1).nullable(),
+  nativeRunId: z.string().min(1).nullable(),
+  activeTurnId: z.string().min(1).nullable(),
+  lastEventCursor: z.number().int().nonnegative().nullable(),
+  state: WorkerProcessLeaseStateSchema,
+  reservedAt: IsoDateSchema,
+  attachedAt: IsoDateSchema.nullable(),
+  updatedAt: IsoDateSchema,
+  releasedAt: IsoDateSchema.nullable(),
+  exitCode: z.number().int().nullable(),
+  signal: z.string().min(1).nullable(),
+  error: z.string().min(1).nullable(),
+  revision: z.number().int().nonnegative(),
+});
+export type WorkerProcessLease = z.infer<typeof WorkerProcessLeaseSchema>;
+
+export type DriverProcessLeaseUpdate = Partial<
+  Pick<
+    WorkerProcessLease,
+    "nativeSessionId" | "nativeRunId" | "activeTurnId" | "lastEventCursor" | "error" | "transport" | "adapterState"
+  >
+>;
+
+export type DriverWorkerHostPlan = {
+  mode: "launch" | "reconnect";
+  protocolVersion: 1;
+  hostCommand: string;
+  hostArgs: string[];
+  capability: string;
+  controllerOwnerId: string;
+  ownerEpoch: number;
+  endpoint: string;
+  spoolPath: string;
+  afterSeq: number;
+  maxSpoolBytes: number;
+  maxSpoolFrames: number;
+};
+
+export interface DriverProcessSupervisor {
+  /** A durable process from an earlier daemon generation must be reattached before probing shared infrastructure. */
+  readonly retainedProcess?: boolean;
+  reserveProcess(spec: DriverProcessSpec): WorkerProcessLease;
+  attachProcess(leaseId: string, identity: ProcessIdentity): WorkerProcessLease;
+  adoptProcess?(
+    leaseId: string,
+    expectedRevision: number,
+    transport: WorkerProcessLease["transport"],
+  ): WorkerProcessLease;
+  updateProcess(leaseId: string, patch: DriverProcessLeaseUpdate): WorkerProcessLease;
+  releaseProcess(
+    leaseId: string,
+    result: { exitCode: number | null; signal: string | null; error?: string | null },
+  ): WorkerProcessLease;
+  workerHostPlan?(leaseId: string): DriverWorkerHostPlan | null;
+}
 
 export const DriverEventKindSchema = z.enum([
   "session.started",
@@ -241,19 +364,56 @@ export const DriverStartRequestSchema = z.object({
 });
 export type DriverStartRequest = z.infer<typeof DriverStartRequestSchema>;
 
+export type DriverLifecycleOptions = {
+  /**
+   * Aborted when Symphony no longer accepts a lifecycle result. Drivers must
+   * stop provisional local resources and must not retain a late session.
+   */
+  signal: AbortSignal;
+  /** Persist directly-owned adapter processes before they can outlive setup. */
+  processSupervisor?: DriverProcessSupervisor;
+};
+
+export const DriverAuthenticationResultSchema = z.object({
+  authenticated: z.boolean(),
+  detail: z.string(),
+  loginUrl: z.string().url().optional(),
+});
+export type DriverAuthenticationResult = z.infer<typeof DriverAuthenticationResultSchema>;
+
 export interface WorkerDriver {
   readonly id: ResolvedHarness;
   readonly capabilities: DriverCapability;
   doctor(): Promise<DriverDoctorResult>;
   listModels(): Promise<ModelDescriptor[]>;
-  start(request: DriverStartRequest, onEvent: (event: DriverEvent) => void): Promise<DriverSession>;
+  /** Start the harness's documented interactive authentication flow. */
+  authenticate?(): Promise<DriverAuthenticationResult>;
+  start(
+    request: DriverStartRequest,
+    onEvent: (event: DriverEvent) => void,
+    options?: DriverLifecycleOptions,
+  ): Promise<DriverSession>;
   resume(
     session: DriverSession,
     request: DriverStartRequest,
     onEvent: (event: DriverEvent) => void,
+    options?: DriverLifecycleOptions,
   ): Promise<DriverSession>;
-  sendMessage(session: DriverSession, message: string): Promise<{ receiptId: string; queued: boolean }>;
+  sendMessage(session: DriverSession, message: string): Promise<{
+    receiptId: string;
+    queued: boolean;
+    /** The preceding native result won the boundary; persist this as a new turn. */
+    terminalBoundary?: boolean;
+    /**
+     * A follow-up can allocate a new native run. The runtime must durably
+     * replace its session/run checkpoint before it records delivery.
+     */
+    session?: DriverSession;
+  }>;
   cancel(session: DriverSession): Promise<void>;
+  /** Release this daemon's transport ownership without terminating durable native work. */
+  detach?(session: DriverSession): Promise<void>;
+  forceTerminate?(session: DriverSession): Promise<void>;
   dispose?(): Promise<void>;
 }
 
@@ -363,8 +523,13 @@ export const CommandSchema = z.object({
     "agent.message",
     "agent.observe",
     "agent.cancel",
+    "agent.present",
+    "workflow.register",
     "workflow.run",
     "workflow.cancel",
+    "plugin.invoke",
+    "driver.update",
+    "driver.authenticate",
   ]),
   payload: JsonValueSchema,
   actor: z.object({ type: z.enum(["user", "agent", "system"]), id: z.string().nullable() }),
@@ -374,8 +539,10 @@ export type Command = z.infer<typeof CommandSchema>;
 export const CommandReceiptSchema = z.object({
   idempotencyKey: z.string(),
   accepted: z.boolean(),
+  state: z.enum(["dispatching", "settled", "failed"]).default("settled"),
   result: JsonValueSchema,
   createdAt: z.string(),
+  updatedAt: z.string().optional(),
 });
 export type CommandReceipt = z.infer<typeof CommandReceiptSchema>;
 
