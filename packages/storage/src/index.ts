@@ -23,6 +23,7 @@ import {
   applyObjectiveControlMutation,
   applyObjectiveControlMutationToSnapshot,
   objectiveControlStableJson,
+  walkObjectiveControlNodes,
   validateObjectiveControlMutationTarget,
   previewObjectiveControlMutation,
   ObjectivePolicySnapshotSchema,
@@ -1505,17 +1506,12 @@ function assertObjectiveControlSnapshotReferences(
   revision: ObjectiveControlPlanRevision,
   snapshot: ObjectiveControlPlanSnapshot,
 ): void {
-  const nodeIds = new Set<string>();
-  const visit = (node: ObjectiveControlPlanRevision["plan"]["root"]): void => {
-    nodeIds.add(node.id);
-    if (node.type === "sequence" || node.type === "parallel" || node.type === "while") {
-      node.steps.forEach(visit);
-    } else if (node.type === "if") {
-      node.then.forEach(visit);
-      node.else?.forEach(visit);
-    }
-  };
-  visit(revision.plan.root);
+  // Dynamic fan-out children use ids from the item template. They are not
+  // static executions, but they are still valid durable snapshot keys once
+  // the fan-out receipt has materialized them.
+  const nodeIds = new Set(
+    walkObjectiveControlNodes(revision.plan.root, { includeFanoutTemplates: true }).map((visit) => visit.node.id),
+  );
 
   const executionIds = new Set<string>();
   for (const execution of snapshot.executions) {

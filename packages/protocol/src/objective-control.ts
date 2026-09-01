@@ -854,6 +854,78 @@ function objectiveControlNodeMap(plan: ObjectiveControlPlan): Map<string, Object
   return nodes;
 }
 
+/**
+ * Resolve the blueprint node for one concrete execution. Fan-out children are
+ * intentionally absent from the plan's top-level node map because their
+ * execution ids are materialized at runtime. Their durable scope points back
+ * to the fan-out execution and carries the template node id, which lets the
+ * snapshot validator type-check them without pretending they are static plan
+ * nodes.
+ */
+function objectiveControlExecutionNode(
+  nodes: Map<string, ObjectiveControlNode>,
+  executions: Map<string, ObjectiveControlExecutionRecord>,
+  execution: ObjectiveControlExecutionRecord,
+): ObjectiveControlNode | undefined {
+  const direct = nodes.get(execution.key.nodeId);
+  if (direct) return direct;
+  const scope = execution.fanoutScope;
+  if (!scope) return undefined;
+
+  const parentExecution = executions.get(objectiveControlExecutionId(scope.fanoutExecution));
+  if (!parentExecution) {
+    throw new Error(
+      `Objective control snapshot execution ${objectiveControlExecutionId(execution.key)} references orphan fan-out execution ${objectiveControlExecutionId(scope.fanoutExecution)}`,
+    );
+  }
+  if (
+    parentExecution.key.nodeId !== scope.fanoutExecution.nodeId
+    || parentExecution.key.iterationKey !== scope.fanoutExecution.iterationKey
+  ) {
+    throw new Error(`Objective control fan-out scope for ${objectiveControlExecutionId(execution.key)} does not match its parent execution`);
+  }
+  const fanoutNode = nodes.get(parentExecution.key.nodeId);
+  if (!fanoutNode || fanoutNode.type !== "fanout") {
+    throw new Error(`Objective control fan-out scope ${objectiveControlExecutionId(execution.key)} does not point to a fan-out node`);
+  }
+  if (scope.templateNodeId !== execution.key.nodeId) {
+    throw new Error(`Objective control fan-out scope template ${scope.templateNodeId} does not match execution node ${execution.key.nodeId}`);
+  }
+
+  const findTemplate = (node: ObjectiveControlNode): ObjectiveControlNode | undefined => {
+    if (node.id === scope.templateNodeId) return node;
+    if (node.type === "sequence" || node.type === "parallel" || node.type === "while") {
+      for (const child of node.steps) {
+        const found = findTemplate(child);
+        if (found) return found;
+      }
+    } else if (node.type === "if") {
+      for (const child of [...node.then, ...(node.else ?? [])]) {
+        const found = findTemplate(child);
+        if (found) return found;
+      }
+    } else if (node.type === "fanout") {
+      return findTemplate(node.itemTemplate);
+    }
+    return undefined;
+  };
+  return findTemplate(fanoutNode.itemTemplate);
+}
+
+function requireObjectiveControlExecutionNode(
+  nodes: Map<string, ObjectiveControlNode>,
+  executions: Map<string, ObjectiveControlExecutionRecord>,
+  execution: ObjectiveControlExecutionRecord,
+): ObjectiveControlNode {
+  const node = objectiveControlExecutionNode(nodes, executions, execution);
+  if (!node) {
+    throw new Error(
+      `Objective control snapshot execution ${objectiveControlExecutionId(execution.key)} references unknown plan node ${execution.key.nodeId}`,
+    );
+  }
+  return node;
+}
+
 function requireObjectiveControlSnapshotExecution(
   mapName: string,
   executionId: string,
@@ -918,10 +990,11 @@ export function validateObjectiveControlSnapshotAgainstPlan(
     if (executions.has(executionId)) {
       throw new Error(`Objective control snapshot contains duplicate execution id ${executionId}`);
     }
-    if (!nodes.has(execution.key.nodeId)) {
-      throw new Error(`Objective control snapshot execution ${executionId} references unknown plan node ${execution.key.nodeId}`);
-    }
     executions.set(executionId, execution);
+  }
+  for (const execution of parsedSnapshot.executions) {
+    const executionId = objectiveControlExecutionId(execution.key);
+    const node = requireObjectiveControlExecutionNode(nodes, executions, execution);
     if (execution.suspension) {
       const suspension = execution.suspension;
       if (
@@ -937,7 +1010,6 @@ export function validateObjectiveControlSnapshotAgainstPlan(
       ) {
         throw new Error(`Objective control suspension identity/state disagrees with execution ${executionId}`);
       }
-      const node = nodes.get(execution.key.nodeId);
       if (node?.type !== suspension.kind) {
         throw new Error(`Objective control suspension ${executionId} does not match plan node type`);
       }
@@ -964,7 +1036,7 @@ export function validateObjectiveControlSnapshotAgainstPlan(
 
   for (const [executionId] of Object.entries(parsedSnapshot.branches)) {
     const execution = requireObjectiveControlSnapshotExecution("branches", executionId, executions);
-    const node = nodes.get(execution.key.nodeId)!;
+    const node = requireObjectiveControlExecutionNode(nodes, executions, execution);
     if (node.type !== "if") {
       throw new Error(`Objective control snapshot branches key ${executionId} does not refer to an if execution`);
     }
@@ -972,7 +1044,7 @@ export function validateObjectiveControlSnapshotAgainstPlan(
 
   for (const [executionId, iterations] of Object.entries(parsedSnapshot.loopIterations)) {
     const execution = requireObjectiveControlSnapshotExecution("loopIterations", executionId, executions);
-    const node = nodes.get(execution.key.nodeId)!;
+    const node = requireObjectiveControlExecutionNode(nodes, executions, execution);
     if (node.type !== "while") {
       throw new Error(`Objective control snapshot loopIterations key ${executionId} does not refer to a while execution`);
     }
@@ -983,7 +1055,7 @@ export function validateObjectiveControlSnapshotAgainstPlan(
 
   for (const [executionId, attemptId] of Object.entries(parsedSnapshot.attemptIds)) {
     const execution = requireObjectiveControlSnapshotExecution("attemptIds", executionId, executions);
-    const node = nodes.get(execution.key.nodeId)!;
+    const node = requireObjectiveControlExecutionNode(nodes, executions, execution);
     // Reducer snapshots retain nullable attempt entries for every execution,
     // but a concrete attempt id belongs only to an agent leaf.
     if (attemptId !== null && node.type !== "agent") {
@@ -993,7 +1065,7 @@ export function validateObjectiveControlSnapshotAgainstPlan(
 
   for (const [executionId, reason] of Object.entries(parsedSnapshot.exitReasons)) {
     const execution = requireObjectiveControlSnapshotExecution("exitReasons", executionId, executions);
-    const node = nodes.get(execution.key.nodeId)!;
+    const node = requireObjectiveControlExecutionNode(nodes, executions, execution);
     if (!isObjectiveControlTerminalState(execution.state)) {
       throw new Error(`Objective control snapshot exitReasons key ${executionId} refers to nonterminal execution`);
     }

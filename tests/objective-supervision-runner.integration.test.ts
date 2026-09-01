@@ -11,6 +11,7 @@ import {
   type ObjectiveRunRecord,
 } from "../packages/protocol/src/index.js";
 import { ObjectiveRuntime } from "../packages/workflow/src/objective-runtime.js";
+import { compileObjectiveControlPlan } from "../packages/workflow/src/objective-control-plan.js";
 import { ObjectiveStoreRepository } from "../packages/workflow/src/objective-store-repository.js";
 import { ObjectiveSupervisionRunner } from "../packages/workflow/src/objective-supervision-runner.js";
 import { createStore, type SymphonyStore } from "../packages/storage/src/index.js";
@@ -179,6 +180,66 @@ afterEach(() => {
 });
 
 describe("ObjectiveSupervisionRunner durable integration contract", () => {
+  it("dispatches materialized fan-out agents through the durable runner and resumes after a runner restart", async () => {
+    const fixture = makeFixture();
+    const controlPlan = compileObjectiveControlPlan({
+      id: "integration-workflow",
+      name: "Fan-out integration workflow",
+      mission: { statement: "Process every durable item.", keyResults: [] },
+      workspace: { path: "/tmp/symphony-objective-runner" },
+      inputSchema: { type: "object" },
+      output: "steps",
+      steps: [{
+        id: "map-items",
+        type: "fanout",
+        source: "items",
+        concurrency: 1,
+        aggregation: { mode: "array" },
+        itemTemplate: {
+          id: "item-worker",
+          type: "agent",
+          objective: "Process {{ item.id }} as {{ itemKey }}.",
+          model: "fixture",
+          harness: "auto",
+          outputSchema: {},
+          workspace: { path: "/tmp/symphony-objective-runner", dirtyPolicy: "local-only" },
+        },
+      }],
+      triggers: [{ id: "manual", type: "manual" }],
+    }, { workflowRevision: 1, workflowHash: "integration-workflow-hash" });
+    const run = createObjective(fixture.runtime, fixture.store, {
+      controlPlan,
+      context: { items: [{ id: "a" }, { id: "b" }] },
+    });
+    const first = new ObjectiveSupervisionRunner(fixture.runtime, fixture.repository, fixture.agents as never, fixture.store, { authority });
+    expect((await first.step(run.runId)).intent.kind).toBe("sequence");
+    const materialized = await first.step(run.runId);
+    expect(materialized.intent.kind).toBe("fanout");
+    expect(materialized.action).toBe("dispatched");
+    expect(fixture.runtime.controlState(run.runId)?.snapshot.executions.filter((entry) => entry.fanoutScope)).toHaveLength(2);
+    const dispatched = await first.step(run.runId);
+    expect(dispatched.action).toBe("dispatched");
+    expect(dispatched.intent.kind).toBe("agent");
+    expect(fixture.nativeLaunches).toHaveLength(1);
+    expect(fixture.orders[0]?.objective).toBe("Process a as a.");
+
+    // A fresh runner must observe the durable assignment and never create a
+    // second native agent for the same materialized item.
+    const restarted = new ObjectiveSupervisionRunner(fixture.runtime, fixture.repository, fixture.agents as never, fixture.store, { authority });
+    const waiting = await restarted.step(run.runId);
+    expect(waiting.action).toBe("waiting");
+    expect(fixture.nativeLaunches).toHaveLength(1);
+
+    const order = fixture.orders[0];
+    if (!order) throw new Error("fan-out dispatch order was not recorded");
+    const agent = agentFor(fixture, order);
+    fixture.store.saveAgent({ ...agent, status: "completed", output: { id: "a" }, finishedAt: "2026-09-01T00:00:02.000Z", updatedAt: "2026-09-01T00:00:02.000Z" });
+    fixture.store.appendEvent({ type: "agent.completed", workflowId: run.workflowId, runId: run.runId, agentId: agent.id, occurredAt: "2026-09-01T00:00:02.000Z", payload: { output: { id: "a" } }, provenance: { source: "daemon" } });
+    await restarted.step(run.runId);
+    expect(fixture.runtime.controlState(run.runId)?.snapshot.frontier).toHaveLength(1);
+    expect(fixture.runtime.controlState(run.runId)?.snapshot.executions.filter((entry) => entry.fanoutScope)).toHaveLength(2);
+  });
+
   it("recovers a dispatched frontier without launching duplicate native work", async () => {
     const fixture = makeFixture();
     const run = createObjective(fixture.runtime, fixture.store, { tasks: [objectiveTask("build")] });
