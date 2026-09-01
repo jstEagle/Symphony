@@ -119,6 +119,11 @@ function StrategyNodeView({ node, depth, frontierIds, onOpenAgent }: { node: Obj
   if (node.kind === "if") return <IfNode node={node} depth={depth} frontier={isFrontier(node, frontierIds)} frontierIds={frontierIds} onOpenAgent={onOpenAgent} />;
   if (node.kind === "set") return <SetNode node={node} depth={depth} frontier={isFrontier(node, frontierIds)} />;
   if (node.kind === "evaluate") return <EvaluateNode node={node} depth={depth} frontier={isFrontier(node, frontierIds)} />;
+  if (node.kind === "fanout") {
+    const className = cn("rounded-lg", depth > 0 && "ml-3 border-l border-border/40 pl-3");
+    const concurrency = node.concurrency === null ? "unlimited" : `${node.concurrency} concurrent`;
+    return <div className={className} data-control-kind="fanout"><NodeHeader icon={<Shuffle />} label={node.label} kind="fanout" state={node.state} frontier={isFrontier(node, frontierIds)} detail={`map ${node.source} · ${node.aggregation} results · ${concurrency} · template ${node.templateLabel}`} /></div>;
+  }
 
   const children = node.kind === "while" ? node.body : node.children;
   const icon = node.kind === "while" ? <Repeat /> : node.kind === "parallel" ? <Shuffle /> : <ListBullets />;
@@ -232,7 +237,7 @@ function NodeHeader({ icon, label, kind, state, frontier, detail, error }: { ico
         {detail ? <span className="mt-0.5 block truncate font-mono text-[9px] text-muted-foreground/75" title={detail}>{detail}</span> : null}
         {error ? <span className="mt-1 flex min-w-0 items-center gap-1 text-[9px] text-destructive" title={error}><XCircle className="size-3 shrink-0" aria-hidden="true" /><span className="truncate">{error}</span></span> : null}
       </span>
-      {kind !== "agent" && kind !== "set" ? <CaretDown className="mt-1 size-3 shrink-0 text-muted-foreground/45 transition-transform group-open/strategy:rotate-0" aria-hidden="true" /> : null}
+      {kind !== "agent" && kind !== "set" && kind !== "fanout" ? <CaretDown className="mt-1 size-3 shrink-0 text-muted-foreground/45 transition-transform group-open/strategy:rotate-0" aria-hidden="true" /> : null}
       {kind === "agent" && frontier ? <ArrowSquareOut className="mt-1 size-3 shrink-0 text-info/65" aria-hidden="true" /> : null}
     </div>
   );

@@ -78,6 +78,14 @@ export type ObjectiveStrategyParallelNode = ObjectiveStrategyNodeBase & {
   children: ObjectiveStrategyNode[];
 };
 
+export type ObjectiveStrategyFanoutNode = ObjectiveStrategyNodeBase & {
+  kind: "fanout";
+  source: string;
+  concurrency: number | null;
+  aggregation: string;
+  templateLabel: string;
+};
+
 export type ObjectiveStrategyIfNode = ObjectiveStrategyNodeBase & {
   kind: "if";
   condition: string | null;
@@ -119,6 +127,7 @@ export type ObjectiveStrategyNode =
   | ObjectiveStrategyEvaluateNode
   | ObjectiveStrategySequenceNode
   | ObjectiveStrategyParallelNode
+  | ObjectiveStrategyFanoutNode
   | ObjectiveStrategyIfNode
   | ObjectiveStrategyWhileNode
   | ObjectiveStrategyTimerNode
@@ -255,6 +264,16 @@ function projectControlRoots(control: ObjectiveControlProjection): ObjectiveStra
         actual: output?.actual ?? null,
         pass: output?.pass ?? null,
         iterationContext: execution.iterationKey,
+      };
+    }
+    if (node.type === "fanout") {
+      return {
+        ...base,
+        kind: "fanout",
+        source: node.source,
+        concurrency: node.concurrency,
+        aggregation: node.aggregation?.mode ?? "array",
+        templateLabel: node.itemTemplate.label ?? node.itemTemplate.id,
       };
     }
     if (node.type === "timer") {
