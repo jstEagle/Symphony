@@ -2341,4 +2341,51 @@ describe("agent graph and workflow execution", () => {
     expect(coordinator.get("durable-agent")).toMatchObject({ status: "idle", error: null, finishedAt: null });
     store.close();
   });
+
+  it("executes authored dependency frontiers inside parallel containers", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-workflow-dependency-frontier-"));
+    temporary.push(root);
+    writeDefaultConfig(root);
+    const loaded = loadConfig({ rootDirectory: root });
+    loaded.config.router.provider = "neutral-lexical";
+    loaded.config.observer.provider = "deterministic";
+    const store = createStore(loaded.dataDirectory);
+    const drivers = new DriverRegistry();
+    drivers.register(new FakeDriver());
+    const secrets = new SecretStore("dev.symphony.tests");
+    const coordinator = new AgentCoordinator(
+      loaded,
+      store,
+      drivers,
+      new ModelRouter(loaded, secrets, drivers, store),
+      new PassiveObserver(loaded, secrets, store),
+    );
+    const engine = new WorkflowEngine(loaded, store, coordinator);
+    const ir = new WorkflowCompiler().compile({
+      id: "dependency-frontier",
+      name: "Dependency frontier",
+      mission: { statement: "Honor explicit prerequisites while retaining parallelism.", keyResults: [] },
+      workspace: { path: root, dirtyPolicy: "local-only" },
+      steps: [{
+        id: "fanout",
+        type: "parallel",
+        steps: [
+          { id: "prepare", type: "set", value: { ready: true } },
+          { id: "independent", type: "set", value: { ready: true } },
+          { id: "consume", type: "set", dependsOn: ["prepare"], value: { consumed: true } },
+        ],
+      }],
+    }, 1);
+    engine.register(ir);
+
+    const result = await engine.run(ir.definition.id, {}, { runId: "dependency-frontier-run", origin: userRunOrigin });
+
+    expect(result.status).toBe("completed");
+    const started = store.recentEvents({ runId: result.id, types: ["workflow.step.started"], limit: 20 }).map((event) => String((event.payload as Record<string, unknown>).stepId));
+    expect(started.indexOf("prepare")).toBeGreaterThanOrEqual(0);
+    expect(started.indexOf("independent")).toBeGreaterThanOrEqual(0);
+    expect(started.indexOf("consume")).toBeGreaterThan(started.indexOf("prepare"));
+    expect(started.indexOf("consume")).toBeGreaterThan(started.indexOf("independent"));
+    store.close();
+  });
 });

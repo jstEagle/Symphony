@@ -77,6 +77,18 @@ export const WorkflowMissionSchema = z.object({
 export type WorkflowMission = z.infer<typeof WorkflowMissionSchema>;
 
 /**
+ * Explicit prerequisite references used by authored workflow steps.
+ *
+ * Keep this contract in the protocol package so the daemon, workflow compiler,
+ * and clients agree on the graph vocabulary. References resolve against the
+ * workflow's globally unique step IDs; execution still preserves the
+ * container's sequence/parallel semantics.
+ */
+export const WorkflowStepDependencyIdSchema = z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/u);
+export const WorkflowStepDependenciesSchema = z.array(WorkflowStepDependencyIdSchema).max(256).default([]);
+export type WorkflowStepDependencies = z.infer<typeof WorkflowStepDependenciesSchema>;
+
+/**
  * A caller's request to append future steps to one running workflow plan.
  *
  * The authenticated author is deliberately not part of this input contract;

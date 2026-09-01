@@ -16,6 +16,7 @@ const definition = {
         {
           id: "quality-gate",
           type: "if",
+          dependsOn: ["set-context"],
           condition: { path: "steps.tests.score", op: "gte", value: 8 },
           then: [{ id: "publish", type: "agent", objective: "Publish the release", outputSchema: { type: "object" } }],
           else: [{ id: "repair", type: "agent", objective: "Repair the release", outputSchema: { type: "object" } }],
@@ -90,5 +91,36 @@ describe("workflow studio view model", () => {
     const model = buildWorkflowVisualModel(evaluationRecord);
     expect(model.steps[0]).toMatchObject({ type: "evaluate", detail: "Release quality · release.score gte 8" });
     expect(model.steps[0]?.detail).not.toContain("%");
+  });
+
+  it("validates dependency references and exposes prerequisite edges in the structure", () => {
+    const dependentDefinition = {
+      ...definition,
+      steps: [
+        { id: "prepare", type: "set", value: { ready: true } },
+        { id: "consume", type: "agent", dependsOn: ["prepare"], objective: "Consume the prepared context", outputSchema: { type: "object" } },
+      ],
+    };
+    const result = validateWorkflowJson(JSON.stringify(dependentDefinition));
+    expect(result.valid).toBe(true);
+    const dependentRecord = { ...record, definition: dependentDefinition as unknown as JsonValue };
+    expect(buildWorkflowVisualModel(dependentRecord).steps[1]).toMatchObject({ id: "consume", dependsOn: ["prepare"] });
+
+    const unknown = validateWorkflowJson(JSON.stringify({
+      ...dependentDefinition,
+      steps: [{ ...dependentDefinition.steps[1], dependsOn: ["missing"] }],
+    }));
+    expect(unknown.valid).toBe(false);
+    expect(unknown.errors.some((error) => error.includes("references unknown step missing"))).toBe(true);
+
+    const cycle = validateWorkflowJson(JSON.stringify({
+      ...dependentDefinition,
+      steps: [
+        { id: "prepare", type: "set", dependsOn: ["consume"], value: { ready: true } },
+        { ...dependentDefinition.steps[1], dependsOn: ["prepare"] },
+      ],
+    }));
+    expect(cycle.valid).toBe(false);
+    expect(cycle.errors.some((error) => error.includes("dependency cycle"))).toBe(true);
   });
 });

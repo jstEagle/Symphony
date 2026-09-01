@@ -306,6 +306,18 @@ describe("objective control plan compiler and reducer", () => {
     expect(nextObjectiveControlIntent(plan, snapshot)).toMatchObject({ nodeId: "consume", operation: "dispatch" });
   });
 
+  it("carries authored workflow dependencies into the daemon control plan", () => {
+    const workflow = new WorkflowCompiler().compile(definition([{
+      id: "fanout",
+      type: "parallel",
+      steps: [agent("prepare"), { ...agent("consume"), dependsOn: ["prepare"] }],
+    }]), 4);
+    const plan = compileObjectiveControlPlan(workflow);
+    const fanout = plan.root.steps[0];
+    if (fanout?.type !== "parallel") throw new Error("fixture did not compile a parallel node");
+    expect(fanout.steps[1]).toMatchObject({ id: "consume", dependsOn: ["prepare"] });
+  });
+
   it("enforces the concurrent-agent limit and persists output context refs", () => {
     const { plan } = fixture([{
       id: "fanout",

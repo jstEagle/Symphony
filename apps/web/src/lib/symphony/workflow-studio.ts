@@ -12,6 +12,7 @@ export type WorkflowVisualNode = Readonly<{
   type: WorkflowStepType;
   label: string;
   detail: string;
+  dependsOn: string[];
   depth: number;
   steps: WorkflowVisualNode[];
   branches: WorkflowBranch[];
@@ -37,15 +38,15 @@ const ROOT_KEYS = new Set(["id", "name", "mission", "workspace", "inputSchema", 
 const MISSION_KEYS = new Set(["statement", "keyResults"]);
 const WORKSPACE_KEYS = new Set(["path", "remoteRepository", "startingRef", "dirtyPolicy"]);
 const STEP_KEYS: Record<WorkflowStepType, ReadonlySet<string>> = {
-  agent: new Set(["id", "type", "objective", "model", "harness", "permissions", "outputSchema", "routing", "workspace"]),
-  sequence: new Set(["id", "type", "steps"]),
-  parallel: new Set(["id", "type", "steps"]),
-  while: new Set(["id", "type", "condition", "steps", "maxIterations"]),
-  if: new Set(["id", "type", "condition", "then", "else"]),
-  set: new Set(["id", "type", "value"]),
-  evaluate: new Set(["id", "type", "metric", "path", "operator", "op", "target", "default"]),
-  timer: new Set(["id", "type", "durationMs", "expiresAfterMs"]),
-  signal: new Set(["id", "type", "signalKey", "expiresAfterMs", "payloadSchema"]),
+  agent: new Set(["id", "type", "dependsOn", "objective", "model", "harness", "permissions", "outputSchema", "routing", "workspace"]),
+  sequence: new Set(["id", "type", "dependsOn", "steps"]),
+  parallel: new Set(["id", "type", "dependsOn", "steps"]),
+  while: new Set(["id", "type", "dependsOn", "condition", "steps", "maxIterations"]),
+  if: new Set(["id", "type", "dependsOn", "condition", "then", "else"]),
+  set: new Set(["id", "type", "dependsOn", "value"]),
+  evaluate: new Set(["id", "type", "dependsOn", "metric", "path", "operator", "op", "target", "default"]),
+  timer: new Set(["id", "type", "dependsOn", "durationMs", "expiresAfterMs"]),
+  signal: new Set(["id", "type", "dependsOn", "signalKey", "expiresAfterMs", "payloadSchema"]),
 };
 const CONDITION_KEYS = new Set(["path", "op", "value", "default"]);
 
@@ -101,14 +102,22 @@ export function validateWorkflowJson(source: string): WorkflowJsonValidation {
     errors.push("$.steps must contain at least one step.");
   } else {
     const ids = new Set<string>();
-    validateSteps(steps, "$.steps", errors, ids);
+    const dependencies = new Map<string, { path: string; ids: string[] }>();
+    validateSteps(steps, "$.steps", errors, ids, dependencies);
+    validateDependencies(dependencies, ids, errors);
   }
   if (value.triggers !== undefined) validateTriggers(value.triggers, errors);
   if (errors.length) return { valid: false, errors };
   return { valid: true, errors: [], value: value as JsonValue };
 }
 
-function validateSteps(value: unknown[], path: string, errors: string[], ids: Set<string>): void {
+function validateSteps(
+  value: unknown[],
+  path: string,
+  errors: string[],
+  ids: Set<string>,
+  dependencies: Map<string, { path: string; ids: string[] }>,
+): void {
   value.forEach((raw, index) => {
     const stepPath = `${path}[${index}]`;
     if (!isRecord(raw)) {
@@ -126,6 +135,8 @@ function validateSteps(value: unknown[], path: string, errors: string[], ids: Se
     }
     const stepType = type as WorkflowStepType;
     validateKeys(raw, STEP_KEYS[stepType], stepPath, errors);
+    const dependencyIds = validateStepDependencies(raw, stepPath, errors);
+    if (typeof id === "string" && id.trim()) dependencies.set(id, { path: `${stepPath}.dependsOn`, ids: dependencyIds });
     if (stepType === "agent") {
       requireString(raw, "objective", stepPath, errors);
       if (!isRecord(raw.outputSchema)) errors.push(`${stepPath}.outputSchema must be an object.`);
@@ -145,19 +156,68 @@ function validateSteps(value: unknown[], path: string, errors: string[], ids: Se
     if (stepType === "sequence" || stepType === "parallel" || stepType === "while") {
       const nested = raw.steps;
       if (!Array.isArray(nested) || nested.length === 0) errors.push(`${stepPath}.steps must contain at least one step.`);
-      else validateSteps(nested, `${stepPath}.steps`, errors, ids);
+      else validateSteps(nested, `${stepPath}.steps`, errors, ids, dependencies);
       if (stepType === "while") validateCondition(raw.condition, `${stepPath}.condition`, errors);
     }
     if (stepType === "if") {
       validateCondition(raw.condition, `${stepPath}.condition`, errors);
       if (!Array.isArray(raw.then) || raw.then.length === 0) errors.push(`${stepPath}.then must contain at least one step.`);
-      else validateSteps(raw.then, `${stepPath}.then`, errors, ids);
+      else validateSteps(raw.then, `${stepPath}.then`, errors, ids, dependencies);
       if (raw.else !== undefined) {
         if (!Array.isArray(raw.else)) errors.push(`${stepPath}.else must be an array of steps.`);
-        else validateSteps(raw.else, `${stepPath}.else`, errors, ids);
+        else validateSteps(raw.else, `${stepPath}.else`, errors, ids, dependencies);
       }
     }
   });
+}
+
+function validateStepDependencies(record: Record<string, unknown>, path: string, errors: string[]): string[] {
+  if (record.dependsOn === undefined) return [];
+  if (!Array.isArray(record.dependsOn)) {
+    errors.push(`${path}.dependsOn must be an array of step IDs.`);
+    return [];
+  }
+  if (record.dependsOn.length > 256) errors.push(`${path}.dependsOn must contain at most 256 step IDs.`);
+  const dependencies: string[] = [];
+  const seen = new Set<string>();
+  record.dependsOn.forEach((dependency, index) => {
+    if (typeof dependency !== "string" || !dependency.trim() || !/^[a-zA-Z0-9_.-]+$/u.test(dependency)) {
+      errors.push(`${path}.dependsOn[${index}] must be a stable step ID.`);
+      return;
+    }
+    if (seen.has(dependency)) errors.push(`${path}.dependsOn[${index}] duplicates ${dependency}.`);
+    seen.add(dependency);
+    dependencies.push(dependency);
+  });
+  return dependencies;
+}
+
+function validateDependencies(
+  dependencies: Map<string, { path: string; ids: string[] }>,
+  ids: Set<string>,
+  errors: string[],
+): void {
+  for (const [stepId, dependency] of dependencies.entries()) {
+    dependency.ids.forEach((dependencyId, index) => {
+      if (dependencyId === stepId) errors.push(`${dependency.path}[${index}] cannot reference ${stepId} itself.`);
+      else if (!ids.has(dependencyId)) errors.push(`${dependency.path}[${index}] references unknown step ${dependencyId}.`);
+    });
+  }
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (stepId: string): void => {
+    if (visited.has(stepId)) return;
+    if (visiting.has(stepId)) {
+      const path = dependencies.get(stepId)?.path ?? "$.steps";
+      errors.push(`${path} participates in a dependency cycle through ${stepId}.`);
+      return;
+    }
+    visiting.add(stepId);
+    for (const dependencyId of dependencies.get(stepId)?.ids ?? []) if (ids.has(dependencyId)) visit(dependencyId);
+    visiting.delete(stepId);
+    visited.add(stepId);
+  };
+  for (const stepId of dependencies.keys()) visit(stepId);
 }
 
 function validateCondition(value: unknown, path: string, errors: string[]): void {
@@ -224,6 +284,7 @@ function visualNode(value: unknown, depth: number): WorkflowVisualNode | null {
     type,
     label: stepLabel(type),
     detail: stepDetail(step, type, children.length, branches),
+    dependsOn: asArray(step.dependsOn).filter((dependency): dependency is string => typeof dependency === "string"),
     depth,
     steps: children,
     branches,

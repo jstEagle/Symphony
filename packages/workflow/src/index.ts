@@ -20,6 +20,7 @@ import {
   type CapabilityExecutionBinding,
   type JsonValue,
   type WorkflowMission,
+  WorkflowStepDependenciesSchema,
 } from "@symphony/protocol";
 import { AgentCoordinator, idempotencyKey } from "@symphony/runtime";
 import type {
@@ -49,7 +50,11 @@ export * from "./objective-feedback.js";
 export * from "./objective-feedback-runtime.js";
 
 const OutputSchema = z.record(z.string(), JsonValueSchema);
-const CommonStepSchema = z.object({ id: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/u) });
+const CommonStepSchema = z.object({
+  id: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/u),
+  /** Explicit prerequisite step IDs. Dependencies are resolved by the daemon. */
+  dependsOn: WorkflowStepDependenciesSchema.optional(),
+});
 
 export type AgentStep = z.infer<typeof CommonStepSchema> & {
   type: "agent";
@@ -228,10 +233,12 @@ export class WorkflowCompiler {
   compile(definitionInput: unknown, revision: number): WorkflowIr {
     const definition = WorkflowDefinitionSchema.parse(definitionInput);
     const ids: string[] = [];
+    const stepsById = new Map<string, WorkflowStep>();
     const visit = (steps: WorkflowStep[]): void => {
       for (const step of steps) {
         if (ids.includes(step.id)) throw new Error(`Duplicate workflow step id: ${step.id}`);
         ids.push(step.id);
+        stepsById.set(step.id, step);
         if (step.type === "sequence" || step.type === "parallel" || step.type === "while") visit(step.steps);
         if (step.type === "if") {
           visit(step.then);
@@ -240,6 +247,31 @@ export class WorkflowCompiler {
       }
     };
     visit(definition.steps);
+    const knownIds = new Set(ids);
+    for (const step of stepsById.values()) {
+      const seenDependencies = new Set<string>();
+      for (const dependencyId of step.dependsOn ?? []) {
+        if (seenDependencies.has(dependencyId)) throw new Error(`Workflow step ${step.id} declares duplicate dependency ${dependencyId}`);
+        if (dependencyId === step.id) throw new Error(`Workflow step ${step.id} cannot depend on itself`);
+        if (!knownIds.has(dependencyId)) throw new Error(`Workflow step ${step.id} depends on unknown step ${dependencyId}`);
+        seenDependencies.add(dependencyId);
+      }
+    }
+    // A dependency graph must be finite before a durable run can be admitted.
+    // Container ordering is enforced separately by the runtime scheduler.
+    const visiting = new Set<string>();
+    const visited = new Set<string>();
+    const visitDependencies = (stepId: string): void => {
+      if (visited.has(stepId)) return;
+      if (visiting.has(stepId)) throw new Error(`Workflow dependency cycle detected through ${stepId}`);
+      const step = stepsById.get(stepId);
+      if (!step) return;
+      visiting.add(stepId);
+      for (const dependencyId of step.dependsOn ?? []) visitDependencies(dependencyId);
+      visiting.delete(stepId);
+      visited.add(stepId);
+    };
+    for (const stepId of ids) visitDependencies(stepId);
     const canonical = stableStringify(definition);
     const hash = createHash("sha256").update(canonical).digest("hex");
     return {
@@ -286,6 +318,10 @@ export class WorkflowLoader {
 }
 
 type ExecutionContext = { input: JsonValue; steps: Record<string, JsonValue>; iteration: Record<string, number> };
+
+function hasStepOutput(context: ExecutionContext, stepId: string): boolean {
+  return Object.prototype.hasOwnProperty.call(context.steps, stepId);
+}
 
 export type WorkflowRunStartOptions = {
   runId?: string;
@@ -552,7 +588,9 @@ export class WorkflowEngine {
       if (!hasStartedEvent) this.event(current, "workflow.run.started", { revision: ir.revision, hash: ir.hash });
     });
     const context: ExecutionContext = { input: current.input, steps: {}, iteration: {} };
-    for (const attempt of this.store.listStepAttempts(current.id)) if (attempt.status === "completed" && attempt.output !== null) context.steps[attempt.stepId] = attempt.output;
+    for (const attempt of this.store.listStepAttempts(current.id)) {
+      if (attempt.status === "completed") context.steps[attempt.stepId] = attempt.output;
+    }
     try {
       await this.executeSteps(ir.definition.steps, current, ir, context, "root");
       this.throwIfCancelled(current.id);
@@ -572,10 +610,41 @@ export class WorkflowEngine {
     }
   }
 
-  private async executeSteps(steps: WorkflowStep[], run: WorkflowRunRecord, ir: WorkflowIr, context: ExecutionContext, scope: string): Promise<void> {
-    for (const step of steps) {
+  private async executeSteps(
+    steps: WorkflowStep[],
+    run: WorkflowRunRecord,
+    ir: WorkflowIr,
+    context: ExecutionContext,
+    scope: string,
+    mode: "sequence" | "parallel" = "sequence",
+  ): Promise<void> {
+    const pending = [...steps];
+    while (pending.length > 0) {
       this.throwIfCancelled(run.id);
-      await this.executeStep(step, run, ir, context, scope);
+      const ready = pending.filter((step) => (step.dependsOn ?? []).every((dependencyId) => hasStepOutput(context, dependencyId)));
+      if (ready.length === 0) {
+        const blocked = pending.map((step) => `${step.id} after ${(step.dependsOn ?? []).join(", ") || "an unresolved prerequisite"}`).join("; ");
+        throw new Error(`Workflow dependencies cannot be satisfied in ${scope}: ${blocked}`);
+      }
+
+      if (mode === "parallel") {
+        // Execute a ready frontier together. A dependent sibling moves to the
+        // next frontier only after this batch has durably completed.
+        const readyIds = new Set(ready.map((step) => step.id));
+        pending.splice(0, pending.length, ...pending.filter((step) => !readyIds.has(step.id)));
+        await Promise.all(ready.map((step) => this.executeStep(step, run, ir, context, scope)));
+      } else {
+        // Sequence containers retain source order; dependencies can add a
+        // prerequisite fence but cannot silently reorder authored steps.
+        const next = pending[0];
+        if (!next) return;
+        if (!(next.dependsOn ?? []).every((dependencyId) => hasStepOutput(context, dependencyId))) {
+          const unresolved = (next.dependsOn ?? []).filter((dependencyId) => !hasStepOutput(context, dependencyId));
+          throw new Error(`Workflow step ${next.id} is blocked in ${scope} by ${unresolved.join(", ")}. Sequence order cannot satisfy this dependency.`);
+        }
+        pending.shift();
+        await this.executeStep(next, run, ir, context, scope);
+      }
     }
   }
 
@@ -583,7 +652,7 @@ export class WorkflowEngine {
     const iterationKey = `${scope}:${Object.entries(context.iteration).map(([key, value]) => `${key}=${value}`).join(",")}`;
     const replay = this.store.getLatestStepAttempt(run.id, step.id, iterationKey);
     if (replay?.status === "completed") {
-      if (replay.output !== null) context.steps[step.id] = replay.output;
+      context.steps[step.id] = replay.output;
       return;
     }
     const attemptNumber = (replay?.attempt ?? 0) + (replay?.status === "failed" ? 1 : 0) || 1;
@@ -612,7 +681,7 @@ export class WorkflowEngine {
         await this.executeSteps(step.steps, run, ir, context, `${scope}/${step.id}`);
         output = Object.fromEntries(step.steps.map((child) => [child.id, context.steps[child.id] ?? null]));
       } else if (step.type === "parallel") {
-        await Promise.all(step.steps.map((child) => this.executeStep(child, run, ir, context, `${scope}/${step.id}`)));
+        await this.executeSteps(step.steps, run, ir, context, `${scope}/${step.id}`, "parallel");
         output = Object.fromEntries(step.steps.map((child) => [child.id, context.steps[child.id] ?? null]));
       } else if (step.type === "if") {
         const branch = evaluateCondition(step.condition, context) ? step.then : step.else ?? [];

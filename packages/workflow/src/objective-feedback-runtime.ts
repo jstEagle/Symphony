@@ -56,7 +56,7 @@ export type ObjectiveFeedbackRuntimeResult = Readonly<{
   decision: CapabilityResultDecisionRecord;
   reduced: ObjectiveFeedbackDecision;
   run: ObjectiveRunRecord;
-  applied: "continue" | "attention" | "replan" | "deferred" | "replayed";
+  applied: "continue" | "attention" | "replan" | "wait-for-approval" | "finish" | "deferred" | "replayed";
   attention: ObjectiveAttentionRecord | null;
 }>;
 
@@ -118,9 +118,12 @@ export class ObjectiveFeedbackRuntime {
       ? `${feedback.id}:continue`
       : reduced.kind === "replan"
         ? `${feedback.id}:replan`
-        : null;
-    const operationApplied = operationRequestKey !== null
-      && this.options.objectiveRepository.getObjectiveActionReceipt(operationRequestKey) !== null;
+        : reduced.kind === "wait-for-approval"
+          ? `${feedback.id}:approval`
+          : reduced.kind === "finish"
+            ? `${feedback.id}:finish`
+            : null;
+    const operationApplied = operationRequestKey !== null && this.feedbackOperationApplied(reduced, current, operationRequestKey);
     if (!records.replayed || reduced.kind === "attention" || (operationRequestKey !== null && !operationApplied)) {
       const outcome = this.applyDecision(feedback, reduced, current, apply);
       current = outcome.run;
@@ -269,9 +272,194 @@ export class ObjectiveFeedbackRuntime {
       }, this.options.authority);
       return { run: next, applied: "replan", attention: null };
     }
-    // Approval/finish are intentionally proposal-only at this seam. Existing
-    // approval and terminal operations have distinct authority boundaries.
-    return { run, applied: "deferred", attention: null };
+    if (reduced.kind === "wait-for-approval") return this.applyApproval(feedback, reduced, run);
+    return this.applyFinish(feedback, reduced, run);
+  }
+
+  /**
+   * Approval and completion are daemon-owned operations. The reducer only
+   * proposes them; this boundary is where the proposal gets the same durable
+   * request-key/CAS semantics as every other ObjectiveRuntime mutation.
+   */
+  private applyApproval(
+    feedback: CapabilityResultFeedbackRecord,
+    reduced: Extract<ObjectiveFeedbackDecision, { kind: "wait-for-approval" }>,
+    run: ObjectiveRunRecord,
+  ): { run: ObjectiveRunRecord; applied: "wait-for-approval" | "attention"; attention: ObjectiveAttentionRecord | null } {
+    const expectedKind = reduced.approvalKind === "completion" ? "completion" : "plan";
+    const pending = run.pendingApprovalId === null
+      ? null
+      : this.options.objectiveRepository.getObjectiveApproval(run.runId, run.pendingApprovalId);
+    if (pending) {
+      if (pending.status !== "requested" || pending.kind !== expectedKind || (reduced.approvalId !== undefined && pending.id !== reduced.approvalId)) {
+        return { run, applied: "attention", attention: this.openInvalidAttention(feedback, run, "Capability feedback approval does not match the durable pending approval.") };
+      }
+      return { run, applied: "wait-for-approval", attention: null };
+    }
+    if (reduced.approvalId !== undefined) {
+      return { run, applied: "attention", attention: this.openInvalidAttention(feedback, run, "Capability feedback references an approval that is not pending.") };
+    }
+
+    let current = run;
+    if (expectedKind === "completion") {
+      const prepared = this.prepareSuccessfulAttempt(feedback, current, `${feedback.id}:approval:prepare`);
+      if (prepared.attention) return { run: prepared.run, applied: "attention", attention: prepared.attention };
+      current = prepared.run;
+      const preparedApproval = current.pendingApprovalId === null
+        ? null
+        : this.options.objectiveRepository.getObjectiveApproval(current.runId, current.pendingApprovalId);
+      if (preparedApproval) {
+        if (preparedApproval.status !== "requested" || preparedApproval.kind !== "completion") {
+          return { run: current, applied: "attention", attention: this.openInvalidAttention(feedback, current, "Completion approval preparation produced an invalid durable approval.") };
+        }
+        return { run: current, applied: "wait-for-approval", attention: null };
+      }
+    } else {
+      const prepared = this.prepareFailedAttempt(feedback, current, `${feedback.id}:approval:prepare`);
+      if (prepared.attention) return { run: prepared.run, applied: "attention", attention: prepared.attention };
+      current = prepared.run;
+    }
+
+    try {
+      const next = this.options.runtime.requestApproval(current.runId, {
+        kind: expectedKind,
+        taskId: null,
+        question: reduced.reason,
+        scope: {
+          feedbackId: feedback.id,
+          evidence: {
+            eventCursor: reduced.evidence.eventCursor,
+            eventIds: reduced.evidence.eventIds,
+            observationIds: reduced.evidence.observationIds,
+            artifactIds: reduced.evidence.artifactIds,
+            checkpointIds: reduced.evidence.checkpointIds,
+          },
+          decisionId: reduced.decisionId,
+        },
+        operationId: `objective-feedback:${expectedKind}:${feedback.id}`,
+        requestHash: reduced.decisionId,
+        policyHash: current.policyHash ?? current.workflowHash,
+        sideEffectClass: current.policy?.sideEffectClassCeiling ?? "local",
+        canonicalTarget: `${current.workflowId}:${current.objectiveId}:${expectedKind}`,
+        expiresAt: null,
+        requestKey: `${feedback.id}:approval`,
+      }, this.options.authority);
+      return { run: next, applied: "wait-for-approval", attention: null };
+    } catch (error) {
+      return { run: current, applied: "attention", attention: this.openInvalidAttention(feedback, current, error instanceof Error ? error.message : String(error)) };
+    }
+  }
+
+  private applyFinish(
+    feedback: CapabilityResultFeedbackRecord,
+    reduced: Extract<ObjectiveFeedbackDecision, { kind: "finish" }>,
+    run: ObjectiveRunRecord,
+  ): { run: ObjectiveRunRecord; applied: "finish" | "attention"; attention: ObjectiveAttentionRecord | null } {
+    if (run.state === "succeeded") return { run, applied: "finish", attention: null };
+    if (["failed", "cancelled", "interrupted", "awaiting-approval"].includes(run.state)) {
+      return { run, applied: "attention", attention: this.openInvalidAttention(feedback, run, "Capability feedback finish does not match the durable objective state.") };
+    }
+    const prepared = this.prepareSuccessfulAttempt(feedback, run, `${feedback.id}:finish`);
+    if (prepared.attention) return { run: prepared.run, applied: "attention", attention: prepared.attention };
+    if (prepared.run.state !== "succeeded") {
+      return { run: prepared.run, applied: "attention", attention: this.openInvalidAttention(feedback, prepared.run, "Capability feedback claimed completion but the durable objective did not reach a succeeded state.") };
+    }
+    return { run: prepared.run, applied: "finish", attention: null };
+  }
+
+  private prepareSuccessfulAttempt(
+    feedback: CapabilityResultFeedbackRecord,
+    run: ObjectiveRunRecord,
+    requestKey: string,
+  ): { run: ObjectiveRunRecord; attention: ObjectiveAttentionRecord | null } {
+    const task = run.tasks.find((candidate) => candidate.task.id === feedback.nodeId);
+    if (!task || task.attemptId !== feedback.attemptId) {
+      return { run, attention: this.openInvalidAttention(feedback, run, "Capability feedback attempt is not the current objective frontier.") };
+    }
+    if (!["running", "completed"].includes(task.state)) {
+      return { run, attention: this.openInvalidAttention(feedback, run, "Capability feedback success cannot advance a non-running objective task.") };
+    }
+    const otherTasksComplete = run.tasks.every((record) => record.task.id === task.task.id || record.state === "completed" || record.state === "superseded");
+    if (!otherTasksComplete) {
+      return { run, attention: this.openInvalidAttention(feedback, run, "Capability feedback claims objective completion while another task remains unfinished.") };
+    }
+    if (task.state === "completed") {
+      if (run.state === "succeeded") return { run, attention: null };
+      try {
+        return {
+          run: this.options.runtime.checkpoint(run.runId, {
+            eventCursor: Math.max(maxEvidenceCursor(feedback), this.latestCheckpointCursor(run)),
+            reason: `Capability feedback ${feedback.id} finalized the completed objective attempt.`,
+            requestKey,
+          }, this.options.authority),
+          attention: null,
+        };
+      } catch (error) {
+        return { run, attention: this.openInvalidAttention(feedback, run, error instanceof Error ? error.message : String(error)) };
+      }
+    }
+    try {
+      return {
+        run: this.options.runtime.checkpoint(run.runId, {
+          eventCursor: Math.max(maxEvidenceCursor(feedback), this.latestCheckpointCursor(run)),
+          taskUpdates: [{ taskId: task.task.id, state: "completed", attemptId: feedback.attemptId, output: resultOutput(feedback.result) }],
+          reason: `Capability feedback ${feedback.id} was accepted and reduced to finish.`,
+          requestKey,
+        }, this.options.authority),
+        attention: null,
+      };
+    } catch (error) {
+      return { run, attention: this.openInvalidAttention(feedback, run, error instanceof Error ? error.message : String(error)) };
+    }
+  }
+
+  private prepareFailedAttempt(
+    feedback: CapabilityResultFeedbackRecord,
+    run: ObjectiveRunRecord,
+    requestKey: string,
+  ): { run: ObjectiveRunRecord; attention: ObjectiveAttentionRecord | null } {
+    const task = run.tasks.find((candidate) => candidate.task.id === feedback.nodeId);
+    if (!task || task.attemptId !== feedback.attemptId) {
+      return { run, attention: this.openInvalidAttention(feedback, run, "Capability feedback attempt is not the current objective frontier.") };
+    }
+    if (task.state === "completed" || task.state === "superseded") {
+      return { run, attention: this.openInvalidAttention(feedback, run, "A failed capability result does not match the already-completed objective task.") };
+    }
+    if (task.state === "failed" || task.state === "blocked") return { run, attention: null };
+    try {
+      return {
+        run: this.options.runtime.checkpoint(run.runId, {
+          eventCursor: Math.max(maxEvidenceCursor(feedback), this.latestCheckpointCursor(run)),
+          taskUpdates: [{ taskId: task.task.id, state: "failed", attemptId: feedback.attemptId, error: feedback.summary ?? "Capability result failed." }],
+          reason: `Capability feedback ${feedback.id} recorded a failed attempt before approval.`,
+          requestKey,
+        }, this.options.authority),
+        attention: null,
+      };
+    } catch (error) {
+      return { run, attention: this.openInvalidAttention(feedback, run, error instanceof Error ? error.message : String(error)) };
+    }
+  }
+
+  private latestCheckpointCursor(run: ObjectiveRunRecord): number {
+    if (!run.latestCheckpointId) return 0;
+    return this.options.objectiveRepository.getObjectiveCheckpoint(run.runId, run.latestCheckpointId)?.eventCursor ?? 0;
+  }
+
+  private feedbackOperationApplied(
+    reduced: ObjectiveFeedbackDecision,
+    run: ObjectiveRunRecord,
+    requestKey: string,
+  ): boolean {
+    if (this.options.objectiveRepository.getObjectiveActionReceipt(requestKey) !== null) return true;
+    if (reduced.kind !== "wait-for-approval") return false;
+    // Completion preparation can itself create the policy-driven approval and
+    // has a separate checkpoint receipt. Keep that marker after approval
+    // resolution so replay cannot reopen a settled request.
+    if (this.options.objectiveRepository.getObjectiveActionReceipt(`${reduced.feedbackId}:approval:prepare`) !== null) return true;
+    if (run.pendingApprovalId === null) return false;
+    const approval = this.options.objectiveRepository.getObjectiveApproval(run.runId, run.pendingApprovalId);
+    return approval?.status === "requested" && approval.kind === (reduced.approvalKind === "completion" ? "completion" : "plan");
   }
 
   private openInvalidAttention(feedback: CapabilityResultFeedbackRecord, run: ObjectiveRunRecord, reason: string): ObjectiveAttentionRecord {

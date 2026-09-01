@@ -128,7 +128,7 @@ function mapAgent(step: AgentStep, sourcePath: string): ObjectiveControlAgentNod
     id: step.id,
     sourceNodeId: step.id,
     sourcePath,
-    dependsOn: [],
+    dependsOn: [...(step.dependsOn ?? [])],
     label: step.id,
     type: "agent",
     objective: step.objective,
@@ -164,9 +164,9 @@ function mapStep(
     id: step.id,
     sourceNodeId: step.id,
     sourcePath,
-    dependsOn: [] as string[],
+    dependsOn: [...(step.dependsOn ?? [])],
     label: step.id,
-  } as const;
+  };
 
   if (step.type === "agent") return mapAgent(step, sourcePath);
   if (step.type === "set") return { ...base, type: "set", value: step.value } satisfies ObjectiveControlSetNode;

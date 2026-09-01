@@ -29,7 +29,7 @@ function task(id: string) {
   };
 }
 
-function fixture() {
+function fixture(specOverrides: Record<string, unknown> = {}) {
   const root = mkdtempSync(join(tmpdir(), "symphony-feedback-runtime-"));
   roots.push(root);
   writeDefaultConfig(root);
@@ -51,6 +51,7 @@ function fixture() {
       criteria: [],
       approvalPolicy: { mode: "never" },
       maxReplans: 1,
+      ...specOverrides,
     },
     tasks: [task("capability-node")],
     requestKey: "feedback-runtime-create",
@@ -121,6 +122,67 @@ afterEach(() => {
 });
 
 describe("ObjectiveFeedbackRuntime", () => {
+  it("materializes a finish decision as one durable terminal checkpoint", () => {
+    const fixtureState = fixture();
+    const input = feedback({ result: { status: "succeeded", output: { ok: true } } });
+    fixtureState.feedbackRepository.saveFeedback(input);
+
+    const first = fixtureState.boundary.processAccepted(input, context({ objectiveComplete: true }));
+    const replay = fixtureState.boundary.processAccepted(input, context({ objectiveComplete: true }));
+
+    expect(first.reduced.kind).toBe("finish");
+    expect(first.applied).toBe("finish");
+    expect(first.run.state).toBe("succeeded");
+    expect(first.run.tasks[0]).toMatchObject({ state: "completed", output: { ok: true } });
+    expect(fixtureState.repository.getObjectiveActionReceipt(`${input.id}:finish`)).toMatchObject({ kind: "objective.checkpoint.commit" });
+    expect(replay.applied).toBe("replayed");
+    expect(replay.run).toEqual(first.run);
+    expect(fixtureState.feedbackRepository.listEvaluations()).toHaveLength(1);
+    expect(fixtureState.feedbackRepository.listDecisions()).toHaveLength(1);
+  });
+
+  it("materializes completion approval and replays it without reopening the request", () => {
+    const fixtureState = fixture({ approvalPolicy: { mode: "before-completion" } });
+    const input = feedback({ id: "feedback-runtime-completion-approval", idempotencyKey: "feedback-runtime-completion-approval-request", result: { status: "succeeded", output: { ok: true } } });
+    fixtureState.feedbackRepository.saveFeedback(input);
+
+    const first = fixtureState.boundary.processAccepted(input, context({
+      objectiveComplete: true,
+      approvalPolicy: "before-completion",
+    }));
+    const approvalId = first.run.pendingApprovalId;
+    const replay = fixtureState.boundary.processAccepted(input, context({
+      objectiveComplete: true,
+      approvalPolicy: "before-completion",
+    }));
+
+    expect(first.reduced.kind).toBe("wait-for-approval");
+    expect(first.applied).toBe("wait-for-approval");
+    expect(first.run.state).toBe("awaiting-approval");
+    expect(approvalId).not.toBeNull();
+    expect(fixtureState.repository.getObjectiveApproval(first.run.runId, approvalId as string)).toMatchObject({ kind: "completion", status: "requested" });
+    expect(replay.applied).toBe("replayed");
+    expect(replay.run).toEqual(first.run);
+    expect(fixtureState.repository.getObjectiveActionReceipt(`${input.id}:approval:prepare`)).toMatchObject({ kind: "objective.checkpoint.commit" });
+  });
+
+  it("records a failed attempt before opening one idempotent replan approval", () => {
+    const fixtureState = fixture();
+    const input = feedback({ id: "feedback-runtime-replan-approval", idempotencyKey: "feedback-runtime-replan-approval-request", result: { status: "failed" } });
+    fixtureState.feedbackRepository.saveFeedback(input);
+
+    const first = fixtureState.boundary.processAccepted(input, context({ approvalPolicy: "on-replan" }));
+    const replay = fixtureState.boundary.processAccepted(input, context({ approvalPolicy: "on-replan" }));
+
+    expect(first.reduced.kind).toBe("wait-for-approval");
+    expect(first.applied).toBe("wait-for-approval");
+    expect(first.run.state).toBe("awaiting-approval");
+    expect(first.run.tasks[0]?.state).toBe("failed");
+    expect(fixtureState.repository.getObjectiveApproval(first.run.runId, first.run.pendingApprovalId as string)).toMatchObject({ kind: "plan", status: "requested" });
+    expect(replay.applied).toBe("replayed");
+    expect(replay.run).toEqual(first.run);
+  });
+
   it("persists one evaluation/decision and replays without a second checkpoint", () => {
     const fixtureState = fixture();
     const input = feedback();
