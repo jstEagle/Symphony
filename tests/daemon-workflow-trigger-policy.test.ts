@@ -136,6 +136,20 @@ describe("daemon workflow trigger activation policy", () => {
       expect(second.triggers.activeTriggerCount("agent-scheduled")).toBe(0);
       expect(second.store.listTriggerOccurrences().filter((occurrence) => occurrence.workflowId === "agent-scheduled")).toEqual([]);
 
+      const activation = await postWithRetry(`http://127.0.0.1:${port}/v1/workflows/agent-scheduled/activate`, {
+        method: "POST",
+        headers: {
+          "idempotency-key": "agent-activate-scheduled",
+          "x-symphony-agent-id": "workflow-author",
+          "x-symphony-agent-token": second.agents.tokenFor("workflow-author"),
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      expect(activation.status).toBe(200);
+      expect(second.triggers.isPending("agent-scheduled")).toBe(false);
+      expect(second.triggers.activeTriggerCount("agent-scheduled")).toBe(1);
+
       const userBody = JSON.stringify(scheduledDefinition("user-scheduled", "0 0 1 1 *"));
       const userResponse = await postWithRetry(`http://127.0.0.1:${port}/v1/workflows`, {
         method: "POST",
@@ -147,7 +161,7 @@ describe("daemon workflow trigger activation policy", () => {
       expect(second.triggers.activeTriggerCount("user-scheduled")).toBe(1);
 
       const projection = await fetch(`http://127.0.0.1:${port}/v1/workflows`).then((response) => response.json()) as Array<{ id: string; triggerState: string }>;
-      expect(projection.find((workflow) => workflow.id === "agent-scheduled")?.triggerState).toBe("pending");
+      expect(projection.find((workflow) => workflow.id === "agent-scheduled")?.triggerState).toBe("active");
       expect(projection.find((workflow) => workflow.id === "user-scheduled")?.triggerState).toBe("active");
     } finally {
       await second.close();

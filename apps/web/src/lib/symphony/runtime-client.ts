@@ -497,6 +497,18 @@ export async function registerWorkflow(
   });
 }
 
+/** Promote an agent-authored workflow schedule after explicit user/agent review. */
+export async function activateWorkflow(
+  workflowId: string,
+  idempotencyKey: string,
+): Promise<WorkflowRevisionRecord> {
+  return request<WorkflowRevisionRecord>(`/workflows/${encodeURIComponent(workflowId)}/activate`, {
+    method: "POST",
+    headers: mutationHeaders(idempotencyKey),
+    body: "{}",
+  });
+}
+
 /**
  * Objective mutations deliberately keep the request key out of the JSON
  * payload. The daemon derives the durable request key from Idempotency-Key,

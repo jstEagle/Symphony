@@ -787,6 +787,14 @@ if (canCreate) {
     `/v1/workflows/${encodeURIComponent(workflowId)}/runs`,
     mutation("run-workflow", extra.requestId, input),
   )));
+
+  server.registerTool("activate_workflow", {
+    description: "Promote your own pending Symphony workflow schedule after inspecting its immutable definition. User-authored schedules are already active; agent-authored cron triggers remain pending until explicitly activated.",
+    inputSchema: { workflowId: z.string().min(1) },
+  }, async ({ workflowId }, extra) => result(await api(
+    `/v1/workflows/${encodeURIComponent(workflowId)}/activate`,
+    mutation("activate-workflow", extra.requestId, {}),
+  )));
 }
 
 server.registerTool("cancel_run", {

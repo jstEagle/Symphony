@@ -1713,6 +1713,7 @@ export const CommandSchema = z.object({
     "agent.cancel",
     "agent.present",
     "workflow.register",
+    "workflow.activate",
     "workflow.run",
     "workflow.cancel",
     "plugin.invoke",
