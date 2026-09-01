@@ -97,11 +97,14 @@ describe("Symphony MCP objective projections", () => {
     const listing = await client.listTools();
     const listTool = listing.tools.find((tool) => tool.name === "list_objectives");
     const getTool = listing.tools.find((tool) => tool.name === "get_objective");
+    const workflowsTool = listing.tools.find((tool) => tool.name === "list_workflows");
 
     expect(listTool?.description).toContain("durable Symphony objectives");
     expect(listTool?.description).toContain("cross-harness conductor");
     expect(listTool?.description).toContain("Native harness subagents");
     expect(getTool?.description).toContain("plan revisions");
+    expect(workflowsTool?.description).toContain("fanout/map");
+    expect(workflowsTool?.description).toContain("item/itemIndex/itemKey");
     expect(listing.tools.map((tool) => tool.name)).not.toContain("create_objective");
 
     const list = await client.callTool({
@@ -130,6 +133,8 @@ describe("Symphony MCP objective projections", () => {
     }
     expect(listing.tools.find((tool) => tool.name === "create_objective")?.description).toContain("cross-harness conductor");
     expect(listing.tools.find((tool) => tool.name === "create_objective")?.description).toContain("Native harness subagents");
+    expect(listing.tools.find((tool) => tool.name === "register_workflow")?.description).toContain("null/unlimited concurrency");
+    expect(listing.tools.find((tool) => tool.name === "run_workflow")?.description).toContain("durable execution and recovery");
     expect(listing.tools.map((tool) => tool.name)).not.toContain("resolve_objective_approval");
 
     await client.callTool({
@@ -198,6 +203,9 @@ describe("Symphony MCP objective projections", () => {
     const listing = await client.listTools();
     expect(listing.tools.map((tool) => tool.name)).toContain("get_objective_strategy");
     expect(listing.tools.map((tool) => tool.name)).toContain("revise_objective_strategy");
+    expect(listing.tools.find((tool) => tool.name === "get_objective_strategy")?.description).toContain("durable materializer");
+    expect(listing.tools.find((tool) => tool.name === "revise_objective_strategy")?.description).toContain("stable item bindings");
+    expect(listing.tools.find((tool) => tool.name === "preview_objective_strategy")?.description).toContain("do not materialize child executions");
 
     await client.callTool({
       name: "get_objective_strategy",

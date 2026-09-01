@@ -84,7 +84,7 @@ const ObjectiveCreateInputSchema = z.object({
   spec: ObjectiveSpecSchema,
   tasks: z.array(ObjectiveTaskSchema).max(128).default([]),
   context: z.record(z.string(), JsonValueSchema).default({}),
-  controlPlan: ObjectiveControlPlanSchema.nullable().optional().describe("Optional initial tree-shaped objective strategy; the daemon pins and validates it during admission."),
+  controlPlan: ObjectiveControlPlanSchema.nullable().optional().describe("Optional initial tree-shaped objective strategy; the daemon pins and validates it during admission. Control fanout nodes are durable map blueprints (source + itemTemplate + bounded or null/unlimited concurrency) and are currently surfaced fail-closed until the objective materializer is available; use a registered workflow for executable fanout."),
 }).strict();
 
 const ObjectivePlanCommitInputSchema = z.object({
@@ -187,7 +187,7 @@ const ObjectiveStrategyMutationInputSchema = z.object({
     preserveLineage: z.literal(true),
   }).strict().optional(),
   maxIterations: z.number().int().positive().optional(),
-  node: ObjectiveControlNodeSchema.optional(),
+  node: ObjectiveControlNodeSchema.optional().describe("Typed strategy node. A fanout node maps a runtime array at source through itemTemplate, exposing item, itemIndex, and stable itemKey bindings; set concurrency to a positive integer or null for unlimited concurrency. Objective fanout is currently a durable blueprint that waits for materialization, so use register_workflow/run_workflow when the map must execute now."),
 }).strict();
 
 const ObjectiveSignalDeliveryInputSchema = z.object({
@@ -346,7 +346,7 @@ server.registerTool("cancel_agent", {
 });
 
 server.registerTool("list_workflows", {
-  description: "List registered dynamic Symphony workflows and their immutable revisions.",
+  description: "List registered dynamic Symphony workflows and their immutable revisions. Inspect a definition before running it: workflows are agent-authored orchestration programs and may include durable fanout/map steps that resolve a runtime array, execute one itemTemplate per item with bounded or null/unlimited concurrency, expose item/itemIndex/itemKey bindings, and aggregate results as an array, keyed object, or merged object.",
   inputSchema: {},
 }, async () => result(await api("/v1/workflows")));
 
@@ -627,7 +627,7 @@ server.registerTool("publish_objective_artifact", {
 )));
 
 server.registerTool("get_objective_strategy", {
-  description: "Read the current durable control strategy for an objective run: its immutable control-plan head and revision, execution snapshot, and append-only mutation history. Symphony owns this cross-harness strategy; native harness subagents are ephemeral implementation tactics. The daemon scopes the result to the authenticated agent's objective lineage.",
+  description: "Read the current durable control strategy for an objective run: its immutable control-plan head and revision, execution snapshot, and append-only mutation history. Symphony owns this cross-harness strategy; native harness subagents are ephemeral implementation tactics. Fanout nodes are shown as source/itemTemplate/concurrency/reducer blueprints; objective execution currently waits for their durable materializer rather than dispatching the blueprint accidentally. Use a registered workflow for executable fanout. The daemon scopes the result to the authenticated agent's objective lineage.",
   inputSchema: {
     runId: z.string().min(1).describe("The durable objective run ID."),
   },
@@ -642,7 +642,7 @@ server.registerTool("deliver_objective_signal", {
 )));
 
 server.registerTool("revise_objective_strategy", {
-  description: "Submit one typed compare-and-swap mutation to an objective's durable Symphony strategy. The daemon binds the authenticated actor and idempotency key, derives the resulting revision and snapshot server-side, and emits a semantic invalidation event. Never send or rely on a caller-computed resulting plan/snapshot; rebase after a deterministic revision conflict.",
+  description: "Submit one typed compare-and-swap mutation to an objective's durable Symphony strategy. The daemon binds the authenticated actor and idempotency key, derives the resulting revision and snapshot server-side, and emits a semantic invalidation event. Fanout nodes are valid agent-authored map blueprints with a runtime source, itemTemplate, positive or null/unlimited concurrency, stable item bindings, and an optional array/object/merge reducer; they remain fail-closed until objective materialization is implemented. Never send or rely on a caller-computed resulting plan/snapshot; rebase after a deterministic revision conflict.",
   inputSchema: ObjectiveStrategyMutationInputSchema,
 }, async ({ runId, ...input }, extra) => result(await api(
   `/v1/objectives/${encodeURIComponent(runId)}/strategy`,
@@ -650,7 +650,7 @@ server.registerTool("revise_objective_strategy", {
 )));
 
 server.registerTool("preview_objective_strategy", {
-  description: "Compute an authenticated deterministic preview for one objective strategy mutation. Returns candidate plan, node/edge/frontier/attempt/authority/workspace/capability/budget/loop impact, policy errors, and supporting evidence without advancing the plan CAS head.",
+  description: "Compute an authenticated deterministic preview for one objective strategy mutation. Returns candidate plan, node/edge/frontier/attempt/authority/workspace/capability/budget/loop impact, policy errors, and supporting evidence without advancing the plan CAS head. Fanout previews preserve the runtime source, itemTemplate, reducer, and concurrency policy but do not materialize child executions.",
   inputSchema: ObjectiveStrategyMutationInputSchema,
 }, async ({ runId, ...input }, extra) => result(await api(
   `/v1/objectives/${encodeURIComponent(runId)}/strategy/preview`,
@@ -771,7 +771,7 @@ if (canCreate) {
   )));
 
   server.registerTool("register_workflow", {
-    description: "Register an immutable revision of a custom Symphony workflow. Use sequence, parallel, if, while, set, and agent steps to express the orchestration strategy that best serves the mission. Reusing the same request is idempotent; changing a definition registers a new revision. This does not start a run.",
+    description: "Register an immutable revision of a custom Symphony workflow. Use sequence, parallel, fanout, if, while, set, evaluate, timer, signal, and agent steps to express the orchestration strategy that best serves the mission. A fanout step maps the array resolved by source through an itemTemplate, binds item/itemIndex/itemKey for interpolation, runs items with a positive concurrency cap or null/unlimited concurrency, and reduces results as an array, keyed object, or merged object. Reusing the same request is idempotent; changing a definition registers a new revision. This does not start a run.",
     inputSchema: {
       definition: z.record(z.string(), z.unknown()).describe("A complete Symphony workflow definition with id, name, mission, workspace, steps, optional output, and optional triggers."),
     },
@@ -781,7 +781,7 @@ if (canCreate) {
   )));
 
   server.registerTool("run_workflow", {
-    description: "Start a registered dynamic workflow with JSON input.",
+    description: "Start a registered dynamic workflow with JSON input. The daemon owns durable execution and recovery, including fanout/map materialization, per-item scopes, stable item keys, concurrency, and deterministic aggregation; use the workflow run projection to observe progress after starting it.",
     inputSchema: { workflowId: z.string().min(1), input: z.unknown().default({}) },
   }, async ({ workflowId, input }, extra) => result(await api(
     `/v1/workflows/${encodeURIComponent(workflowId)}/runs`,
