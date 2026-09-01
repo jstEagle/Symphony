@@ -28,6 +28,7 @@ export * from "./workspace-manifest.js";
 export * from "./agent-message.js";
 export * from "./worker-event.js";
 export * from "./capability-result-feedback.js";
+export * from "./workflow.js";
 
 export const IdSchema = z.string().min(1);
 export const IsoDateSchema = z.iso.datetime({ offset: true });

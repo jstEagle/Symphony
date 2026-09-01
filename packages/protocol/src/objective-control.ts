@@ -12,6 +12,10 @@ import {
   ObjectiveValueCharterMutationCitationSchema,
   type ObjectiveValueCharterMutationCitation,
 } from "./objective-values.js";
+import {
+  WorkflowFanoutAggregationSchema,
+  type WorkflowFanoutAggregation,
+} from "./workflow.js";
 
 /**
  * The control plan is deliberately a data-only protocol.  It describes the
@@ -217,6 +221,19 @@ export type ObjectiveControlParallelNode = z.infer<typeof ObjectiveControlNodeBa
   type: "parallel";
   steps: ObjectiveControlNode[];
 };
+/**
+ * A dynamic map/fan-out blueprint. The template is intentionally kept as a
+ * control node so agent-authored plans can fan out any existing declarative
+ * node shape. It is a blueprint, not a pre-materialized execution; concrete
+ * item executions and reduction behavior belong to the durable executor.
+ */
+export type ObjectiveControlFanoutNode = z.infer<typeof ObjectiveControlNodeBaseSchema> & {
+  type: "fanout";
+  source: string;
+  itemTemplate: ObjectiveControlNode;
+  concurrency: number | null;
+  aggregation?: WorkflowFanoutAggregation | undefined;
+};
 export type ObjectiveControlIfNode = z.infer<typeof ObjectiveControlNodeBaseSchema> & {
   type: "if";
   condition: ObjectiveControlCondition;
@@ -258,6 +275,7 @@ export type ObjectiveControlNode =
   | ObjectiveControlEvaluateNode
   | ObjectiveControlSequenceNode
   | ObjectiveControlParallelNode
+  | ObjectiveControlFanoutNode
   | ObjectiveControlIfNode
   | ObjectiveControlWhileNode
   | ObjectiveControlTimerNode
@@ -309,6 +327,13 @@ const ObjectiveControlNodeSchema: z.ZodType<ObjectiveControlNode> = z.lazy(() =>
       type: z.literal("parallel"),
       steps: z.array(ObjectiveControlNodeSchema).min(1).max(256),
     }),
+    ObjectiveControlNodeBaseSchema.extend({
+      type: z.literal("fanout"),
+      source: z.string().min(1).max(1_000),
+      itemTemplate: ObjectiveControlNodeSchema,
+      concurrency: z.number().int().positive().nullable().default(null),
+      aggregation: WorkflowFanoutAggregationSchema.optional(),
+    }).strict(),
     ObjectiveControlNodeBaseSchema.extend({
       type: z.literal("if"),
       condition: ObjectiveControlConditionSchema,

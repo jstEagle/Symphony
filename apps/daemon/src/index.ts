@@ -7163,9 +7163,15 @@ export class SymphonyDaemon {
       if (page.length < 1_000) break;
     }
     replaying = false;
-    for (const event of buffered
+    // Buffered events crossed the replay/listener boundary while the initial
+    // backlog was being projected. They must use the same rehydration path as
+    // both replayed and post-replay events; otherwise persisted chat updates
+    // arrive as identity-only `{messageId}` records and the UI can permanently
+    // miss the assistant message after a reload.
+    const bufferedAfterReplay = buffered
       .filter((candidate) => candidate.cursor > replayCursor)
-      .sort((left, right) => left.cursor - right.cursor)) writeEvent(response, event);
+      .sort((left, right) => left.cursor - right.cursor);
+    for (const event of projectStoredBacklog(this.store, bufferedAfterReplay)) writeEvent(response, event);
     const keepAlive = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
     request.on("close", () => {
       clearInterval(keepAlive);
@@ -7476,7 +7482,12 @@ function writeEvent(response: ServerResponse, event: EventEnvelope): void {
   response.write(`id: ${exported.cursor}\nevent: ${exported.type}\ndata: ${JSON.stringify(exported)}\n\n`);
 }
 
-function projectStoredBacklog(store: SymphonyStore, events: EventEnvelope[]): EventEnvelope[] {
+/**
+ * Rehydrate compact persisted chat events before they cross an SSE boundary.
+ * Kept exported so projection tests can exercise the exact path used for
+ * replay, listener-buffered events, and live delivery.
+ */
+export function projectStoredBacklog(store: SymphonyStore, events: EventEnvelope[]): EventEnvelope[] {
   const latestChatCursor = new Map<string, number>();
   for (const event of events) {
     const key = chatUpdateKey(event);

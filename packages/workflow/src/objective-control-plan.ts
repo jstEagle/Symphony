@@ -26,6 +26,7 @@ import {
   type ObjectiveControlNode,
   type ObjectiveControlNodeState,
   type ObjectiveControlParallelNode,
+  type ObjectiveControlFanoutNode,
   type ObjectiveControlPlan,
   type ObjectiveControlPlanRevision,
   type ObjectiveControlPlanSnapshot,
@@ -205,6 +206,27 @@ function mapStep(
       return mapStep(child, `${sourcePath}.steps.${index}`, options, relations, seen);
     });
     return { ...base, type: step.type, steps: children } as ObjectiveControlSequenceNode | ObjectiveControlParallelNode;
+  }
+
+  if (step.type === "fanout") {
+    // Keep the blueprint identity scoped to the fan-out. It must not collide
+    // with sibling workflow step IDs, nor be counted as a materialized
+    // execution before the source collection is resolved by the executor.
+    const template = mapStep(
+      step.itemTemplate,
+      `${sourcePath}.itemTemplate`,
+      options,
+      new Map(relations),
+      new Set(),
+    );
+    return {
+      ...base,
+      type: "fanout",
+      source: step.source,
+      itemTemplate: template,
+      concurrency: step.concurrency ?? null,
+      ...(step.aggregation === undefined ? {} : { aggregation: step.aggregation }),
+    } satisfies ObjectiveControlFanoutNode;
   }
 
   if (step.type === "if") {
@@ -1100,6 +1122,19 @@ function makeIntent(
     const value = interpolate(node.value, snapshot);
     const base = baseIntent(snapshot, execution, "set", { value });
     return { ...base, kind: "set", node, operation: "apply", value };
+  }
+  // Fan-out nodes are durable blueprints. They require the executor to
+  // resolve the source collection and materialize one execution per item;
+  // never silently dispatch the blueprint itself as an agent attempt.
+  if (node.type === "fanout") {
+    const base = baseIntent(snapshot, execution, "wait", { reason: "control-fanout-materialization-required" });
+    return {
+      ...base,
+      kind: "wait",
+      node,
+      operation: "await-agent",
+      reason: "control-fanout-materialization-required",
+    };
   }
   // Checkpoint/artifact leaves are intentionally data-only extension points.
   // Until their dedicated durable publication acknowledgements are supplied

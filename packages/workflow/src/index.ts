@@ -20,6 +20,8 @@ import {
   type CapabilityExecutionBinding,
   type JsonValue,
   type WorkflowMission,
+  WorkflowFanoutAggregationSchema,
+  type WorkflowFanoutAggregation,
   WorkflowStepDependenciesSchema,
 } from "@symphony/protocol";
 import { AgentCoordinator, idempotencyKey } from "@symphony/runtime";
@@ -70,6 +72,19 @@ export type AgentStep = z.infer<typeof CommonStepSchema> & {
 };
 export type SequenceStep = z.infer<typeof CommonStepSchema> & { type: "sequence"; steps: WorkflowStep[] };
 export type ParallelStep = z.infer<typeof CommonStepSchema> & { type: "parallel"; steps: WorkflowStep[] };
+/**
+ * Declarative map/fan-out. `itemTemplate` is compiled once as a blueprint;
+ * the durable executor materializes one concrete execution per source item.
+ * `null` concurrency is explicit unlimited concurrency, matching the agent
+ * and objective limit contracts.
+ */
+export type FanoutStep = z.infer<typeof CommonStepSchema> & {
+  type: "fanout";
+  source: string;
+  itemTemplate: WorkflowStep;
+  concurrency?: number | null | undefined;
+  aggregation?: WorkflowFanoutAggregation | undefined;
+};
 export type WhileStep = z.infer<typeof CommonStepSchema> & {
   type: "while";
   condition: Condition;
@@ -99,7 +114,7 @@ export type SignalStep = z.infer<typeof CommonStepSchema> & {
   expiresAfterMs?: number | null | undefined;
   payloadSchema?: Record<string, JsonValue> | undefined;
 };
-export type WorkflowStep = AgentStep | SequenceStep | ParallelStep | WhileStep | IfStep | SetStep | EvaluateStep | TimerStep | SignalStep;
+export type WorkflowStep = AgentStep | SequenceStep | ParallelStep | FanoutStep | WhileStep | IfStep | SetStep | EvaluateStep | TimerStep | SignalStep;
 
 export type Condition = {
   path: string;
@@ -125,6 +140,13 @@ const WorkflowStepSchema: z.ZodType<WorkflowStep> = z.lazy(() => z.discriminated
   }),
   CommonStepSchema.extend({ type: z.literal("sequence"), steps: z.array(WorkflowStepSchema).min(1) }),
   CommonStepSchema.extend({ type: z.literal("parallel"), steps: z.array(WorkflowStepSchema).min(1) }),
+  CommonStepSchema.extend({
+    type: z.literal("fanout"),
+    source: z.string().min(1).max(1_000),
+    itemTemplate: WorkflowStepSchema,
+    concurrency: z.number().int().positive().nullable().optional(),
+    aggregation: WorkflowFanoutAggregationSchema.optional(),
+  }).strict(),
   CommonStepSchema.extend({ type: z.literal("while"), condition: ConditionSchema, steps: z.array(WorkflowStepSchema).min(1), maxIterations: z.number().int().positive().optional() }),
   CommonStepSchema.extend({ type: z.literal("if"), condition: ConditionSchema, then: z.array(WorkflowStepSchema).min(1), else: z.array(WorkflowStepSchema).optional() }),
   CommonStepSchema.extend({ type: z.literal("set"), value: JsonValueSchema }),
@@ -241,6 +263,13 @@ export class WorkflowCompiler {
         ids.push(step.id);
         stepsById.set(step.id, step);
         if (step.type === "sequence" || step.type === "parallel" || step.type === "while") visit(step.steps);
+        // A fan-out template is a blueprint, not a second top-level step.
+        // Validate its shape through the recursive schema, while keeping its
+        // identity scoped to the fan-out for future materialization.
+        if (step.type === "fanout") {
+          if (step.source.trim() !== step.source) throw new Error(`Workflow fanout ${step.id} source path may not have surrounding whitespace.`);
+          if (step.source.length === 0) throw new Error(`Workflow fanout ${step.id} requires a source context path.`);
+        }
         if (step.type === "if") {
           visit(step.then);
           visit(step.else ?? []);
@@ -318,7 +347,15 @@ export class WorkflowLoader {
   }
 }
 
-type ExecutionContext = { input: JsonValue; steps: Record<string, JsonValue>; iteration: Record<string, number> };
+type ExecutionContext = {
+  input: JsonValue;
+  steps: Record<string, JsonValue>;
+  iteration: Record<string, number>;
+  /** Runtime bindings exposed to a fan-out item template. */
+  item?: JsonValue;
+  itemIndex?: number;
+  itemKey?: string;
+};
 
 function hasStepOutput(context: ExecutionContext, stepId: string): boolean {
   return Object.prototype.hasOwnProperty.call(context.steps, stepId);
@@ -694,6 +731,8 @@ export class WorkflowEngine {
       } else if (step.type === "parallel") {
         await this.executeSteps(step.steps, run, ir, context, `${scope}/${step.id}`, "parallel");
         output = Object.fromEntries(step.steps.map((child) => [child.id, context.steps[child.id] ?? null]));
+      } else if (step.type === "fanout") {
+        output = await this.executeFanout(step, run, ir, context, scope);
       } else if (step.type === "if") {
         const branch = evaluateCondition(step.condition, context) ? step.then : step.else ?? [];
         await this.executeSteps(branch, run, ir, context, `${scope}/${step.id}`);
@@ -742,6 +781,72 @@ export class WorkflowEngine {
       });
       throw error;
     }
+  }
+
+  /**
+   * Execute one durable child execution for every value in a runtime array.
+   *
+   * The parent attempt is deliberately kept running until every item has a
+   * completed child attempt. If the daemon stops in the middle, recovery
+   * enters this same method again; completed children replay from SQLite and
+   * an in-flight agent child reuses its persisted agent id. This makes the
+   * fan-out a real durable operation rather than a Promise.all convenience.
+   */
+  private async executeFanout(
+    step: FanoutStep,
+    run: WorkflowRunRecord,
+    ir: WorkflowIr,
+    context: ExecutionContext,
+    scope: string,
+  ): Promise<JsonValue> {
+    const source = getPath(context as unknown as JsonValue, step.source);
+    if (!Array.isArray(source)) {
+      throw new Error(`Workflow fanout ${step.id} source ${step.source} must resolve to an array.`);
+    }
+    if (source.length === 0) return aggregateFanoutResults([], [], step.aggregation);
+
+    // null means explicitly unlimited concurrency. A positive limit keeps
+    // large maps from creating an unbounded native-harness burst.
+    const concurrency = step.concurrency === null || step.concurrency === undefined
+      ? source.length
+      : Math.min(step.concurrency, source.length);
+    const outputs: JsonValue[] = Array.from({ length: source.length }, () => null);
+    const keys: string[] = Array.from({ length: source.length }, () => "");
+    const seenKeys = new Map<string, number>();
+    let nextIndex = 0;
+
+    const runItem = async (): Promise<void> => {
+      while (true) {
+        const index = nextIndex;
+        nextIndex += 1;
+        if (index >= source.length) return;
+        this.throwIfCancelled(run.id);
+
+        const item = source[index]!;
+        const baseKey = fanoutItemKey(item, index, step.aggregation?.keyPath);
+        const occurrence = (seenKeys.get(baseKey) ?? 0) + 1;
+        seenKeys.set(baseKey, occurrence);
+        // Preserve the useful user key for the first item, while making
+        // duplicate values independently addressable and replayable.
+        const key = occurrence === 1 ? baseKey : `${baseKey}#${occurrence}`;
+        keys[index] = key;
+
+        const itemContext: ExecutionContext = {
+          ...context,
+          steps: { ...context.steps },
+          iteration: { ...context.iteration },
+          item,
+          itemIndex: index,
+          itemKey: key,
+        };
+        const itemScope = `${scope}/${step.id}/item/${encodeURIComponent(key)}`;
+        await this.executeStep(step.itemTemplate, run, ir, itemContext, itemScope);
+        outputs[index] = itemContext.steps[step.itemTemplate.id] ?? null;
+      }
+    };
+
+    await Promise.all(Array.from({ length: concurrency }, () => runItem()));
+    return aggregateFanoutResults(outputs, keys, step.aggregation);
   }
 
   private async executeAgent(step: AgentStep, run: WorkflowRunRecord, ir: WorkflowIr, context: ExecutionContext, attempt: StepAttemptRecord): Promise<JsonValue> {
@@ -1082,7 +1187,7 @@ function interpolate(template: string, context: ExecutionContext): string {
 function interpolateJson(value: JsonValue, context: ExecutionContext): JsonValue {
   if (typeof value === "string") return interpolate(value, context);
   if (Array.isArray(value)) return value.map((item) => interpolateJson(item, context));
-  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, interpolateJson(item, context)]));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([key, item]) => [interpolate(key, context), interpolateJson(item, context)]));
   return value;
 }
 
@@ -1127,4 +1232,51 @@ function evaluateStep(step: EvaluateStep, context: ExecutionContext): JsonValue 
                 : actual <= target
           : false;
   return { actual: actual ?? null, target, operator, pass };
+}
+
+function fanoutItemKey(item: JsonValue, index: number, keyPath?: string): string {
+  const explicit = keyPath === undefined ? undefined : getPath(item, keyPath);
+  if (keyPath !== undefined && explicit === undefined) {
+    throw new Error(`Workflow fanout item is missing key path ${keyPath} at index ${index}.`);
+  }
+  const candidate = explicit ?? (
+    item && typeof item === "object" && !Array.isArray(item) &&
+      (typeof (item as Record<string, JsonValue>).id === "string" || typeof (item as Record<string, JsonValue>).id === "number")
+      ? (item as Record<string, JsonValue>).id
+      : undefined
+  );
+  if (typeof candidate === "string") return candidate;
+  if (typeof candidate === "number" || typeof candidate === "boolean" || candidate === null) return String(candidate);
+  if (candidate !== undefined) return stableStringify(candidate);
+  // Hash the canonical item instead of embedding arbitrary JSON in durable
+  // iteration keys. The index is only a final fallback for duplicate or
+  // otherwise unidentifiable primitive values.
+  if (item !== undefined) return createHash("sha256").update(stableStringify(item)).digest("hex").slice(0, 24);
+  return String(index);
+}
+
+function aggregateFanoutResults(
+  outputs: JsonValue[],
+  keys: string[],
+  aggregation?: WorkflowFanoutAggregation,
+): JsonValue {
+  const mode = aggregation?.mode ?? "array";
+  if (mode === "array") return outputs;
+  if (mode === "object") {
+    const result: Record<string, JsonValue> = {};
+    outputs.forEach((output, index) => {
+      const key = keys[index] ?? String(index);
+      if (Object.prototype.hasOwnProperty.call(result, key)) throw new Error(`Workflow fanout produced duplicate result key ${key}.`);
+      result[key] = output;
+    });
+    return result;
+  }
+  const merged: Record<string, JsonValue> = {};
+  outputs.forEach((output, index) => {
+    if (!output || typeof output !== "object" || Array.isArray(output)) {
+      throw new Error(`Workflow fanout merge requires object output at index ${index}.`);
+    }
+    Object.assign(merged, output);
+  });
+  return merged;
 }

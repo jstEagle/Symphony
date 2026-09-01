@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ChatService } from "../apps/daemon/src/index.js";
+import { ChatService, projectStoredBacklog } from "../apps/daemon/src/index.js";
 import { loadConfig } from "../packages/config/src/index.js";
 import { ConversationMessageSchema, nowIso, type AgentRecord } from "../packages/protocol/src/index.js";
 import { createStore, type ChatThreadRecord, type SymphonyStore } from "../packages/storage/src/index.js";
@@ -110,6 +110,35 @@ function saveOutputEvent(store: SymphonyStore, record: AgentRecord, text: string
 }
 
 describe("durable chat projection", () => {
+  it("rehydrates compact buffered chat events before SSE delivery", () => {
+    const { store } = fixture();
+    const timestamp = nowIso();
+    const message = ConversationMessageSchema.parse({
+      id: "buffered-message",
+      threadId: "buffered-thread",
+      role: "assistant",
+      streaming: false,
+      parts: [{ type: "text", text: "The durable answer survived the replay boundary." }],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+    store.appendConversationMessage(message);
+    const compact = store.appendEvent({
+      type: "chat.message.updated",
+      workflowId: "chat:buffered-thread",
+      runId: "chat-run:buffered-thread",
+      agentId: null,
+      occurredAt: timestamp,
+      payload: { threadId: message.threadId, messageId: message.id },
+      provenance: { source: "daemon" },
+    });
+
+    const projected = projectStoredBacklog(store, [compact]);
+    expect(projected).toHaveLength(1);
+    expect(projected[0]?.payload).toEqual({ threadId: message.threadId, message });
+    store.close();
+  });
+
   it("projects early text, tools, and output before conductor linkage without leaking across chats", () => {
     const { root, loaded, store } = fixture();
     // Establish the projector cursor, then stop its listener to model the

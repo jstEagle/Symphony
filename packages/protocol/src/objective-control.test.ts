@@ -145,6 +145,25 @@ describe("objective control snapshot validation", () => {
     expect(() => ObjectiveControlNodeSchema.parse({ ...evaluation, operator: "eq", op: "gte" })).toThrow(/agree/);
   });
 
+  it("accepts a data-only fanout blueprint and applies its unlimited default", () => {
+    const fanout = {
+      id: "fanout",
+      sourceNodeId: "fanout",
+      sourcePath: "steps.0",
+      dependsOn: [],
+      type: "fanout" as const,
+      source: "steps.items",
+      itemTemplate: node("item-template"),
+      aggregation: { mode: "array" as const },
+    };
+    expect(ObjectiveControlNodeSchema.parse(fanout)).toMatchObject({
+      ...fanout,
+      concurrency: null,
+    });
+    expect(() => ObjectiveControlNodeSchema.parse({ ...fanout, concurrency: 0 })).toThrow(/expected number to be >0/);
+    expect(() => ObjectiveControlNodeSchema.parse({ ...fanout, aggregation: { mode: "array", unsupported: true } })).toThrow(/unsupported/);
+  });
+
   it("accepts a complete snapshot and fences revision/source identity when available", () => {
     const { plan, revision, snapshot } = fixture();
     expect(() => validateObjectiveControlSnapshotAgainstPlan(plan, snapshot)).not.toThrow();
