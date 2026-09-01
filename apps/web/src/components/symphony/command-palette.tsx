@@ -5,6 +5,7 @@ import { Archive, Bell, ChartBar, Chats, FolderSimplePlus, Gear, MagnifyingGlass
 import { Dialog, DialogContent, DialogHeader, DialogTitle, type DialogHandle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { AgentLoader } from "@/components/symphony/agent-tool";
+import { useSidebar } from "@/components/ui/sidebar";
 import type { ConversationDirectory } from "@/lib/symphony/contracts";
 import { searchChats, type ChatSearchResponse } from "@/lib/symphony/runtime-client";
 import { rankFuzzyMatches, rankPaletteActions, type PaletteSearchAction } from "@/lib/symphony/palette-search";
@@ -43,6 +44,7 @@ export function CommandPalette({ open, onOpenChange, handle, directory, defaultG
   const [activeIndex, setActiveIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
   const searchGeneration = useRef(0);
+  const { isMobile, setOpenMobile } = useSidebar();
   const allChats = useMemo(() => directory.groups.flatMap((group) => group.conversations.map((conversation) => ({ conversation, group: group.title }))), [directory.groups]);
   const allChatsById = useMemo(
     () => new Map(allChats.map((item) => [item.conversation.id, item])),
@@ -116,7 +118,12 @@ export function CommandPalette({ open, onOpenChange, handle, directory, defaultG
       .map((item) => ({ ...item, snippet: "" }))).slice(0, 24);
   const items = [
     ...visibleActions.map((action) => ({ run: action.run })),
-    ...visibleChats.map((item) => ({ run: () => onSelectConversation(item.conversation.id) })),
+    ...visibleChats.map((item) => ({
+      run: () => {
+        onSelectConversation(item.conversation.id);
+        if (isMobile) setOpenMobile(false);
+      },
+    })),
   ];
   useEffect(() => {
     setActiveIndex((current) => Math.min(Math.max(0, items.length - 1), current));
@@ -160,7 +167,10 @@ export function CommandPalette({ open, onOpenChange, handle, directory, defaultG
             const result = remoteById.get(item.conversation.id);
             return <PaletteButton key={item.conversation.id} active={activeIndex === visibleActions.length + index} icon={Chats} label={item.conversation.title} detail={item.snippet || item.group}
               meta={result && search?.method === "openrouter-rerank" ? `${Math.round(result.score * 100)}%` : item.conversation.updatedLabel}
-              onClick={() => execute(() => onSelectConversation(item.conversation.id))} />;
+              onClick={() => execute(() => {
+                onSelectConversation(item.conversation.id);
+                if (isMobile) setOpenMobile(false);
+              })} />;
           })}</PaletteSection> : null}
           {!loading && visibleActions.length === 0 && visibleChats.length === 0 ? <div className="grid min-h-36 place-items-center px-6 text-center text-xs text-muted-foreground"><div><Archive className="mx-auto mb-2 size-5" />No matching command or chat</div></div> : null}
         </div>
