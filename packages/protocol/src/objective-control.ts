@@ -283,6 +283,44 @@ export type ObjectiveControlNode =
   | ObjectiveControlCheckpointNode
   | ObjectiveControlArtifactNode;
 
+/**
+ * Visit every node in a control tree, optionally including dynamic fan-out
+ * templates. Templates are blueprints rather than materialized executions,
+ * so callers that validate policy/budget should opt in explicitly while
+ * execution/snapshot callers can retain the default concrete-only walk.
+ */
+export type ObjectiveControlNodeVisit = Readonly<{
+  node: ObjectiveControlNode;
+  path: readonly (string | number)[];
+  depth: number;
+  isFanoutTemplate: boolean;
+}>;
+
+export function walkObjectiveControlNodes(
+  root: ObjectiveControlNode,
+  options: { includeFanoutTemplates?: boolean } = {},
+): ObjectiveControlNodeVisit[] {
+  const visits: ObjectiveControlNodeVisit[] = [];
+  const walk = (
+    node: ObjectiveControlNode,
+    path: readonly (string | number)[],
+    depth: number,
+    isFanoutTemplate: boolean,
+  ): void => {
+    visits.push({ node, path, depth, isFanoutTemplate });
+    if (node.type === "sequence" || node.type === "parallel" || node.type === "while") {
+      node.steps.forEach((child, index) => walk(child, [...path, "steps", index], depth + 1, isFanoutTemplate));
+    } else if (node.type === "if") {
+      node.then.forEach((child, index) => walk(child, [...path, "then", index], depth + 1, isFanoutTemplate));
+      node.else?.forEach((child, index) => walk(child, [...path, "else", index], depth + 1, isFanoutTemplate));
+    } else if (node.type === "fanout" && options.includeFanoutTemplates) {
+      walk(node.itemTemplate, [...path, "itemTemplate"], depth + 1, true);
+    }
+  };
+  walk(root, ["root"], 1, false);
+  return visits;
+}
+
 const ObjectiveControlNodeSchema: z.ZodType<ObjectiveControlNode> = z.lazy(() =>
   z.discriminatedUnion("type", [
     ObjectiveControlNodeBaseSchema.extend({
@@ -377,28 +415,29 @@ function addControlPlanGraphIssues(
   context: z.RefinementCtx,
 ): void {
   const nodes = new Map<string, { node: ObjectiveControlNode; path: (string | number)[]; depth: number }>();
-  const walk = (node: ObjectiveControlNode, path: (string | number)[], depth: number): void => {
-    if (nodes.has(node.id)) {
-      context.addIssue({
-        code: "custom",
-        path: [...path, "id"],
-        message: `Duplicate objective control node id: ${node.id}`,
-      });
-      return;
+  const visits = walkObjectiveControlNodes(plan.root, { includeFanoutTemplates: true });
+  for (const visit of visits) {
+    const { node, path, depth } = visit;
+    // Fan-out templates are scoped blueprints. Their ids must not collide
+    // with executable nodes in the surrounding plan, but their structure and
+    // policy cost still count toward immutable plan limits below.
+    if (!visit.isFanoutTemplate) {
+      if (nodes.has(node.id)) {
+        context.addIssue({
+          code: "custom",
+          path: [...path, "id"],
+          message: `Duplicate objective control node id: ${node.id}`,
+        });
+      } else {
+        nodes.set(node.id, { node, path: [...path], depth });
+      }
     }
-    nodes.set(node.id, { node, path, depth });
     if (plan.limits.maxDepth !== null && depth > plan.limits.maxDepth) {
       context.addIssue({
         code: "custom",
-        path,
+        path: [...path],
         message: `Objective control plan exceeds maxDepth ${plan.limits.maxDepth} at ${node.id}`,
       });
-    }
-    if (node.type === "sequence" || node.type === "parallel" || node.type === "while") {
-      node.steps.forEach((child, index) => walk(child, [...path, "steps", index], depth + 1));
-    } else if (node.type === "if") {
-      node.then.forEach((child, index) => walk(child, [...path, "then", index], depth + 1));
-      node.else?.forEach((child, index) => walk(child, [...path, "else", index], depth + 1));
     }
     if (node.type === "while" && plan.limits.maxLoopIterations !== null && node.maxIterations > plan.limits.maxLoopIterations) {
       context.addIssue({
@@ -407,14 +446,13 @@ function addControlPlanGraphIssues(
         message: `Loop ${node.id} exceeds maxLoopIterations ${plan.limits.maxLoopIterations}`,
       });
     }
-  };
-  walk(plan.root, ["root"], 1);
+  }
 
-  if (plan.limits.maxNodes !== null && nodes.size > plan.limits.maxNodes) {
+  if (plan.limits.maxNodes !== null && visits.length > plan.limits.maxNodes) {
     context.addIssue({
       code: "custom",
       path: ["root"],
-      message: `Objective control plan has ${nodes.size} nodes; maxNodes is ${plan.limits.maxNodes}`,
+      message: `Objective control plan has ${visits.length} nodes; maxNodes is ${plan.limits.maxNodes}`,
     });
   }
 

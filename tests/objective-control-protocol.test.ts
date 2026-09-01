@@ -11,6 +11,7 @@ import {
   objectiveControlStableJson,
   parseObjectiveControlPlan,
   validateObjectiveControlMutationTarget,
+  walkObjectiveControlNodes,
 } from "../packages/protocol/src/objective-control.js";
 
 const source = {
@@ -173,6 +174,24 @@ describe("objective control-plan protocol", () => {
       maxIterations: 4,
       steps: [agent("body", "steps.0")],
     }, { maxLoopIterations: 3 }))).toThrow(/maxLoopIterations/);
+  });
+
+  it("counts and exposes fanout templates for policy traversal", () => {
+    const parsed = ObjectiveControlPlanSchema.parse(plan({
+      ...identity("root"),
+      type: "sequence",
+      steps: [{
+        ...identity("map", "steps.0"),
+        type: "fanout" as const,
+        source: "files",
+        concurrency: null,
+        itemTemplate: agent("item", "steps.0.itemTemplate"),
+      }],
+    }));
+    const visits = walkObjectiveControlNodes(parsed.root, { includeFanoutTemplates: true });
+    expect(visits.map((visit) => visit.node.id)).toEqual(["root", "map", "item"]);
+    expect(visits.map((visit) => visit.isFanoutTemplate)).toEqual([false, false, true]);
+    expect(() => ObjectiveControlPlanSchema.parse(plan(parsed.root, { maxNodes: 2 }))).toThrow(/maxNodes/);
   });
 
   it("preserves deterministic source paths and distinct loop execution identities", () => {
