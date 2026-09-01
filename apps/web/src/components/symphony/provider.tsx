@@ -441,6 +441,11 @@ export function SymphonyProvider({ children, windowId = "main:server" }: { child
     refetchOnWindowFocus: true,
   });
 
+  useEffect(() => {
+    if (!runEventsQuery.error) return;
+    setActionError(runEventsQuery.error instanceof Error ? runEventsQuery.error.message : String(runEventsQuery.error));
+  }, [runEventsQuery.error]);
+
   const inbox = useMemo(() => {
     if (!envelope) return [];
     if (envelope.mode === "preview") {
@@ -488,12 +493,17 @@ export function SymphonyProvider({ children, windowId = "main:server" }: { child
     let cancelled = false;
     void fetchThread(activeConversation.id)
       .then((detail) => {
-        if (!cancelled) setThreadMessages({ threadId: activeConversation.id, messages: detail.messages });
-      })
-      .catch(() => {
         if (!cancelled) {
-          setThreadMessages({ threadId: activeConversation.id, messages: [] });
+          setThreadMessages({ threadId: activeConversation.id, messages: detail.messages });
+          setActionError(null);
         }
+      })
+      .catch((error: unknown) => {
+        // Preserve the last durable projection on transient daemon/harness
+        // failures. Rendering an empty transcript makes a real outage look
+        // like data loss; the shared error surface now explains the retryable
+        // failure while the next runtime epoch refetches it.
+        if (!cancelled) setActionError(error instanceof Error ? error.message : String(error));
       });
     return () => {
       cancelled = true;
