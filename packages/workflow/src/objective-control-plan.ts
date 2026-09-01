@@ -1143,7 +1143,7 @@ function resolveFanoutItems(
   node: ObjectiveControlFanoutNode,
   snapshot: ObjectiveControlPlanSnapshot,
   scope?: ObjectiveControlFanoutScope,
-): ObjectiveControlFanoutItem[] {
+): ObjectiveControlFanoutValue[] {
   const source = getPath(contextFromSnapshot(snapshot, scope), node.source);
   if (!Array.isArray(source)) throw new Error(`Objective fan-out ${node.id} source ${node.source} must resolve to an array.`);
   const seen = new Map<string, number>();
@@ -1155,14 +1155,14 @@ function resolveFanoutItems(
   });
 }
 
-function fanoutSourceHash(node: ObjectiveControlFanoutNode, items: readonly ObjectiveControlFanoutItem[]): string {
+function fanoutSourceHash(node: ObjectiveControlFanoutNode, items: readonly ObjectiveControlFanoutValue[]): string {
   return sha256({ nodeId: node.id, source: node.source, items });
 }
 
 function fanoutItemExecutionKey(
   fanoutExecution: ObjectiveControlExecutionKey,
   node: ObjectiveControlFanoutNode,
-  item: ObjectiveControlFanoutItem,
+  item: ObjectiveControlFanoutValue,
 ): ObjectiveControlExecutionKey {
   return key(
     node.itemTemplate.id,
