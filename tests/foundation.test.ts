@@ -299,4 +299,55 @@ describe("protocol and durable storage", () => {
     expect(new Set(ids).size).toBe(7);
     store.close();
   });
+
+  it("keeps a moving agent visible across a paginated read snapshot", () => {
+    const directory = mkdtempSync(join(tmpdir(), "symphony-store-agent-snapshot-"));
+    temporary.push(directory);
+    const path = join(directory, "state.sqlite");
+    const store = new SymphonyStore(path);
+    const concurrentStore = new SymphonyStore(path);
+    const timestamp = new Date().toISOString();
+    for (let index = 0; index < 5; index += 1) {
+      const id = `agent-${String(index).padStart(2, "0")}`;
+      store.saveAgent({
+        id,
+        logicalAgentId: `logical-${id}`,
+        workflowId: "workflow",
+        runId: "run",
+        parentAgentId: null,
+        depth: 0,
+        objective: `Snapshot agent ${index}.`,
+        missionHash: "12345678",
+        requestedHarness: "codex",
+        requestedModel: "fixture",
+        harness: "codex",
+        model: "fixture",
+        permissions: "read-only",
+        status: "completed",
+        nativeSessionId: `native-${id}`,
+        nativeRunId: `native-run-${id}`,
+        workspacePath: directory,
+        output: {},
+        error: null,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        startedAt: timestamp,
+        finishedAt: timestamp,
+      });
+    }
+
+    const ids = store.readTransaction(() => {
+      const first = store.listAgentPage({ limit: 2 });
+      const moving = concurrentStore.getAgent("agent-02");
+      expect(moving).not.toBeNull();
+      concurrentStore.saveAgent({ ...moving!, status: "running", updatedAt: new Date(Date.parse(timestamp) + 1_000).toISOString() });
+      const second = store.listAgentPage({ limit: 2, cursor: first.nextCursor! });
+      return [...first.agents, ...second.agents].map((agent) => agent.id);
+    });
+
+    expect(ids).toContain("agent-02");
+    expect(new Set(ids).size).toBe(4);
+    concurrentStore.close();
+    store.close();
+  });
 });

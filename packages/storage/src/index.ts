@@ -1986,6 +1986,25 @@ export class SymphonyStore {
     return result;
   }
 
+  /**
+   * Run a multi-query read against one SQLite snapshot. Keyset pagination
+   * orders by mutable lifecycle fields, so each page must observe the same
+   * database state or a row updated between pages can move above the cursor
+   * and be silently omitted.
+   */
+  readTransaction<T>(callback: () => T): T {
+    if (this.database.isTransaction) return callback();
+    this.database.exec("BEGIN");
+    try {
+      const result = callback();
+      this.database.exec("COMMIT");
+      return result;
+    } catch (error) {
+      this.database.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   durableTransaction<T>(callback: () => T): T {
     // An outer transaction already owns the commit boundary and synchronous
     // mode cannot be changed while it is active.

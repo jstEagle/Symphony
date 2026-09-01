@@ -1392,18 +1392,20 @@ export class AgentCoordinator {
     // authority path instead of inheriting storage's bounded convenience
     // default (1,000 rows), which silently hid older agents from MCP and
     // direct `/v1/agents` consumers once a graph grew past that size.
-    const agents: AgentRecord[] = [];
-    let cursor: AgentListCursor | undefined;
-    do {
-      const page = this.store.listAgentPage({
-        ...options,
-        limit: 1_000,
-        ...(cursor ? { cursor } : {}),
-      });
-      agents.push(...page.agents);
-      cursor = page.nextCursor ?? undefined;
-    } while (cursor);
-    return agents;
+    return this.store.readTransaction(() => {
+      const agents: AgentRecord[] = [];
+      let cursor: AgentListCursor | undefined;
+      do {
+        const page = this.store.listAgentPage({
+          ...options,
+          limit: 1_000,
+          ...(cursor ? { cursor } : {}),
+        });
+        agents.push(...page.agents);
+        cursor = page.nextCursor ?? undefined;
+      } while (cursor);
+      return agents;
+    });
   }
 
   get(agentId: string): AgentRecord {
@@ -2044,17 +2046,20 @@ export class AgentCoordinator {
     this.failClosedUnknownSteeringDispatches();
     await this.retireControllerLostProcessLeases();
     const retirementIntents = this.pendingSessionRetirementIntents();
-    const agents: AgentRecord[] = [];
-    let pageCursor: AgentListCursor | undefined;
-    do {
-      const page = this.store.listAgentPage({
-        activeOnly: true,
-        limit: 250,
-        ...(pageCursor ? { cursor: pageCursor } : {}),
-      });
-      agents.push(...page.agents);
-      pageCursor = page.nextCursor ?? undefined;
-    } while (pageCursor);
+    const agents = this.store.readTransaction(() => {
+      const listed: AgentRecord[] = [];
+      let pageCursor: AgentListCursor | undefined;
+      do {
+        const page = this.store.listAgentPage({
+          activeOnly: true,
+          limit: 250,
+          ...(pageCursor ? { cursor: pageCursor } : {}),
+        });
+        listed.push(...page.agents);
+        pageCursor = page.nextCursor ?? undefined;
+      } while (pageCursor);
+      return listed;
+    });
     const activeIds = new Set(agents.map((agent) => agent.id));
     for (const agentId of this.adoptableProcessLeases.keys()) {
       if (activeIds.has(agentId)) continue;
