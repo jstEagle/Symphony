@@ -338,6 +338,10 @@ export class ObjectiveSupervisionRunner {
           summary: `Evaluation ${intent.metric} resolved from durable snapshot context.`,
         },
       } : {}),
+      ...(intent.kind === "fanout" ? {
+        sourceHash: intent.sourceHash,
+        fanoutItems: intent.items,
+      } : {}),
     };
     const approvalPolicy = run.policy?.approvalPolicy ?? run.spec.approvalPolicy;
     if (intent.kind === "complete" && approvalPolicy.mode === "before-completion") {

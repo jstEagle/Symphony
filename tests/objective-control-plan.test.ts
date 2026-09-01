@@ -101,6 +101,72 @@ function finish(plan: ReturnType<typeof compileObjectiveControlPlan>, snapshot: 
 }
 
 describe("objective control plan compiler and reducer", () => {
+  it("materializes objective fan-out items durably and reduces them in source order", () => {
+    const { plan, snapshot: initial } = fixture([
+      {
+        id: "map-items",
+        type: "fanout",
+        source: "items",
+        concurrency: 1,
+        aggregation: { mode: "array" },
+        itemTemplate: agent("item-worker", "Process {{ item.id }} ({{ itemKey }})."),
+      },
+    ], { items: [{ id: "a" }, { id: "b" }] });
+    let snapshot = ack(plan, initial);
+    let intent = nextObjectiveControlIntent(plan, snapshot);
+    expect(intent.kind).toBe("fanout");
+    if (intent.kind !== "fanout") return;
+    expect(intent.operation).toBe("materialize");
+    snapshot = applyObjectiveControlAcknowledgement(plan, snapshot, {
+      kind: "fanout",
+      intentId: intent.intentId,
+      requestKey: "fanout-materialize-1",
+      sourceHash: intent.sourceHash,
+      fanoutItems: intent.items,
+      now,
+    });
+    expect(snapshot.executions.filter((entry) => entry.fanoutScope)).toHaveLength(2);
+    expect(snapshot.frontier).toHaveLength(1);
+
+    intent = nextObjectiveControlIntent(plan, snapshot);
+    expect(intent.kind).toBe("agent");
+    if (intent.kind !== "agent") return;
+    snapshot = applyObjectiveControlAcknowledgement(plan, snapshot, {
+      kind: "agent",
+      intentId: intent.intentId,
+      requestKey: "fanout-agent-a",
+      attemptId: intent.attemptId,
+      state: "completed",
+      output: { result: "A" },
+      now,
+    });
+    intent = nextObjectiveControlIntent(plan, snapshot);
+    expect(intent.kind).toBe("agent");
+    if (intent.kind !== "agent") return;
+    snapshot = applyObjectiveControlAcknowledgement(plan, snapshot, {
+      kind: "agent",
+      intentId: intent.intentId,
+      requestKey: "fanout-agent-b",
+      attemptId: intent.attemptId,
+      state: "completed",
+      output: { result: "B" },
+      now,
+    });
+    intent = nextObjectiveControlIntent(plan, snapshot);
+    expect(intent.kind).toBe("fanout");
+    if (intent.kind !== "fanout") return;
+    expect(intent.operation).toBe("join");
+    snapshot = applyObjectiveControlAcknowledgement(plan, snapshot, {
+      kind: "fanout",
+      intentId: intent.intentId,
+      requestKey: "fanout-join-1",
+      sourceHash: intent.sourceHash,
+      fanoutItems: intent.items,
+      now,
+    });
+    expect(snapshot.executions.find((entry) => entry.key.nodeId === "map-items")?.output).toEqual([{ result: "A" }, { result: "B" }]);
+  });
+
   it("pins the saved workflow tree without flattening control flow", () => {
     const { plan } = fixture([
       {
