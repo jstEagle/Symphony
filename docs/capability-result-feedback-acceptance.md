@@ -16,11 +16,16 @@ The gate invokes the production `ObjectiveFeedbackReducer` and
 the existing capability admission and values-charter contracts. The harness
 does not add a test-only reducer or depend on provider credentials.
 
-The acceptance test currently drives the reducer and its durable SQLite
-repository directly because no daemon HTTP feedback route is exposed yet. If a
-route is added, the same scenarios should be run through that boundary as a
-second live adapter; the direct reducer/storage gate remains useful for
-isolating protocol and persistence regressions.
+The daemon exposes an authenticated HTTP submission route at
+`POST /v1/capability-result-feedback`. That route validates the content hash,
+binds the idempotency key, and durably records the accepted feedback. The
+separate objective-supervisor boundary can consume accepted records through
+`ObjectiveSupervisionRunner.processCapabilityResultFeedback`, where the
+deterministic reducer can checkpoint progress, request approval, finish, or
+open attention. Keeping submission and application separate prevents an
+untrusted adapter from mutating an objective directly; the direct
+reducer/storage gate remains useful for isolating protocol and persistence
+regressions.
 
 The completed gate must demonstrate:
 
