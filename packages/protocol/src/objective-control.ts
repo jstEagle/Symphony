@@ -866,11 +866,13 @@ function objectiveControlExecutionNode(
   nodes: Map<string, ObjectiveControlNode>,
   executions: Map<string, ObjectiveControlExecutionRecord>,
   execution: ObjectiveControlExecutionRecord,
+  trail: Set<string> = new Set(),
 ): ObjectiveControlNode | undefined {
-  const direct = nodes.get(execution.key.nodeId);
-  if (direct) return direct;
+  const executionId = objectiveControlExecutionId(execution.key);
+  if (trail.has(executionId)) throw new Error(`Objective control fan-out scope cycle detected at ${executionId}`);
+  const nextTrail = new Set(trail).add(executionId);
   const scope = execution.fanoutScope;
-  if (!scope) return undefined;
+  if (!scope) return nodes.get(execution.key.nodeId);
 
   const parentExecution = executions.get(objectiveControlExecutionId(scope.fanoutExecution));
   if (!parentExecution) {
@@ -884,7 +886,7 @@ function objectiveControlExecutionNode(
   ) {
     throw new Error(`Objective control fan-out scope for ${objectiveControlExecutionId(execution.key)} does not match its parent execution`);
   }
-  const fanoutNode = nodes.get(parentExecution.key.nodeId);
+  const fanoutNode = objectiveControlExecutionNode(nodes, executions, parentExecution, nextTrail);
   if (!fanoutNode || fanoutNode.type !== "fanout") {
     throw new Error(`Objective control fan-out scope ${objectiveControlExecutionId(execution.key)} does not point to a fan-out node`);
   }
