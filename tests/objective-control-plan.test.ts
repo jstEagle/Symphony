@@ -190,6 +190,53 @@ describe("objective control plan compiler and reducer", () => {
     expect(snapshot.executions.find((entry) => entry.key.nodeId === "map-items")?.state).toBe("failed");
   });
 
+  it("resolves nested fan-out templates from their durable parent scopes", () => {
+    const { plan, snapshot: initial } = fixture([
+      {
+        id: "outer-map",
+        type: "fanout",
+        source: "items",
+        itemTemplate: {
+          id: "inner-map",
+          type: "fanout",
+          source: "item.children",
+          concurrency: 1,
+          itemTemplate: agent("leaf-worker", "Process {{ item.id }} from {{ itemKey }}."),
+        },
+      },
+    ], { items: [{ id: "parent", children: [{ id: "child" }] }] });
+    let snapshot = ack(plan, initial);
+    let intent = nextObjectiveControlIntent(plan, snapshot);
+    expect(intent.kind).toBe("fanout");
+    if (intent.kind !== "fanout") return;
+    snapshot = applyObjectiveControlAcknowledgement(plan, snapshot, {
+      kind: "fanout",
+      intentId: intent.intentId,
+      requestKey: "nested-outer-materialize",
+      sourceHash: intent.sourceHash,
+      fanoutItems: intent.items,
+      now,
+    });
+    intent = nextObjectiveControlIntent(plan, snapshot);
+    expect(intent.kind).toBe("fanout");
+    if (intent.kind !== "fanout") return;
+    expect(intent.node.id).toBe("inner-map");
+    expect(intent.items).toEqual([{ index: 0, key: "child", value: { id: "child" } }]);
+    snapshot = applyObjectiveControlAcknowledgement(plan, snapshot, {
+      kind: "fanout",
+      intentId: intent.intentId,
+      requestKey: "nested-inner-materialize",
+      sourceHash: intent.sourceHash,
+      fanoutItems: intent.items,
+      now,
+    });
+    intent = nextObjectiveControlIntent(plan, snapshot);
+    expect(intent.kind).toBe("agent");
+    if (intent.kind !== "agent") return;
+    expect(intent.node.id).toBe("leaf-worker");
+    expect(intent.objective).toBe("Process child from child.");
+  });
+
   it("pins the saved workflow tree without flattening control flow", () => {
     const { plan } = fixture([
       {

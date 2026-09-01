@@ -666,10 +666,30 @@ function findNodeInTree(root: ObjectiveControlNode, nodeId: string): ObjectiveCo
 function fanoutTemplateNode(
   plan: ObjectiveControlPlan,
   scope: ObjectiveControlFanoutScope,
+  snapshot: ObjectiveControlPlanSnapshot,
+  trail: Set<string> = new Set(),
 ): ObjectiveControlNode | null {
-  const fanout = nodeMap(plan).get(scope.fanoutExecution.nodeId);
+  const fanoutExecutionId = objectiveControlExecutionId(scope.fanoutExecution);
+  if (trail.has(fanoutExecutionId)) throw new Error(`Objective control fan-out scope cycle detected at ${fanoutExecutionId}`);
+  const nextTrail = new Set(trail).add(fanoutExecutionId);
+  const parentRecord = recordFor(snapshot, scope.fanoutExecution);
+  const fanout = parentRecord?.fanoutScope
+    ? fanoutTemplateNode(plan, parentRecord.fanoutScope, snapshot, nextTrail)
+    : nodeMap(plan).get(scope.fanoutExecution.nodeId) ?? null;
   if (!fanout || fanout.type !== "fanout") return null;
   return findNodeInTree(fanout.itemTemplate, scope.templateNodeId);
+}
+
+function fanoutNodeForExecution(
+  plan: ObjectiveControlPlan,
+  execution: ObjectiveControlExecutionKey,
+  snapshot: ObjectiveControlPlanSnapshot,
+): ObjectiveControlFanoutNode | null {
+  const record = recordFor(snapshot, execution);
+  const node = record?.fanoutScope
+    ? fanoutTemplateNode(plan, record.fanoutScope, snapshot)
+    : nodeMap(plan).get(execution.nodeId);
+  return node?.type === "fanout" ? node : null;
 }
 
 function nodeForExecution(
@@ -679,7 +699,7 @@ function nodeForExecution(
 ): ObjectiveControlNode | undefined {
   const record = recordFor(snapshot, execution);
   if (record?.fanoutScope) {
-    const templateNode = fanoutTemplateNode(plan, record.fanoutScope);
+    const templateNode = fanoutTemplateNode(plan, record.fanoutScope, snapshot);
     if (templateNode) return templateNode;
   }
   return nodeMap(plan).get(execution.nodeId);
@@ -811,10 +831,10 @@ function parentRelationFor(
   snapshot?: ObjectiveControlPlanSnapshot,
 ): ParentRelation | null {
   const scope = snapshot ? recordFor(snapshot, execution)?.fanoutScope : undefined;
-  if (!scope) return findParentRelation(plan, execution.nodeId);
+  if (!snapshot || !scope) return findParentRelation(plan, execution.nodeId);
   if (execution.nodeId === scope.templateNodeId) return { parentId: scope.fanoutExecution.nodeId, kind: "fanout" };
-  const fanout = nodeMap(plan).get(scope.fanoutExecution.nodeId);
-  if (!fanout || fanout.type !== "fanout") return null;
+  const fanout = fanoutNodeForExecution(plan, scope.fanoutExecution, snapshot);
+  if (!fanout) return null;
   return findParentRelationInTree(fanout.itemTemplate, execution.nodeId);
 }
 
