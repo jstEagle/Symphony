@@ -34,6 +34,7 @@ records.
 | Dynamic plan mutation | PASS | Typed mutation target validation, dependency insertion, and evidence cursor preservation |
 | Dependency-gated frontier | PASS | A conductor-authored dependency keeps the second parallel child queued until its prerequisite completes |
 | Per-agent approval gate | PASS | `requiresApproval` yields an approval intent before dispatch and resumes after approval |
+| Durable objective fan-out | PASS | Source items materialize as scoped executions, honor local concurrency, preserve source order, and fail-fast cancel siblings |
 | Budget/evidence-gated completion | PASS | Budget limits parse and false required evidence cannot produce success |
 | Frontend-as-projection semantics | PASS | Web projection scopes events by exact run identity and derives the control-room lane |
 
@@ -58,5 +59,9 @@ explicitly rather than treating an unconstrained expansion as a pass.
   run.
 - Completion requires all tasks to settle and every required criterion to pass;
   evidence cursors and budget limits remain explicit inputs.
+- Dynamic fan-out is durable: each item has a stable execution path and item
+  scope, queued work advances after terminal events, and a failed item cancels
+  siblings before the parent fails. Composite item templates remain an
+  explicit follow-up boundary rather than being silently treated as agents.
 - The browser is a read-only projection of run-scoped durable records and
   events. It never infers another run's state from arbitrary payload IDs.
