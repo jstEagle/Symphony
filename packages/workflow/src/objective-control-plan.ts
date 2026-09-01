@@ -38,6 +38,10 @@ import {
   ObjectiveControlSignalDeliveryInputSchema,
   ObjectiveControlSuspensionRecordSchema,
   objectiveControlSubscriptionKey,
+  ObjectiveControlFanoutValueSchema,
+  type ObjectiveControlFanoutValue,
+  type ObjectiveControlFanoutScope,
+  type WorkflowFanoutAggregation,
   type ObjectiveControlSignalDeliveryInput,
   type ObjectiveControlSignalSuspension,
   type ObjectiveControlTimerSuspension,
@@ -147,7 +151,7 @@ function mapAgent(step: AgentStep, sourcePath: string): ObjectiveControlAgentNod
 
 type ParentRelation = Readonly<{
   parentId: string;
-  kind: "sequence" | "parallel" | "if" | "while";
+  kind: "sequence" | "parallel" | "if" | "while" | "fanout";
 }>;
 
 function mapStep(
@@ -377,7 +381,11 @@ function key(nodeId: string, iterationKey: string): ObjectiveControlExecutionKey
   return { nodeId, iterationKey };
 }
 
-function emptyExecution(executionKey: ObjectiveControlExecutionKey, state: ObjectiveControlNodeState = "queued"): ObjectiveControlExecutionRecord {
+function emptyExecution(
+  executionKey: ObjectiveControlExecutionKey,
+  state: ObjectiveControlNodeState = "queued",
+  fanoutScope?: ObjectiveControlFanoutScope,
+): ObjectiveControlExecutionRecord {
   return {
     key: executionKey,
     state,
@@ -388,6 +396,7 @@ function emptyExecution(executionKey: ObjectiveControlExecutionKey, state: Objec
     startedAt: null,
     finishedAt: null,
     contextRefs: [],
+    ...(fanoutScope === undefined ? {} : { fanoutScope }),
   };
 }
 
@@ -477,6 +486,16 @@ export type ObjectiveControlEvaluateIntent = ObjectiveControlIntentBase & Readon
   pass: boolean;
   output: ObjectiveControlEvaluation;
 }>;
+export type ObjectiveControlFanoutIntent = ObjectiveControlIntentBase & Readonly<{
+  kind: "fanout";
+  node: ObjectiveControlFanoutNode;
+  operation: "materialize" | "wait";
+  source: string;
+  sourceHash: string;
+  items: ObjectiveControlFanoutValue[];
+  concurrency: number | null;
+  aggregation?: WorkflowFanoutAggregation | undefined;
+}>;
 export type ObjectiveControlAgentIntent = ObjectiveControlIntentBase & Readonly<{
   kind: "agent";
   node: ObjectiveControlAgentNode;
@@ -533,6 +552,7 @@ export type ObjectiveControlIntent =
   | ObjectiveControlWhileIntent
   | ObjectiveControlSetIntent
   | ObjectiveControlEvaluateIntent
+  | ObjectiveControlFanoutIntent
   | ObjectiveControlAgentIntent
   | ObjectiveControlJoinIntent
   | ObjectiveControlCompleteIntent
@@ -551,7 +571,7 @@ export type ObjectiveControlAcknowledgementBase = Readonly<{
 
 /** Validate acknowledgements at the reducer boundary before any projection mutation. */
 export const ObjectiveControlAcknowledgementSchema = z.object({
-  kind: z.enum(["sequence", "parallel", "if", "while", "set", "evaluate", "agent", "join", "complete", "wait", "timer", "signal"]),
+  kind: z.enum(["sequence", "parallel", "if", "while", "set", "evaluate", "fanout", "agent", "join", "complete", "wait", "timer", "signal"]),
   intentId: z.string().min(1).max(2_048),
   requestKey: z.string().min(8).max(2_048),
   eventCursor: z.number().int().nonnegative().optional(),
@@ -580,6 +600,9 @@ export const ObjectiveControlAcknowledgementSchema = z.object({
   subscriptionKey: z.string().min(1).max(512).optional(),
   deliveryId: z.string().min(1).optional(),
   payload: JsonValueSchema.optional(),
+  /** Echoed immutable materialization payload for a fan-out acknowledgement. */
+  fanoutItems: z.array(ObjectiveControlFanoutValueSchema).max(1_024).optional(),
+  sourceHash: z.string().min(8).max(256).optional(),
 }).strict();
 export type ObjectiveControlAcknowledgement = z.infer<typeof ObjectiveControlAcknowledgementSchema>;
 
@@ -622,7 +645,47 @@ function nodeMap(plan: ObjectiveControlPlan): Map<string, ObjectiveControlNode> 
   return result;
 }
 
-function contextFromSnapshot(snapshot: ObjectiveControlPlanSnapshot): JsonValue {
+function findNodeInTree(root: ObjectiveControlNode, nodeId: string): ObjectiveControlNode | null {
+  if (root.id === nodeId) return root;
+  if (root.type === "sequence" || root.type === "parallel" || root.type === "while") {
+    for (const child of root.steps) {
+      const found = findNodeInTree(child, nodeId);
+      if (found) return found;
+    }
+  } else if (root.type === "if") {
+    for (const child of [...root.then, ...(root.else ?? [])]) {
+      const found = findNodeInTree(child, nodeId);
+      if (found) return found;
+    }
+  } else if (root.type === "fanout") {
+    return findNodeInTree(root.itemTemplate, nodeId);
+  }
+  return null;
+}
+
+function fanoutTemplateNode(
+  plan: ObjectiveControlPlan,
+  scope: ObjectiveControlFanoutScope,
+): ObjectiveControlNode | null {
+  const fanout = nodeMap(plan).get(scope.fanoutExecution.nodeId);
+  if (!fanout || fanout.type !== "fanout") return null;
+  return findNodeInTree(fanout.itemTemplate, scope.templateNodeId);
+}
+
+function nodeForExecution(
+  plan: ObjectiveControlPlan,
+  execution: ObjectiveControlExecutionKey,
+  snapshot: ObjectiveControlPlanSnapshot,
+): ObjectiveControlNode | undefined {
+  const record = recordFor(snapshot, execution);
+  if (record?.fanoutScope) {
+    const templateNode = fanoutTemplateNode(plan, record.fanoutScope);
+    if (templateNode) return templateNode;
+  }
+  return nodeMap(plan).get(execution.nodeId);
+}
+
+function contextFromSnapshot(snapshot: ObjectiveControlPlanSnapshot, fanoutScope?: ObjectiveControlFanoutScope): JsonValue {
   const context: Record<string, JsonValue> = { ...(snapshot.context ?? {}) };
   const steps: Record<string, JsonValue> = {};
   for (const execution of snapshot.executions) {
@@ -632,7 +695,9 @@ function contextFromSnapshot(snapshot: ObjectiveControlPlanSnapshot): JsonValue 
       steps[execution.key.nodeId] = execution.output;
     }
   }
-  return { ...context, steps };
+  return fanoutScope
+    ? { ...context, steps, item: fanoutScope.item, itemIndex: fanoutScope.itemIndex, itemKey: fanoutScope.itemKey }
+    : { ...context, steps };
 }
 
 function getPath(root: JsonValue, rawPath: string): JsonValue | undefined {
@@ -689,16 +754,16 @@ export function evaluateObjectiveControlNode(
   return { actual, target, operator, pass };
 }
 
-function interpolate(value: JsonValue, snapshot: ObjectiveControlPlanSnapshot): JsonValue {
+function interpolate(value: JsonValue, snapshot: ObjectiveControlPlanSnapshot, fanoutScope?: ObjectiveControlFanoutScope): JsonValue {
   if (typeof value === "string") {
     return value.replace(/\{\{\s*([^}]+?)\s*\}\}/gu, (_match, path: string) => {
-      const resolved = getPath(contextFromSnapshot(snapshot), path);
+      const resolved = getPath(contextFromSnapshot(snapshot, fanoutScope), path);
       return typeof resolved === "string" ? resolved : JSON.stringify(resolved ?? null);
     });
   }
-  if (Array.isArray(value)) return value.map((entry) => interpolate(entry, snapshot));
+  if (Array.isArray(value)) return value.map((entry) => interpolate(entry, snapshot, fanoutScope));
   if (value !== null && typeof value === "object") {
-    return Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, interpolate(entry, snapshot)]));
+    return Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, interpolate(entry, snapshot, fanoutScope)]));
   }
   return value;
 }
@@ -722,13 +787,47 @@ function findParentRelation(plan: ObjectiveControlPlan, childId: string): Parent
   return result;
 }
 
+function findParentRelationInTree(root: ObjectiveControlNode, childId: string): ParentRelation | null {
+  let result: ParentRelation | null = null;
+  const visit = (node: ObjectiveControlNode): void => {
+    if (result) return;
+    const children = node.type === "if" ? [...node.then, ...(node.else ?? [])]
+      : node.type === "sequence" || node.type === "parallel" || node.type === "while" ? node.steps : [];
+    if (children.some((child) => child.id === childId)) {
+      if (node.type === "if" || node.type === "sequence" || node.type === "parallel" || node.type === "while") {
+        result = { parentId: node.id, kind: node.type };
+      }
+      return;
+    }
+    children.forEach(visit);
+  };
+  visit(root);
+  return result;
+}
+
+function parentRelationFor(
+  plan: ObjectiveControlPlan,
+  execution: ObjectiveControlExecutionKey,
+  snapshot?: ObjectiveControlPlanSnapshot,
+): ParentRelation | null {
+  const scope = snapshot ? recordFor(snapshot, execution)?.fanoutScope : undefined;
+  if (!scope) return findParentRelation(plan, execution.nodeId);
+  if (execution.nodeId === scope.templateNodeId) return { parentId: scope.fanoutExecution.nodeId, kind: "fanout" };
+  const fanout = nodeMap(plan).get(scope.fanoutExecution.nodeId);
+  if (!fanout || fanout.type !== "fanout") return null;
+  return findParentRelationInTree(fanout.itemTemplate, execution.nodeId);
+}
+
 function parentExecutionFor(
   plan: ObjectiveControlPlan,
   execution: ObjectiveControlExecutionKey,
+  snapshot?: ObjectiveControlPlanSnapshot,
 ): ObjectiveControlExecutionKey | null {
   if (execution.nodeId === plan.root.id) return null;
-  const relation = findParentRelation(plan, execution.nodeId);
+  const scope = snapshot ? recordFor(snapshot, execution)?.fanoutScope : undefined;
+  const relation = parentRelationFor(plan, execution, snapshot);
   if (!relation) throw new Error(`Unknown control-node parent for ${execution.nodeId}`);
+  if (relation.kind === "fanout") return scope?.fanoutExecution ?? null;
   const base = `/${relation.parentId}/`;
   if (relation.kind === "if") {
     for (const branch of ["then", "else"] as const) {
@@ -796,10 +895,10 @@ function dependencyExecutionKeys(
   dependencyId: string,
   snapshot: ObjectiveControlPlanSnapshot,
 ): ObjectiveControlExecutionKey[] {
-  const parent = parentExecutionFor(plan, execution);
+  const parent = parentExecutionFor(plan, execution, snapshot);
   if (!parent) return dependencyId === plan.root.id ? [key(plan.root.id, "root")] : [];
   if (dependencyId === parent.nodeId) return [parent];
-  const parentNode = nodeMap(plan).get(parent.nodeId);
+  const parentNode = nodeForExecution(plan, parent, snapshot);
   if (!parentNode) return [];
   if (parentNode.type === "sequence" || parentNode.type === "parallel") {
     if (parentNode.steps.some((child) => child.id === dependencyId)) return [childKey(parent, dependencyId)];
@@ -832,10 +931,9 @@ function pendingDependencies(
 }
 
 function runningAgentCount(plan: ObjectiveControlPlan, snapshot: ObjectiveControlPlanSnapshot): number {
-  const nodes = nodeMap(plan);
   return snapshot.executions.filter((entry) => {
     if (entry.state !== "running" && entry.state !== "waiting") return false;
-    return nodes.get(entry.key.nodeId)?.type === "agent";
+    return nodeForExecution(plan, entry.key, snapshot)?.type === "agent";
   }).length;
 }
 
@@ -1024,6 +1122,105 @@ function signalIntent(
   return { ...base, kind: "signal", node, operation, attemptId, since, expiresAt, signalKey: node.signalKey, subscriptionKey };
 }
 
+function fanoutItemKey(item: JsonValue, index: number, keyPath?: string): string {
+  const explicit = keyPath === undefined ? undefined : getPath(item, keyPath);
+  if (keyPath !== undefined && explicit === undefined) {
+    throw new Error(`Objective fan-out item is missing key path ${keyPath} at index ${index}.`);
+  }
+  const candidate = explicit ?? (
+    item !== null && typeof item === "object" && !Array.isArray(item)
+      && (typeof item.id === "string" || typeof item.id === "number")
+      ? item.id
+      : undefined
+  );
+  if (typeof candidate === "string") return candidate;
+  if (typeof candidate === "number" || typeof candidate === "boolean" || candidate === null) return String(candidate);
+  if (candidate !== undefined) return stableJson(candidate);
+  return createHash("sha256").update(stableJson(item)).digest("hex").slice(0, 24);
+}
+
+function resolveFanoutItems(
+  node: ObjectiveControlFanoutNode,
+  snapshot: ObjectiveControlPlanSnapshot,
+  scope?: ObjectiveControlFanoutScope,
+): ObjectiveControlFanoutItem[] {
+  const source = getPath(contextFromSnapshot(snapshot, scope), node.source);
+  if (!Array.isArray(source)) throw new Error(`Objective fan-out ${node.id} source ${node.source} must resolve to an array.`);
+  const seen = new Map<string, number>();
+  return source.map((value, index) => {
+    const baseKey = fanoutItemKey(value, index, node.aggregation?.keyPath);
+    const count = (seen.get(baseKey) ?? 0) + 1;
+    seen.set(baseKey, count);
+    return { key: count === 1 ? baseKey : `${baseKey}#${count}`, index, value };
+  });
+}
+
+function fanoutSourceHash(node: ObjectiveControlFanoutNode, items: readonly ObjectiveControlFanoutItem[]): string {
+  return sha256({ nodeId: node.id, source: node.source, items });
+}
+
+function fanoutItemExecutionKey(
+  fanoutExecution: ObjectiveControlExecutionKey,
+  node: ObjectiveControlFanoutNode,
+  item: ObjectiveControlFanoutItem,
+): ObjectiveControlExecutionKey {
+  return key(
+    node.itemTemplate.id,
+    `${fanoutExecution.iterationKey}/${fanoutExecution.nodeId}/item/${encodeURIComponent(item.key)}/${node.itemTemplate.id}`,
+  );
+}
+
+function fanoutItemRecords(
+  snapshot: ObjectiveControlPlanSnapshot,
+  fanoutExecution: ObjectiveControlExecutionKey,
+  node: ObjectiveControlFanoutNode,
+): ObjectiveControlExecutionRecord[] {
+  const fanoutId = objectiveControlExecutionId(fanoutExecution);
+  return snapshot.executions
+    .filter((entry) => entry.fanoutScope
+      && objectiveControlExecutionId(entry.fanoutScope.fanoutExecution) === fanoutId
+      && entry.fanoutScope.templateNodeId === node.itemTemplate.id
+      && entry.key.nodeId === node.itemTemplate.id)
+    .sort((left, right) => (left.fanoutScope?.itemIndex ?? 0) - (right.fanoutScope?.itemIndex ?? 0));
+}
+
+function aggregateObjectiveFanout(
+  records: readonly ObjectiveControlExecutionRecord[],
+  aggregation?: WorkflowFanoutAggregation,
+): JsonValue {
+  const mode = aggregation?.mode ?? "array";
+  if (mode === "array") return records.map((record) => record.output);
+  if (mode === "object") {
+    const output: Record<string, JsonValue> = {};
+    for (const record of records) {
+      const itemKey = record.fanoutScope?.itemKey;
+      if (!itemKey || Object.prototype.hasOwnProperty.call(output, itemKey)) throw new Error("Objective fan-out produced duplicate result key.");
+      output[itemKey] = record.output;
+    }
+    return output;
+  }
+  const merged: Record<string, JsonValue> = {};
+  records.forEach((record, index) => {
+    if (record.output === null || typeof record.output !== "object" || Array.isArray(record.output)) {
+      throw new Error(`Objective fan-out merge requires object output at index ${index}.`);
+    }
+    Object.assign(merged, record.output);
+  });
+  return merged;
+}
+
+function advanceFanoutFrontier(
+  snapshot: ObjectiveControlPlanSnapshot,
+  fanoutExecution: ObjectiveControlExecutionKey,
+  node: ObjectiveControlFanoutNode,
+): ObjectiveControlPlanSnapshot {
+  const records = fanoutItemRecords(snapshot, fanoutExecution, node);
+  const active = records.filter((record) => record.state === "running" || record.state === "waiting").length;
+  const capacity = node.concurrency === null ? Number.POSITIVE_INFINITY : Math.max(0, node.concurrency - active);
+  const queued = records.filter((record) => record.state === "queued").slice(0, capacity).map((record) => record.key);
+  return { ...snapshot, frontier: addFrontier(snapshot.frontier, queued) };
+}
+
 function makeIntent(
   plan: ObjectiveControlPlan,
   snapshot: ObjectiveControlPlanSnapshot,
@@ -1196,11 +1393,15 @@ function replaceExecution(
   };
 }
 
-function ensureExecutions(snapshot: ObjectiveControlPlanSnapshot, children: ObjectiveControlExecutionKey[]): ObjectiveControlPlanSnapshot {
+function ensureExecutions(
+  snapshot: ObjectiveControlPlanSnapshot,
+  children: ObjectiveControlExecutionKey[],
+  fanoutScope?: ObjectiveControlFanoutScope,
+): ObjectiveControlPlanSnapshot {
   let current = snapshot;
   for (const child of children) {
     if (recordFor(current, child)) continue;
-    current = replaceExecution(current, child, emptyExecution(child));
+    current = replaceExecution(current, child, emptyExecution(child, "queued", fanoutScope));
   }
   return current;
 }
@@ -1284,7 +1485,7 @@ function settleParent(
   let current = snapshot;
   let child = childExecution;
   while (true) {
-    const parent = parentExecutionFor(plan, child);
+    const parent = parentExecutionFor(plan, child, current);
     if (!parent) {
       const root = key(plan.root.id, "root");
       if (objectiveControlExecutionId(child) === objectiveControlExecutionId(root)) return current;
@@ -1311,7 +1512,7 @@ function settleParent(
     if (parentNode.type === "sequence" || parentNode.type === "if" || parentNode.type === "while") {
       const next = firstMissingOrUnfinished(parentNode, parent, current);
       if (next) {
-        current = ensureExecutions(current, [next.key]);
+        current = ensureExecutions(current, [next.key], parentRecord.fanoutScope);
         current = { ...current, frontier: addFrontier(removeFrontier(current.frontier, child), [next.key]) };
         return current;
       }
@@ -1376,7 +1577,7 @@ function markCompletedAndPropagate(
     frontier: removeFrontier(current.frontier, execution),
     exitReasons: { ...current.exitReasons, [executionId]: current.exitReasons[executionId] ?? "completed" },
   };
-  const parent = parentExecutionFor(plan, execution);
+  const parent = parentExecutionFor(plan, execution, current);
   if (!parent) return current;
   return settleParent(plan, current, execution, now);
 }
@@ -1454,7 +1655,7 @@ export function applyObjectiveControlAcknowledgement(
     if (intent.operation !== "enter") throw new Error(`${intent.kind} acknowledgement is not an enter operation.`);
     const children = intent.children;
     current = replaceExecution(current, execution, { state: "running", startedAt: now });
-    current = ensureExecutions(current, children);
+    current = ensureExecutions(current, children, recordFor(current, execution)?.fanoutScope);
     current = {
       ...current,
       frontier: addFrontier(removeFrontier(current.frontier, execution), intent.kind === "sequence" ? children.slice(0, 1) : children),
@@ -1482,7 +1683,7 @@ export function applyObjectiveControlAcknowledgement(
     };
     if (children.length === 0) return ObjectiveControlPlanSnapshotSchema.parse(markCompletedAndPropagate(plan, current, execution, { branch }, now));
     const childKeys = children.map((child) => branchChildKey(execution, branch, child.id));
-    current = ensureExecutions(current, childKeys.slice(0, 1));
+    current = ensureExecutions(current, childKeys.slice(0, 1), recordFor(current, execution)?.fanoutScope);
     current = { ...current, frontier: addFrontier(removeFrontier(current.frontier, execution), childKeys.slice(0, 1)) };
     return ObjectiveControlPlanSnapshotSchema.parse(current);
   }
@@ -1505,7 +1706,7 @@ export function applyObjectiveControlAcknowledgement(
     current = replaceExecution(current, execution, { state: "running", startedAt: current.executions.find((entry) => objectiveControlExecutionId(entry.key) === objectiveControlExecutionId(execution))?.startedAt ?? now });
     current = { ...current, loopIterations: { ...current.loopIterations, [objectiveControlExecutionId(execution)]: iteration } };
     const childKeys = intent.node.steps.map((child) => loopChildKey(execution, iteration, child.id));
-    current = ensureExecutions(current, childKeys.slice(0, 1));
+    current = ensureExecutions(current, childKeys.slice(0, 1), recordFor(current, execution)?.fanoutScope);
     current = { ...current, frontier: addFrontier(removeFrontier(current.frontier, execution), childKeys.slice(0, 1)) };
     return ObjectiveControlPlanSnapshotSchema.parse(current);
   }

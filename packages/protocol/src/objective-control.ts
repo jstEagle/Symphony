@@ -608,6 +608,89 @@ export function objectiveControlExecutionId(key: ObjectiveControlExecutionKey): 
   return `${key.nodeId}@${key.iterationKey}`;
 }
 
+/**
+ * One item in a deterministic fan-out materialization.  The item value is
+ * retained in the durable control projection so a daemon restart can rebuild
+ * the same child work order without re-reading a mutable external source.
+ * `execution` is included here (rather than inferred by consumers) because
+ * it is the idempotency boundary for the item attempt.
+ */
+export const ObjectiveControlFanoutItemSchema = z
+  .object({
+    index: z.number().int().nonnegative(),
+    key: z.string().min(1).max(512),
+    value: JsonValueSchema,
+    itemHash: z.string().min(8).max(256),
+    execution: ObjectiveControlExecutionKeySchema,
+  })
+  .strict();
+export type ObjectiveControlFanoutItem = z.infer<typeof ObjectiveControlFanoutItemSchema>;
+
+/** The immutable source expansion receipt for one fan-out execution. */
+export const ObjectiveControlFanoutMaterializationSchema = z
+  .object({
+    version: z.literal(1),
+    materializationId: IdSchema,
+    fanoutExecution: ObjectiveControlExecutionKeySchema,
+    sourcePath: z.string().min(1).max(1_000),
+    sourceHash: z.string().min(8).max(256),
+    items: z.array(ObjectiveControlFanoutItemSchema).max(4_096),
+    aggregation: WorkflowFanoutAggregationSchema.optional(),
+  })
+  .strict()
+  .superRefine((materialization, context) => {
+    const keys = new Set<string>();
+    const indexes = new Set<number>();
+    for (const [index, item] of materialization.items.entries()) {
+      if (keys.has(item.key)) {
+        context.addIssue({ code: "custom", path: ["items", index, "key"], message: `Duplicate fan-out item key ${item.key}` });
+      }
+      if (indexes.has(item.index)) {
+        context.addIssue({ code: "custom", path: ["items", index, "index"], message: `Duplicate fan-out item index ${item.index}` });
+      }
+      keys.add(item.key);
+      indexes.add(item.index);
+      if (item.execution.nodeId === materialization.fanoutExecution.nodeId) {
+        context.addIssue({ code: "custom", path: ["items", index, "execution"], message: "Fan-out item execution must not reuse the fan-out node id" });
+      }
+    }
+  });
+export type ObjectiveControlFanoutMaterialization = z.infer<typeof ObjectiveControlFanoutMaterializationSchema>;
+
+/**
+ * Stable child path used by objective-level fan-out executors.  Encoding the
+ * key makes the path unambiguous while keeping the parent execution in the
+ * identity, so duplicate keys cannot accidentally alias work in another
+ * nested fan-out scope.
+ */
+export function objectiveControlFanoutItemExecutionKey(
+  fanoutExecution: ObjectiveControlExecutionKey,
+  itemNodeId: string,
+  itemKey: string,
+): ObjectiveControlExecutionKey {
+  const parsedFanoutExecution = ObjectiveControlExecutionKeySchema.parse(fanoutExecution);
+  const parsedNodeId = NodeIdSchema.parse(itemNodeId);
+  const parsedItemKey = z.string().min(1).max(512).parse(itemKey);
+  return ObjectiveControlExecutionKeySchema.parse({
+    nodeId: parsedNodeId,
+    iterationKey: `${parsedFanoutExecution.iterationKey}/${parsedFanoutExecution.nodeId}/item/${encodeURIComponent(parsedItemKey)}`,
+  });
+}
+
+/** Metadata copied onto each durable child execution created by a fan-out. */
+export const ObjectiveControlFanoutExecutionMetadataSchema = z
+  .object({
+    materializationId: IdSchema,
+    fanoutExecution: ObjectiveControlExecutionKeySchema,
+    sourcePath: z.string().min(1).max(1_000),
+    sourceHash: z.string().min(8).max(256),
+    itemIndex: z.number().int().nonnegative(),
+    itemKey: z.string().min(1).max(512),
+    itemHash: z.string().min(8).max(256),
+  })
+  .strict();
+export type ObjectiveControlFanoutExecutionMetadata = z.infer<typeof ObjectiveControlFanoutExecutionMetadataSchema>;
+
 export const ObjectiveControlContextRefSchema = z
   .object({
     kind: z.enum(["node-output", "artifact", "event", "objective-context"]),
@@ -617,6 +700,33 @@ export const ObjectiveControlContextRefSchema = z
   })
   .strict();
 export type ObjectiveControlContextRef = z.infer<typeof ObjectiveControlContextRefSchema>;
+
+/** Immutable source value used while planning a dynamic fan-out. */
+export const ObjectiveControlFanoutValueSchema = z
+  .object({
+    key: z.string().min(1).max(512),
+    index: z.number().int().nonnegative(),
+    value: JsonValueSchema,
+  })
+  .strict();
+export type ObjectiveControlFanoutValue = z.infer<typeof ObjectiveControlFanoutValueSchema>;
+
+/**
+ * Durable scope attached to an execution materialized from a fan-out item.
+ * Keeping the source value and its stable key in the snapshot means a
+ * restarted daemon can reconstruct the exact work-order inputs without
+ * re-reading a mutable external collection.
+ */
+export const ObjectiveControlFanoutScopeSchema = z
+  .object({
+    fanoutExecution: ObjectiveControlExecutionKeySchema,
+    itemKey: z.string().min(1).max(512),
+    itemIndex: z.number().int().nonnegative(),
+    item: JsonValueSchema,
+    templateNodeId: NodeIdSchema,
+  })
+  .strict();
+export type ObjectiveControlFanoutScope = z.infer<typeof ObjectiveControlFanoutScopeSchema>;
 
 /** Durable state for one concrete node execution, not an aggregate node id. */
 export const ObjectiveControlExecutionRecordSchema = z
@@ -630,6 +740,10 @@ export const ObjectiveControlExecutionRecordSchema = z
     startedAt: IsoDateSchema.nullable().default(null),
     finishedAt: IsoDateSchema.nullable().default(null),
     contextRefs: z.array(ObjectiveControlContextRefSchema).max(256).default([]),
+    /** Present on executions materialized from a dynamic fan-out item. */
+    fanoutScope: ObjectiveControlFanoutScopeSchema.optional(),
+    /** Present only for a child execution materialized by a fan-out node. */
+    fanout: ObjectiveControlFanoutExecutionMetadataSchema.optional(),
     /** Present only for timer/signal nodes; identity is execution-scoped. */
     suspension: ObjectiveControlSuspensionRecordSchema.nullable().default(null).optional(),
   })
@@ -924,6 +1038,76 @@ export const ObjectiveControlEvidenceSchema = z
   })
   .strict();
 export type ObjectiveControlEvidence = z.infer<typeof ObjectiveControlEvidenceSchema>;
+
+const ObjectiveControlFanoutIntentIdentitySchema = {
+  intentId: IdSchema,
+  planId: IdSchema,
+  objectiveId: IdSchema,
+  runId: IdSchema,
+  planRevision: z.number().int().nonnegative(),
+  expectedSequence: z.number().int().positive(),
+  execution: ObjectiveControlExecutionKeySchema,
+  nodeId: NodeIdSchema,
+};
+
+/** Wire contract emitted when the durable executor expands or joins a map. */
+export const ObjectiveControlFanoutIntentSchema = z
+  .object({
+    ...ObjectiveControlFanoutIntentIdentitySchema,
+    kind: z.literal("fanout"),
+    node: ObjectiveControlNodeSchema,
+    operation: z.enum(["materialize", "join"]),
+    materialization: ObjectiveControlFanoutMaterializationSchema,
+    children: z.array(ObjectiveControlExecutionKeySchema).max(4_096).default([]),
+  })
+  .strict()
+  .superRefine((intent, context) => {
+    if (intent.node.type !== "fanout") {
+      context.addIssue({ code: "custom", path: ["node", "type"], message: "Fan-out intent requires a fanout node" });
+    }
+    if (intent.nodeId !== intent.execution.nodeId) {
+      context.addIssue({ code: "custom", path: ["nodeId"], message: "Fan-out intent nodeId must match execution.nodeId" });
+    }
+    if (intent.materialization.fanoutExecution.nodeId !== intent.execution.nodeId
+      || intent.materialization.fanoutExecution.iterationKey !== intent.execution.iterationKey) {
+      context.addIssue({ code: "custom", path: ["materialization", "fanoutExecution"], message: "Fan-out materialization must belong to the intent execution" });
+    }
+    const materializedChildren = intent.materialization.items.map((item) => objectiveControlExecutionId(item.execution));
+    const children = intent.children.map(objectiveControlExecutionId);
+    if (intent.operation === "join" && objectiveControlStableJson(materializedChildren) !== objectiveControlStableJson(children)) {
+      context.addIssue({ code: "custom", path: ["children"], message: "Fan-out join children must match materialized item executions" });
+    }
+  });
+export type ObjectiveControlFanoutIntent = z.infer<typeof ObjectiveControlFanoutIntentSchema>;
+
+/** Wire receipt for durable fan-out expansion/reduction. */
+export const ObjectiveControlFanoutAcknowledgementSchema = z
+  .object({
+    kind: z.literal("fanout"),
+    intentId: IdSchema,
+    requestKey: z.string().min(8).max(2_048),
+    operation: z.enum(["materialize", "join"]),
+    materializationId: IdSchema,
+    materialization: ObjectiveControlFanoutMaterializationSchema.optional(),
+    eventCursor: z.number().int().nonnegative().optional(),
+    reason: z.string().max(2_000).optional(),
+    evidence: ObjectiveControlEvidenceSchema.optional(),
+    now: IsoDateSchema.optional(),
+    state: z.enum(["running", "completed", "failed", "cancelled"]).optional(),
+    output: JsonValueSchema.nullable().optional(),
+    error: z.string().max(20_000).nullable().optional(),
+  })
+  .strict()
+  .superRefine((acknowledgement, context) => {
+    if (acknowledgement.operation === "materialize") {
+      if (!acknowledgement.materialization) {
+        context.addIssue({ code: "custom", path: ["materialization"], message: "Fan-out materialization acknowledgement requires the immutable materialization receipt" });
+      } else if (acknowledgement.materialization.materializationId !== acknowledgement.materializationId) {
+        context.addIssue({ code: "custom", path: ["materializationId"], message: "Fan-out acknowledgement materialization id does not match its receipt" });
+      }
+    }
+  });
+export type ObjectiveControlFanoutAcknowledgement = z.infer<typeof ObjectiveControlFanoutAcknowledgementSchema>;
 
 const ObjectiveControlMutationBaseSchema = {
   version: z.literal(1),

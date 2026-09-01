@@ -4,8 +4,13 @@ import {
   ObjectiveControlPlanSchema,
   ObjectiveControlPlanSnapshotSchema,
   ObjectiveControlNodeSchema,
+  ObjectiveControlFanoutAcknowledgementSchema,
+  ObjectiveControlFanoutExecutionMetadataSchema,
+  ObjectiveControlFanoutIntentSchema,
+  ObjectiveControlFanoutMaterializationSchema,
   applyObjectiveControlMutation,
   objectiveControlExecutionId,
+  objectiveControlFanoutItemExecutionKey,
   type ObjectiveControlExecutionRecord,
   type ObjectiveControlPlan,
   type ObjectiveControlPlanRevision,
@@ -162,6 +167,99 @@ describe("objective control snapshot validation", () => {
     });
     expect(() => ObjectiveControlNodeSchema.parse({ ...fanout, concurrency: 0 })).toThrow(/expected number to be >0/);
     expect(() => ObjectiveControlNodeSchema.parse({ ...fanout, aggregation: { mode: "array", unsupported: true } })).toThrow(/unsupported/);
+  });
+
+  it("gives fan-out items restart-stable execution identities and validates their receipt", () => {
+    const fanoutExecution = { nodeId: "fanout", iterationKey: "root/fanout" } as const;
+    const first = objectiveControlFanoutItemExecutionKey(fanoutExecution, "item", "file/a.ts");
+    const replay = objectiveControlFanoutItemExecutionKey(fanoutExecution, "item", "file/a.ts");
+    const second = objectiveControlFanoutItemExecutionKey(fanoutExecution, "item", "file/b.ts");
+    expect(first).toEqual(replay);
+    expect(first).not.toEqual(second);
+    const materialization = ObjectiveControlFanoutMaterializationSchema.parse({
+      version: 1,
+      materializationId: "fanout-materialization-1",
+      fanoutExecution,
+      sourcePath: "context.files",
+      sourceHash: "source-hash-1",
+      items: [
+        { index: 0, key: "file/a.ts", value: { path: "file/a.ts" }, itemHash: "item-hash-a", execution: first },
+        { index: 1, key: "file/b.ts", value: { path: "file/b.ts" }, itemHash: "item-hash-b", execution: second },
+      ],
+      aggregation: { mode: "array" },
+    });
+    expect(materialization.items.map((item) => item.execution)).toEqual([first, second]);
+    expect(() => ObjectiveControlFanoutMaterializationSchema.parse({
+      ...materialization,
+      items: [materialization.items[0], { ...materialization.items[1], key: materialization.items[0]!.key }],
+    })).toThrow(/Duplicate fan-out item key/);
+    expect(() => ObjectiveControlFanoutMaterializationSchema.parse({
+      ...materialization,
+      items: [materialization.items[0], { ...materialization.items[1], index: materialization.items[0]!.index }],
+    })).toThrow(/Duplicate fan-out item index/);
+  });
+
+  it("keeps fan-out intent and acknowledgement contracts explicit and backward-compatible", () => {
+    const fanoutExecution = { nodeId: "fanout", iterationKey: "root/fanout" } as const;
+    const itemExecution = objectiveControlFanoutItemExecutionKey(fanoutExecution, "item", "a");
+    const materialization = {
+      version: 1 as const,
+      materializationId: "fanout-materialization-2",
+      fanoutExecution,
+      sourcePath: "context.items",
+      sourceHash: "source-hash-2",
+      items: [{ index: 0, key: "a", value: { id: "a" }, itemHash: "item-hash-a", execution: itemExecution }],
+      aggregation: { mode: "array" as const },
+    };
+    const nodeValue = {
+      id: "fanout",
+      sourceNodeId: "fanout",
+      sourcePath: "steps.0",
+      dependsOn: [],
+      type: "fanout" as const,
+      source: "context.items",
+      itemTemplate: node("item-template"),
+      concurrency: null,
+      aggregation: { mode: "array" as const },
+    };
+    const intent = ObjectiveControlFanoutIntentSchema.parse({
+      intentId: "fanout-intent-1",
+      planId: "plan-1",
+      objectiveId: "objective-1",
+      runId: "run-1",
+      planRevision: 0,
+      expectedSequence: 1,
+      execution: fanoutExecution,
+      nodeId: "fanout",
+      kind: "fanout",
+      node: nodeValue,
+      operation: "materialize",
+      materialization,
+      children: [],
+    });
+    expect(intent.materialization.items[0]!.execution).toEqual(itemExecution);
+    const acknowledgement = ObjectiveControlFanoutAcknowledgementSchema.parse({
+      kind: "fanout",
+      intentId: intent.intentId,
+      requestKey: "fanout-ack-request-1",
+      operation: "materialize",
+      materializationId: materialization.materializationId,
+      materialization,
+    });
+    expect(acknowledgement.materialization?.sourceHash).toBe("source-hash-2");
+    expect(() => ObjectiveControlFanoutAcknowledgementSchema.parse({
+      ...acknowledgement,
+      materialization: undefined,
+    })).toThrow(/requires the immutable materialization receipt/);
+    expect(() => ObjectiveControlFanoutExecutionMetadataSchema.parse({
+      materializationId: materialization.materializationId,
+      fanoutExecution,
+      sourcePath: materialization.sourcePath,
+      sourceHash: materialization.sourceHash,
+      itemIndex: 0,
+      itemKey: "a",
+      itemHash: "item-hash-a",
+    })).not.toThrow();
   });
 
   it("accepts a complete snapshot and fences revision/source identity when available", () => {
