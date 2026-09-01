@@ -75,6 +75,7 @@ import {
   objectiveHandoffReferenceHash,
   validateObjectiveHandoffTarget,
   isObjectivePolicyHashValid,
+  walkObjectiveControlNodes,
   stableJsonStringify,
   objectiveArtifactContentHash,
   objectiveArtifactContentSize,
@@ -95,7 +96,6 @@ import {
   type ObjectiveActor,
   type ObjectiveApprovalRecord,
   type ObjectiveControlMutation,
-  type ObjectiveControlNode,
   type ObjectiveControlSignalDeliveryInput,
   type ObjectiveControlPlan,
   type ObjectivePolicyRequest,
@@ -3104,7 +3104,7 @@ export class SymphonyDaemon {
     mutation: ObjectiveControlMutation,
     authority: ObjectiveRuntimeAuthority,
   ): void {
-    const visit = (node: ObjectiveControlNode): void => {
+    const visit = (node: import("@symphony/protocol").ObjectiveControlNode): void => {
       if (node.type === "agent") {
         const permissionCeiling = run.policy?.effectivePermission ?? authority.permissionCeiling;
         if (node.permissions === "full-access" && permissionCeiling !== "full-access") {
@@ -3128,13 +3128,10 @@ export class SymphonyDaemon {
           for (const grant of grants) this.childWorkspaceGrant(grant, node.workspace);
         }
       }
-      if (node.type === "sequence" || node.type === "parallel" || node.type === "while") node.steps.forEach(visit);
-      else if (node.type === "if") {
-        node.then.forEach(visit);
-        node.else?.forEach(visit);
-      }
     };
-    if (mutation.type === "insert-node" || mutation.type === "replace-node" || mutation.type === "insert-branch" || mutation.type === "replace-branch" || mutation.type === "insert-evaluate" || mutation.type === "insert-evaluator" || mutation.type === "insert-timer" || mutation.type === "insert-signal" || mutation.type === "insert-checkpoint" || mutation.type === "insert-artifact") visit(mutation.node);
+    if (mutation.type === "insert-node" || mutation.type === "replace-node" || mutation.type === "insert-branch" || mutation.type === "replace-branch" || mutation.type === "insert-evaluate" || mutation.type === "insert-evaluator" || mutation.type === "insert-timer" || mutation.type === "insert-signal" || mutation.type === "insert-checkpoint" || mutation.type === "insert-artifact") {
+      for (const { node } of walkObjectiveControlNodes(mutation.node, { includeFanoutTemplates: true })) visit(node);
+    }
   }
 
   private objectiveList(request: IncomingMessage, url: URL): { objectives: ObjectiveRunRecord[]; limit: number } {
@@ -3922,7 +3919,7 @@ export class SymphonyDaemon {
     const allowedCapabilities = (authority.allowedCapabilities ?? []).filter(
       (capability) => policy?.allowedCapabilities === undefined || policy.allowedCapabilities.includes(capability),
     );
-    const visit = (node: ObjectiveControlNode): void => {
+    for (const { node } of walkObjectiveControlNodes(plan.root, { includeFanoutTemplates: true })) {
       if (node.type === "agent") {
         if (node.permissions === "full-access" && permissionCeiling !== "full-access") {
           throw new HttpError(403, `Control node ${node.id} requests full-access above the objective authority ceiling.`);
@@ -3937,13 +3934,7 @@ export class SymphonyDaemon {
           this.childWorkspaceGrant(authority.workspace, node.workspace);
         }
       }
-      if (node.type === "sequence" || node.type === "parallel" || node.type === "while") node.steps.forEach(visit);
-      else if (node.type === "if") {
-        node.then.forEach(visit);
-        node.else?.forEach(visit);
-      }
-    };
-    visit(plan.root);
+    }
     return plan;
   }
 
