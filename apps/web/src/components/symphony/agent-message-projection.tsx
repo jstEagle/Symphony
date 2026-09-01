@@ -4,7 +4,6 @@ import {
   ArrowBendUpLeft,
   ArrowSquareOut,
   Check,
-  CircleNotch,
   Envelope,
   GitBranch,
   PaperPlaneTilt,
@@ -332,7 +331,7 @@ function ReferenceList({ title, values, empty }: { title: string; values: string
 }
 
 function StatusMark({ state }: { state: AgentMessageItem["state"] }) {
-  if (state === "pending") return <CircleNotch className="mt-1 size-4 shrink-0 animate-spin text-info" aria-label="Pending" />;
+  if (state === "pending") return <span className="mt-1 shrink-0" aria-label="Pending"><AgentLoader kind="circular" size={16} label="Pending message" animated tone="info" /></span>;
   if (["failed", "unknown", "expired"].includes(state)) return <WarningCircle className={cn("mt-1 size-4 shrink-0", stateTone(state))} aria-label={state} />;
   return <Envelope className={cn("mt-1 size-4 shrink-0", stateTone(state))} aria-label={state} />;
 }

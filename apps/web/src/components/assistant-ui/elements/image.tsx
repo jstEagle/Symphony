@@ -434,9 +434,7 @@ function RegenerateButton({
       aria-label="Regenerate image"
       className="hover:bg-muted inline-flex size-7 items-center justify-center rounded disabled:opacity-50"
     >
-      <ArrowsClockwise
-        className={cn("size-4", isRegenerating && "animate-spin")}
-      />
+      {isRegenerating ? <AgentLoader kind="circular" size={16} label="Regenerating image" animated tone="info" /> : <ArrowsClockwise className="size-4" />}
     </button>
   );
 }
