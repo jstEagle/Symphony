@@ -1096,6 +1096,30 @@ describe("local daemon API", () => {
         expect.objectContaining({ level: "error", message: '{"level":"ERROR","message":"native failure"}' }),
       ]));
 
+      // Daemon-origin diagnostics do not cross the worker-event sanitizer;
+      // the agent-facing logs projection must still redact and bound them.
+      daemon.store.appendEvent({
+        type: "driver.log",
+        workflowId: `chat:${projectChat.id}`,
+        runId: `chat-run:${projectChat.id}`,
+        agentId: streamingAgentId,
+        occurredAt: new Date().toISOString(),
+        payload: {
+          apiKey: "daemon-origin-secret",
+          nested: { password: "nested-secret" },
+          output: "x".repeat(10_000),
+        },
+        provenance: { source: "daemon" },
+      });
+      const safeLogs = await fetch(`${base}/v1/agents/${streamingAgentId}/logs?limit=5&tail=true`).then((response) => response.json()) as {
+        entries: Array<{ data: unknown; message: string }>;
+      };
+      const safeLog = safeLogs.entries.at(-1);
+      expect(JSON.stringify(safeLog)).not.toContain("daemon-origin-secret");
+      expect(JSON.stringify(safeLog)).not.toContain("nested-secret");
+      expect(JSON.stringify(safeLog)).toContain("[REDACTED]");
+      expect(JSON.stringify(safeLog)).toContain("[truncated]");
+
       appendDriverEvent("driver.reasoning.delta", { text: "Plan the response." });
       appendDriverEvent("driver.message.delta", { text: "Answer." });
       appendDriverEvent("driver.reasoning.delta", { text: "Plan the response.", replace: true });

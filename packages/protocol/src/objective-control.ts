@@ -1588,6 +1588,209 @@ function descendantsByNodeId(plan: ObjectiveControlPlan, removed: Set<string>): 
   visit(plan.root);
 }
 
+function controlExecutionRecord(
+  snapshot: ObjectiveControlPlanSnapshot,
+  execution: ObjectiveControlExecutionKey,
+): ObjectiveControlExecutionRecord | undefined {
+  const id = objectiveControlExecutionId(execution);
+  return snapshot.executions.find((entry) => objectiveControlExecutionId(entry.key) === id);
+}
+
+function controlChildKey(parent: ObjectiveControlExecutionKey, childId: string): ObjectiveControlExecutionKey {
+  return { nodeId: childId, iterationKey: `${parent.iterationKey}/${parent.nodeId}/${childId}` };
+}
+
+function controlBranchChildKey(parent: ObjectiveControlExecutionKey, branch: ObjectiveControlBranch, childId: string): ObjectiveControlExecutionKey {
+  return { nodeId: childId, iterationKey: `${parent.iterationKey}/${parent.nodeId}/${branch}/${childId}` };
+}
+
+function controlLoopChildKey(parent: ObjectiveControlExecutionKey, iteration: number, childId: string): ObjectiveControlExecutionKey {
+  return { nodeId: childId, iterationKey: `${parent.iterationKey}/${parent.nodeId}/iteration-${iteration}/${childId}` };
+}
+
+function controlCurrentLoopIteration(
+  node: ObjectiveControlWhileNode,
+  execution: ObjectiveControlExecutionKey,
+  snapshot: ObjectiveControlPlanSnapshot,
+): number {
+  const executionId = objectiveControlExecutionId(execution);
+  let current = snapshot.loopIterations[executionId] ?? 0;
+  const prefix = `${execution.iterationKey}/${execution.nodeId}/iteration-`;
+  for (const entry of snapshot.executions) {
+    if (!entry.key.iterationKey.startsWith(prefix)) continue;
+    const parsed = Number(entry.key.iterationKey.slice(prefix.length).split("/", 1)[0]);
+    if (Number.isInteger(parsed) && parsed > current) current = parsed;
+  }
+  if (current === 0 && snapshot.loopIterations[node.id] !== undefined) {
+    const hasHistory = snapshot.executions.some((entry) => entry.key.iterationKey.startsWith(prefix));
+    if (hasHistory) current = snapshot.loopIterations[node.id]!;
+  }
+  return current;
+}
+
+function controlChildrenFor(
+  node: ObjectiveControlNode,
+  execution: ObjectiveControlExecutionKey,
+  snapshot: ObjectiveControlPlanSnapshot,
+): ObjectiveControlExecutionKey[] {
+  if (node.type === "sequence" || node.type === "parallel") return node.steps.map((child) => controlChildKey(execution, child.id));
+  if (node.type === "if") {
+    const branch = snapshot.branches[objectiveControlExecutionId(execution)];
+    if (!branch) return [];
+    return (branch === "then" ? node.then : node.else ?? []).map((child) => controlBranchChildKey(execution, branch, child.id));
+  }
+  if (node.type === "while") {
+    const iteration = controlCurrentLoopIteration(node, execution, snapshot);
+    return iteration <= 0 ? [] : node.steps.map((child) => controlLoopChildKey(execution, iteration, child.id));
+  }
+  return [];
+}
+
+function controlFirstMissingOrUnfinished(
+  node: ObjectiveControlSequenceNode | ObjectiveControlIfNode | ObjectiveControlWhileNode,
+  execution: ObjectiveControlExecutionKey,
+  snapshot: ObjectiveControlPlanSnapshot,
+): ObjectiveControlExecutionKey | null {
+  for (const child of controlChildrenFor(node, execution, snapshot)) {
+    const record = controlExecutionRecord(snapshot, child);
+    if (!record || !isObjectiveControlTerminalState(record.state)) return child;
+  }
+  return null;
+}
+
+function controlEnsureExecutions(
+  snapshot: ObjectiveControlPlanSnapshot,
+  children: ObjectiveControlExecutionKey[],
+): ObjectiveControlPlanSnapshot {
+  let current = snapshot;
+  for (const child of children) {
+    if (controlExecutionRecord(current, child)) continue;
+    const id = objectiveControlExecutionId(child);
+    const record: ObjectiveControlExecutionRecord = {
+      key: child,
+      state: "queued",
+      attemptId: null,
+      agentId: null,
+      output: null,
+      error: null,
+      startedAt: null,
+      finishedAt: null,
+      contextRefs: [],
+    };
+    current = {
+      ...current,
+      executions: [...current.executions, record],
+      nodeStates: { ...current.nodeStates, [id]: "queued" },
+      attemptIds: { ...current.attemptIds, [id]: null },
+    };
+  }
+  return current;
+}
+
+function controlAddFrontier(
+  frontier: ObjectiveControlExecutionKey[],
+  entries: ObjectiveControlExecutionKey[],
+): ObjectiveControlExecutionKey[] {
+  const seen = new Set(frontier.map(objectiveControlExecutionId));
+  return [...frontier, ...entries.filter((entry) => {
+    const id = objectiveControlExecutionId(entry);
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  })];
+}
+
+function controlRemoveFrontier(
+  frontier: ObjectiveControlExecutionKey[],
+  execution: ObjectiveControlExecutionKey,
+): ObjectiveControlExecutionKey[] {
+  const id = objectiveControlExecutionId(execution);
+  return frontier.filter((entry) => objectiveControlExecutionId(entry) !== id);
+}
+
+/**
+ * Reconcile the executable frontier after a plan revision is committed.
+ *
+ * A plan revision and its snapshot are written atomically, but the new plan
+ * can contain children that did not exist when the previous snapshot was
+ * projected.  Leaving those children out of `frontier` is particularly
+ * dangerous for an active parallel node: its existing siblings can all
+ * settle while the parent waits forever for an execution record that can
+ * never be dispatched.  The same shape can occur after removing the only
+ * active child from a container.
+ *
+ * This reducer only materializes work for already-running containers. Queued
+ * containers remain represented by their own frontier entry and will expand
+ * normally through the regular acknowledgement path. Sequence-like
+ * containers get only their first unfinished child; parallel containers get
+ * every unfinished child. Dependencies are still evaluated by
+ * `nextObjectiveControlIntent`, so a newly materialized child cannot bypass
+ * a prerequisite fence.
+ */
+function reconcileActiveContainerFrontier(
+  plan: ObjectiveControlPlan,
+  snapshot: ObjectiveControlPlanSnapshot,
+): ObjectiveControlPlanSnapshot {
+  let result = snapshot;
+  const nodes = objectiveControlNodeMap(plan);
+
+  // Iterate over a stable copy: ensureExecutions appends records while this
+  // pass is running, but newly appended leaf records must not themselves be
+  // considered as container parents.
+  for (const parentExecution of [...result.executions]) {
+    const parentRecord = controlExecutionRecord(result, parentExecution.key);
+    if (!parentRecord || parentRecord.state !== "running") continue;
+    const node = nodes.get(parentExecution.key.nodeId);
+    if (!node || (node.type !== "sequence" && node.type !== "parallel" && node.type !== "if" && node.type !== "while")) continue;
+
+    const children = controlChildrenFor(node, parentExecution.key, result);
+    result = controlEnsureExecutions(result, children);
+
+    if (node.type === "parallel") {
+      const unfinished = children.filter((child) => {
+        const record = controlExecutionRecord(result, child);
+        return record !== undefined && !isObjectiveControlTerminalState(record.state);
+      });
+      if (unfinished.length === 0) {
+        result = { ...result, frontier: controlAddFrontier(result.frontier, [parentExecution.key]) };
+      } else {
+        result = {
+          ...result,
+          frontier: controlAddFrontier(controlRemoveFrontier(result.frontier, parentExecution.key), unfinished),
+        };
+      }
+      continue;
+    }
+
+    const next = controlFirstMissingOrUnfinished(node, parentExecution.key, result);
+    if (!next) {
+      // With no unfinished child the parent must be revisited so the regular
+      // reducer can issue its join/condition intent and propagate completion.
+      result = { ...result, frontier: controlAddFrontier(result.frontier, [parentExecution.key]) };
+      continue;
+    }
+
+    // A sequence-like parent cannot launch an inserted child while another
+    // sibling is already running, even when the insertion is before that
+    // sibling. It will be re-evaluated by settleParent when the active child
+    // completes. If the next child is itself active, adding it back is
+    // harmless and repairs a frontier lost during a crash or removal.
+    const nextId = objectiveControlExecutionId(next);
+    const activeSibling = children.some((child) => {
+      if (objectiveControlExecutionId(child) === nextId) return false;
+      const record = controlExecutionRecord(result, child);
+      return record !== undefined && !isObjectiveControlTerminalState(record.state);
+    });
+    if (!activeSibling) {
+      result = {
+        ...result,
+        frontier: controlAddFrontier(controlRemoveFrontier(result.frontier, parentExecution.key), [next]),
+      };
+    }
+  }
+  return result;
+}
+
 /**
  * Reduce the execution projection for a structural mutation.  Removed
  * running executions are represented by append-only cancellation tombstones;
@@ -1605,42 +1808,46 @@ export function applyObjectiveControlMutationToSnapshot(
 ): ObjectiveControlPlanSnapshot {
   const parsedSnapshot = ObjectiveControlPlanSnapshotSchema.parse(snapshot);
   const parsedMutation = ObjectiveControlMutationSchema.parse(mutation);
-  if (parsedMutation.type !== "remove-subtree") return ObjectiveControlPlanSnapshotSchema.parse(parsedSnapshot);
-  const currentIds = collectObjectiveControlNodeIds(currentPlan.root);
-  const nextIds = collectObjectiveControlNodeIds(nextPlan.root);
-  const removedIds = new Set([...currentIds].filter((id) => !nextIds.has(id)));
-  descendantsByNodeId(currentPlan, removedIds);
   let result = parsedSnapshot;
-  const removedExecutions = parsedSnapshot.executions.filter((execution) => removedIds.has(execution.key.nodeId));
-  const active = removedExecutions.filter((execution) =>
-    execution.attemptId !== null && (execution.state === "running" || execution.state === "waiting" || execution.state === "queued"),
-  );
-  const cancellations = active.map((execution) => ({
-    version: 1 as const,
-    execution: execution.key,
-    attemptId: execution.attemptId,
-    agentId: execution.agentId,
-    intentId: `objective-control-cancel:${parsedMutation.mutationId}:${objectiveControlExecutionId(execution.key)}`,
-    reason: parsedMutation.cancellationIntent.reason,
-    cancelledAt: now,
-    sourceMutationId: parsedMutation.mutationId,
-  }));
-  const removedExecutionIds = new Set(removedExecutions.map((execution) => objectiveControlExecutionId(execution.key)));
-  const filterRecord = <T,>(entries: Record<string, T>): Record<string, T> => Object.fromEntries(Object.entries(entries).filter(([id]) => !removedExecutionIds.has(id)));
-  result = {
-    ...result,
-    executions: result.executions.filter((execution) => !removedIds.has(execution.key.nodeId)),
-    frontier: result.frontier.filter((execution) => !removedIds.has(execution.nodeId)),
-    nodeStates: filterRecord(result.nodeStates),
-    branches: filterRecord(result.branches),
-    loopIterations: filterRecord(result.loopIterations),
-    exitReasons: filterRecord(result.exitReasons),
-    attemptIds: filterRecord(result.attemptIds),
-    ...(cancellations.length > 0 ? { cancellations: [...(result.cancellations ?? []), ...cancellations] } : {}),
-    reason: parsedMutation.reason,
-    createdAt: now,
-  };
-  return ObjectiveControlPlanSnapshotSchema.parse(result);
+  if (parsedMutation.type === "remove-subtree") {
+    const currentIds = collectObjectiveControlNodeIds(currentPlan.root);
+    const nextIds = collectObjectiveControlNodeIds(nextPlan.root);
+    const removedIds = new Set([...currentIds].filter((id) => !nextIds.has(id)));
+    descendantsByNodeId(currentPlan, removedIds);
+    const removedExecutions = parsedSnapshot.executions.filter((execution) => removedIds.has(execution.key.nodeId));
+    const active = removedExecutions.filter((execution) =>
+      execution.attemptId !== null && (execution.state === "running" || execution.state === "waiting" || execution.state === "queued"),
+    );
+    const cancellations = active.map((execution) => ({
+      version: 1 as const,
+      execution: execution.key,
+      attemptId: execution.attemptId,
+      agentId: execution.agentId,
+      intentId: `objective-control-cancel:${parsedMutation.mutationId}:${objectiveControlExecutionId(execution.key)}`,
+      reason: parsedMutation.cancellationIntent.reason,
+      cancelledAt: now,
+      sourceMutationId: parsedMutation.mutationId,
+    }));
+    const removedExecutionIds = new Set(removedExecutions.map((execution) => objectiveControlExecutionId(execution.key)));
+    const filterRecord = <T,>(entries: Record<string, T>): Record<string, T> => Object.fromEntries(Object.entries(entries).filter(([id]) => !removedExecutionIds.has(id)));
+    result = {
+      ...result,
+      executions: result.executions.filter((execution) => !removedIds.has(execution.key.nodeId)),
+      frontier: result.frontier.filter((execution) => !removedIds.has(execution.nodeId)),
+      nodeStates: filterRecord(result.nodeStates),
+      branches: filterRecord(result.branches),
+      loopIterations: filterRecord(result.loopIterations),
+      exitReasons: filterRecord(result.exitReasons),
+      attemptIds: filterRecord(result.attemptIds),
+      ...(cancellations.length > 0 ? { cancellations: [...(result.cancellations ?? []), ...cancellations] } : {}),
+    };
+  }
+
+  // The same reconciliation is needed for insertion, replacement, rewiring,
+  // and removal. For a no-op mutation this is idempotent and only repairs a
+  // frontier that was already inconsistent with its running container.
+  result = reconcileActiveContainerFrontier(nextPlan, result);
+  return ObjectiveControlPlanSnapshotSchema.parse({ ...result, reason: parsedMutation.reason, createdAt: now });
 }
 
 /**

@@ -30,6 +30,7 @@ import type {
   WorkflowRevisionRecord,
   WorkflowRunOrigin,
   WorkflowRunRecord,
+  WorkflowRunListCursor,
 } from "@symphony/storage";
 
 export * from "./objective-runtime.js";
@@ -487,42 +488,52 @@ export class WorkflowEngine {
     // to finish. Long-running native agents can remain active for hours; the
     // daemon still needs to become ready so clients can inspect, steer, cancel,
     // and observe those runs while they continue in the background.
-    for (const run of this.store.listRuns({ status: ["queued", "running", "waiting", "interrupted"] })) {
-      // Chat runs are durable conversation containers, not compiled workflow
-      // executions. They intentionally have no WorkflowRevisionRecord: native
-      // conductor recovery is owned by AgentCoordinator. Older daemons fed
-      // these records through start(), which rewrote every healthy chat run to
-      // `interrupted` and emitted a false recovery-blocked event on each
-      // restart. Repair that legacy projection once and leave execution to the
-      // conductor supervisor.
-      if (isChatContainerRun(run)) {
-        if (run.status !== "running" || run.error !== null || run.finishedAt !== null) {
-          this.store.saveRun({
-            ...run,
-            status: "running",
-            error: null,
-            updatedAt: nowIso(),
-            finishedAt: null,
-          });
+    const statuses: WorkflowRunRecord["status"][] = ["queued", "running", "waiting", "interrupted"];
+    let cursor: WorkflowRunListCursor | undefined;
+    do {
+      const page = this.store.listRunPage({
+        status: statuses,
+        limit: 1_000,
+        ...(cursor ? { cursor } : {}),
+      });
+      for (const run of page.runs) {
+        // Chat runs are durable conversation containers, not compiled workflow
+        // executions. They intentionally have no WorkflowRevisionRecord: native
+        // conductor recovery is owned by AgentCoordinator. Older daemons fed
+        // these records through start(), which rewrote every healthy chat run to
+        // `interrupted` and emitted a false recovery-blocked event on each
+        // restart. Repair that legacy projection once and leave execution to the
+        // conductor supervisor.
+        if (isChatContainerRun(run)) {
+          if (run.status !== "running" || run.error !== null || run.finishedAt !== null) {
+            this.store.saveRun({
+              ...run,
+              status: "running",
+              error: null,
+              updatedAt: nowIso(),
+              finishedAt: null,
+            });
+          }
+          continue;
         }
-        continue;
+        try {
+          this.start(run.workflowId, run.input, { runId: run.id });
+          if (run.cancelRequested) this.propagateCancellation(run.id);
+        } catch (cause) {
+          // `start()` persists an explicit recovery-blocked state/event for a
+          // missing pinned revision. Persist any other synchronous failure here
+          // as well, while isolating runs so one malformed record cannot hold
+          // daemon startup.
+          const error = cause instanceof Error ? cause.message : String(cause);
+          const latest = this.store.getRun(run.id) ?? run;
+          if (latest.status === "interrupted" && latest.error === error) continue;
+          const blocked = { ...latest, status: "interrupted" as const, error, updatedAt: nowIso(), finishedAt: null };
+          this.store.saveRun(blocked);
+          this.event(blocked, "workflow.run.recovery-blocked", { error });
+        }
       }
-      try {
-        this.start(run.workflowId, run.input, { runId: run.id });
-        if (run.cancelRequested) this.propagateCancellation(run.id);
-      } catch (cause) {
-        // `start()` persists an explicit recovery-blocked state/event for a
-        // missing pinned revision. Persist any other synchronous failure here
-        // as well, while isolating runs so one malformed record cannot hold
-        // daemon startup.
-        const error = cause instanceof Error ? cause.message : String(cause);
-        const latest = this.store.getRun(run.id) ?? run;
-        if (latest.status === "interrupted" && latest.error === error) continue;
-        const blocked = { ...latest, status: "interrupted" as const, error, updatedAt: nowIso(), finishedAt: null };
-        this.store.saveRun(blocked);
-        this.event(blocked, "workflow.run.recovery-blocked", { error });
-      }
-    }
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
   }
 
   cancel(runId: string): WorkflowRunRecord {

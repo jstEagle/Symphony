@@ -410,6 +410,16 @@ export type AgentListOptions = {
   parentAgentId?: string;
 };
 
+/** Stable keyset cursor used while reconciling workflow runs on restart. */
+export type WorkflowRunListCursor = {
+  updatedAt: string;
+  id: string;
+};
+
+export type WorkflowRunListOptions = {
+  status?: WorkflowRunRecord["status"][];
+};
+
 const migrations: Array<{ version: number; sql: string }> = [
   {
     version: 1,
@@ -2323,17 +2333,39 @@ export class SymphonyStore {
     return row ? parseJson<WorkflowRunRecord>(row.record_json) : null;
   }
 
-  listRuns(options: { status?: WorkflowRunRecord["status"][]; limit?: number } = {}): WorkflowRunRecord[] {
-    const limit = Math.min(options.limit ?? 200, 2_000);
+  listRuns(options: WorkflowRunListOptions & { limit?: number } = {}): WorkflowRunRecord[] {
+    return this.listRunPage({ ...options, limit: options.limit ?? 200 }).runs;
+  }
+
+  /**
+   * Read workflow runs with a keyset cursor rather than an offset or a fixed
+   * global cap. Recovery uses this to reconcile every non-terminal run, even
+   * when a durable store contains more than the normal API page size.
+   */
+  listRunPage(
+    options: WorkflowRunListOptions & { cursor?: WorkflowRunListCursor; limit?: number } = {},
+  ): { runs: WorkflowRunRecord[]; nextCursor: WorkflowRunListCursor | null } {
+    let sql = "SELECT record_json FROM workflow_runs WHERE 1 = 1";
+    const params: Array<string | number> = [];
     if (options.status?.length) {
-      const placeholders = options.status.map(() => "?").join(",");
-      return (this.database
-        .prepare(`SELECT record_json FROM workflow_runs WHERE status IN (${placeholders}) ORDER BY updated_at DESC LIMIT ?`)
-        .all(...options.status, limit) as Row[]).map((row) => parseJson<WorkflowRunRecord>(row.record_json));
+      sql += ` AND status IN (${options.status.map(() => "?").join(",")})`;
+      params.push(...options.status);
     }
-    return (this.database.prepare("SELECT record_json FROM workflow_runs ORDER BY updated_at DESC LIMIT ?").all(limit) as Row[]).map(
-      (row) => parseJson<WorkflowRunRecord>(row.record_json),
-    );
+    if (options.cursor) {
+      sql += " AND (updated_at < ? OR (updated_at = ? AND id < ?))";
+      params.push(options.cursor.updatedAt, options.cursor.updatedAt, options.cursor.id);
+    }
+    const limit = Math.max(1, Math.min(options.limit ?? 1_000, 2_000));
+    sql += " ORDER BY updated_at DESC, id DESC LIMIT ?";
+    params.push(limit + 1);
+    const rows = this.database.prepare(sql).all(...params) as Row[];
+    const hasMore = rows.length > limit;
+    const runs = rows.slice(0, limit).map((row) => parseJson<WorkflowRunRecord>(row.record_json));
+    const last = runs.at(-1);
+    return {
+      runs,
+      nextCursor: hasMore && last ? { updatedAt: last.updatedAt, id: last.id } : null,
+    };
   }
 
   /**

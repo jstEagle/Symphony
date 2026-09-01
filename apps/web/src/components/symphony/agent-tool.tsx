@@ -133,10 +133,17 @@ function loaderForTool(toolName: string, argsText?: string) {
   return "square" as const;
 }
 
-function readAgentId(args: unknown, result: unknown): string | undefined {
-  const fromResult = recordString(result, "agentId");
+/**
+ * Native tool adapters do not all preserve structured JSON values on the
+ * assistant-ui boundary. Some return `args`/`result` as JSON strings, which
+ * used to make an otherwise valid create_agent call lose its Open agent
+ * affordance. Keep payload decoding at this projection boundary so every
+ * tool surface can still resolve the durable agent identity.
+ */
+export function readAgentId(args: unknown, result: unknown): string | undefined {
+  const fromResult = recordString(result, "agentId") ?? recordString(result, "id");
   if (fromResult) return fromResult;
-  return recordString(args, "agentId");
+  return recordString(args, "agentId") ?? recordString(args, "id");
 }
 
 function toolSummary(toolName: string, args: unknown, result: unknown): string | undefined {
@@ -153,7 +160,25 @@ function toolSummary(toolName: string, args: unknown, result: unknown): string |
 function clip(value: string): string { const normalized = value.replace(/\s+/gu, " ").trim(); return normalized.length > 78 ? `${normalized.slice(0, 75)}…` : normalized; }
 
 function recordString(value: unknown, key: string): string | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const field = (value as Record<string, unknown>)[key];
+  const record = recordValue(value);
+  if (!record) return undefined;
+  const field = record[key];
   return typeof field === "string" && field.trim() ? field : undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  if (!text.startsWith("{")) return undefined;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }

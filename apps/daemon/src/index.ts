@@ -133,6 +133,7 @@ import {
   UiUtilityService,
   buildSessionDiagnosticBundle,
   classifySessionDiagnosticRuntime,
+  redactSessionDiagnosticText,
   sessionDiagnosticJson,
 } from "@symphony/runtime";
 import {
@@ -7904,6 +7905,86 @@ function firstString(...values: Array<JsonValue | undefined>): string | null {
   return values.find((value): value is string => typeof value === "string" && value.length > 0) ?? null;
 }
 
+const SESSION_LOG_MAX_DEPTH = 8;
+const SESSION_LOG_MAX_ENTRIES = 128;
+const SESSION_LOG_MAX_NODES = 2_000;
+const SESSION_LOG_MAX_STRING_LENGTH = 4_000;
+const SESSION_LOG_SENSITIVE_KEYS = new Set([
+  "authorization", "cookie", "set_cookie", "token", "access_token", "refresh_token",
+  "api_key", "apikey", "openrouter_key", "client_secret", "secret", "password", "passphrase",
+  "credential", "credentials", "private_key", "signing_key", "webhook_secret", "dpop",
+]);
+
+/**
+ * Log payloads are evidence for debugging, but the logs endpoint is also an
+ * agent-facing API. Keep that projection bounded and secret-free even for
+ * daemon-origin events, which do not pass through the worker-event boundary.
+ * This intentionally happens at read time: the authoritative event remains
+ * available to the daemon while exported/session-visible diagnostics are safe
+ * to hand to another agent.
+ */
+function sessionLogSensitiveKey(key: string): boolean {
+  const normalized = key.replace(/([a-z])([A-Z])/gu, "$1_$2").replaceAll("-", "_").toLowerCase();
+  return SESSION_LOG_SENSITIVE_KEYS.has(normalized)
+    || normalized.endsWith("_token")
+    || normalized.endsWith("_secret")
+    || normalized.endsWith("_password");
+}
+
+type SessionLogProjectionState = { nodes: number };
+
+function projectSessionLogValue(
+  value: JsonValue,
+  state: SessionLogProjectionState,
+  depth: number,
+  key?: string,
+): { value: JsonValue; truncated: boolean } {
+  if (key !== undefined && sessionLogSensitiveKey(key)) return { value: "[REDACTED]", truncated: false };
+  if (depth > SESSION_LOG_MAX_DEPTH || state.nodes >= SESSION_LOG_MAX_NODES) return { value: "[truncated]", truncated: true };
+  state.nodes += 1;
+  if (typeof value === "string") {
+    const redacted = redactSessionDiagnosticText(value);
+    return redacted.length <= SESSION_LOG_MAX_STRING_LENGTH
+      ? { value: redacted, truncated: false }
+      : { value: `${redacted.slice(0, SESSION_LOG_MAX_STRING_LENGTH)}[truncated]`, truncated: true };
+  }
+  if (value === null || typeof value === "boolean" || typeof value === "number") return { value, truncated: false };
+  if (Array.isArray(value)) {
+    const result: JsonValue[] = [];
+    let truncated = value.length > SESSION_LOG_MAX_ENTRIES;
+    for (let index = 0; index < value.length && index < SESSION_LOG_MAX_ENTRIES; index += 1) {
+      const child = projectSessionLogValue(value[index] as JsonValue, state, depth + 1);
+      result.push(child.value);
+      truncated ||= child.truncated;
+      if (state.nodes >= SESSION_LOG_MAX_NODES) {
+        truncated = true;
+        break;
+      }
+    }
+    if (truncated) result.push("[truncated]");
+    return { value: result, truncated };
+  }
+  const result: Record<string, JsonValue> = {};
+  const keys = Object.keys(value);
+  let truncated = keys.length > SESSION_LOG_MAX_ENTRIES;
+  for (let index = 0; index < keys.length && index < SESSION_LOG_MAX_ENTRIES; index += 1) {
+    const childKey = keys[index] as string;
+    const child = projectSessionLogValue(value[childKey] as JsonValue, state, depth + 1, childKey);
+    result[childKey] = child.value;
+    truncated ||= child.truncated;
+    if (state.nodes >= SESSION_LOG_MAX_NODES) {
+      truncated = true;
+      break;
+    }
+  }
+  if (truncated) result["[truncated]"] = true;
+  return { value: result, truncated };
+}
+
+function projectSessionLogData(value: JsonValue): JsonValue {
+  return projectSessionLogValue(value, { nodes: 0 }, 0).value;
+}
+
 function sessionLogEntries(events: EventEnvelope[]) {
   const toolNames = new Map<string, string>();
   return events.map((event) => {
@@ -7923,7 +8004,7 @@ function sessionLogEntry(event: EventEnvelope, rememberedTool?: string) {
   const lifecycle = event.type.startsWith("driver.tool.")
     ? `${event.type.endsWith("started") ? "Started" : event.type.endsWith("completed") ? "Completed" : "Updated"} ${tool ?? "native tool"}`
     : null;
-  const message = clipLogMessage(direct ?? lifecycle ?? event.type.replaceAll(".", " "));
+  const message = clipLogMessage(redactSessionDiagnosticText(direct ?? lifecycle ?? event.type.replaceAll(".", " ")));
   return {
     cursor: event.cursor,
     at: event.occurredAt,
@@ -7931,7 +8012,7 @@ function sessionLogEntry(event: EventEnvelope, rememberedTool?: string) {
     source: event.provenance?.driver ?? event.provenance?.source ?? "daemon",
     type: event.type,
     message,
-    data: event.payload,
+    data: projectSessionLogData(event.payload),
   };
 }
 
