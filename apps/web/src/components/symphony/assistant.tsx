@@ -36,7 +36,7 @@ import {
   toThreadMessages,
 } from "@/lib/symphony/messages";
 import { isActivelyWorkingAgent, loaderForHarness } from "@/lib/symphony/format";
-import type { AgentDetail, AgentSessionLog as AgentSessionLogRecord, ChatAttachment, ConversationMessage, JsonValue, WorkflowRevisionRecord } from "@/lib/symphony/contracts";
+import type { AgentDetail, AgentSessionLog as AgentSessionLogRecord, ChatAttachment, ConversationMessage, EventEnvelope, JsonValue, WorkflowRevisionRecord } from "@/lib/symphony/contracts";
 import { openAgentWindow } from "@/lib/symphony/window-layout";
 import {
   getOrCreateWindowId,
@@ -582,6 +582,7 @@ function AssistantConversation({
               selected={symphony.selectedAgentId === detail.id}
               external={externalAgentIds.has(detail.id)}
               loadMessages={symphony.loadAgentMessages}
+              subscribeToAgent={symphony.subscribeToAgent}
               loadLogs={symphony.loadAgentLogs}
               onSteer={symphony.steer}
               onCancel={symphony.cancelOne}
@@ -601,6 +602,7 @@ type AgentTileProps = {
   selected: boolean;
   external: boolean;
   loadMessages: (agentId: string) => Promise<ConversationMessage[]>;
+  subscribeToAgent: (agentId: string, onEvent: (event: EventEnvelope) => void, onReset?: () => void) => () => void;
   loadLogs: (agentId: string, after?: number) => Promise<AgentSessionLogRecord>;
   onSteer: (agentId: string, content: string) => Promise<void>;
   onCancel: (agentId: string) => Promise<void>;
@@ -614,6 +616,7 @@ const AgentTile = memo(function AgentTile({
   selected,
   external,
   loadMessages,
+  subscribeToAgent,
   loadLogs,
   onSteer,
   onCancel,
@@ -695,6 +698,7 @@ const AgentTile = memo(function AgentTile({
           <AgentConversation
             detail={detail}
             loadMessages={loadMessages}
+            subscribeToAgent={subscribeToAgent}
             onSteer={onSteer}
             onCancel={onCancel}
           />
@@ -710,7 +714,7 @@ const AgentTile = memo(function AgentTile({
 
 function areAgentTilePropsEqual(previous: AgentTileProps, next: AgentTileProps): boolean {
   if (previous.conversationId !== next.conversationId || previous.selected !== next.selected || previous.external !== next.external) return false;
-  if (previous.loadMessages !== next.loadMessages || previous.loadLogs !== next.loadLogs || previous.onSteer !== next.onSteer || previous.onCancel !== next.onCancel) return false;
+  if (previous.loadMessages !== next.loadMessages || previous.subscribeToAgent !== next.subscribeToAgent || previous.loadLogs !== next.loadLogs || previous.onSteer !== next.onSteer || previous.onCancel !== next.onCancel) return false;
   const left = previous.detail;
   const right = next.detail;
   return left.id === right.id
@@ -815,6 +819,7 @@ function AgentPopout({
           <AgentConversation
             detail={detail}
             loadMessages={symphony.loadAgentMessages}
+            subscribeToAgent={symphony.subscribeToAgent}
             onSteer={symphony.steer}
             onCancel={symphony.cancelOne}
           />

@@ -10,7 +10,7 @@ import {
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Thread } from "@/components/assistant-ui/elements/thread.aui";
 import { AgentLoader, AgentToolFallback } from "@/components/symphony/agent-tool";
-import type { AgentDetail, ConversationMessage } from "@/lib/symphony/contracts";
+import type { AgentDetail, ConversationMessage, EventEnvelope } from "@/lib/symphony/contracts";
 import { isActivelyWorkingAgent, loaderForHarness } from "@/lib/symphony/format";
 import {
   conversationTranscriptSignature,
@@ -24,11 +24,17 @@ const THREAD_COMPONENTS = { ToolFallback: AgentToolFallback };
 export function AgentConversation({
   detail,
   loadMessages,
+  subscribeToAgent,
   onSteer,
   onCancel,
 }: {
   detail: AgentDetail;
   loadMessages: (agentId: string) => Promise<ConversationMessage[]>;
+  subscribeToAgent?: (
+    agentId: string,
+    onEvent: (event: EventEnvelope) => void,
+    onReset?: () => void,
+  ) => () => void;
   onSteer: (agentId: string, content: string) => Promise<void>;
   onCancel: (agentId: string) => Promise<void>;
 }) {
@@ -37,6 +43,7 @@ export function AgentConversation({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const refreshInFlight = useRef(false);
+  const refreshTimer = useRef<number | null>(null);
   const transcriptSignature = useRef("");
   const live = isActivelyWorkingAgent(detail.state);
 
@@ -66,10 +73,21 @@ export function AgentConversation({
     setLoaded(false);
     setError(null);
     void refresh();
-    if (!live) return;
-    const interval = window.setInterval(() => void refresh(), 1_000);
-    return () => window.clearInterval(interval);
-  }, [detail.id, live, refresh]);
+    if (!subscribeToAgent) return;
+    const scheduleRefresh = () => {
+      if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
+      refreshTimer.current = window.setTimeout(() => {
+        refreshTimer.current = null;
+        void refresh();
+      }, 80);
+    };
+    const unsubscribe = subscribeToAgent(detail.id, scheduleRefresh, scheduleRefresh);
+    return () => {
+      unsubscribe();
+      if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
+      refreshTimer.current = null;
+    };
+  }, [detail.id, live, refresh, subscribeToAgent]);
 
   const onNew = useCallback(async (message: AppendMessage) => {
     const content = extractText(message.content);

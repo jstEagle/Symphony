@@ -1050,6 +1050,21 @@ export function SymphonyProvider({ children, windowId = "main:server" }: { child
     return (await fetchAgentMessages(agentId)).messages;
   }, [mode]);
 
+  const subscribeToAgent = useCallback((
+    agentId: string,
+    onEvent: (event: EventEnvelope) => void,
+    onReset: () => void = () => undefined,
+  ) => {
+    if (mode === "preview") return () => undefined;
+    return subscribeToRuntime(
+      subscriptionStart.current.cursor,
+      onEvent,
+      onReset,
+      () => undefined,
+      { agentId, projection: "all" },
+    );
+  }, [mode]);
+
   const loadAgentLogs = useCallback(async (agentId: string, after = 0) => {
     if (mode === "preview") {
       const detail = previewAgentDetail(agentId);
@@ -1128,6 +1143,7 @@ export function SymphonyProvider({ children, windowId = "main:server" }: { child
       steer,
       cancelOne,
       loadAgentMessages,
+      subscribeToAgent,
       loadAgentLogs,
       markInboxRead,
       loadThreadMessages,
@@ -1151,6 +1167,7 @@ export function SymphonyProvider({ children, windowId = "main:server" }: { child
     inboxOpen,
     loadThreadMessages,
     loadAgentMessages,
+    subscribeToAgent,
     loadAgentLogs,
     markInboxRead,
     moveConversation,

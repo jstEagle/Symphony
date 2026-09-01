@@ -1904,8 +1904,10 @@ export class SymphonyDaemon {
       }
       if (url.pathname === "/v1/events" && request.method === "GET") {
         const scopedRunId = url.searchParams.get("runId");
+        const scopedAgentId = url.searchParams.get("agentId");
         const objectiveRun = scopedRunId ? this.store.getObjectiveRun(scopedRunId) : null;
         if (objectiveRun) this.requireObjectiveAccess(request, objectiveRun, "read an objective event stream");
+        if (scopedAgentId) this.requireAgentTargetAccess(request, scopedAgentId, "read an agent event stream");
         return this.events(request, response, url);
       }
       if (url.pathname === "/v1/drivers" && request.method === "GET") return this.json(response, 200, await this.harnessMaintenance.reports(url.searchParams.get("refresh") === "true"));
@@ -7123,6 +7125,7 @@ export class SymphonyDaemon {
     const requestedPrefixes = scopedTypes ? [] : (uiProjection ? UI_EVENT_PREFIXES : queryPrefixes);
     const eventOptions = {
       ...((scopedRunId ?? url.searchParams.get("runId")) ? { runId: scopedRunId ?? url.searchParams.get("runId") as string } : {}),
+      ...(url.searchParams.get("agentId") ? { agentId: url.searchParams.get("agentId") as string } : {}),
       ...(requestedTypes.length > 0 ? { types: requestedTypes } : {}),
       ...(requestedPrefixes.length > 0 ? { typePrefixes: requestedPrefixes } : {}),
     };
@@ -8300,9 +8303,10 @@ function isUiProjectionEvent(type: string): boolean {
 
 function eventMatchesFilter(
   event: EventEnvelope,
-  options: { runId?: string; types?: readonly string[]; typePrefixes?: readonly string[] },
+  options: { runId?: string; agentId?: string; types?: readonly string[]; typePrefixes?: readonly string[] },
 ): boolean {
   if (options.runId !== undefined && event.runId !== options.runId) return false;
+  if (options.agentId !== undefined && event.agentId !== options.agentId) return false;
   const typeMatch = options.types === undefined || options.types.length === 0 || options.types.includes(event.type);
   const prefixMatch = options.typePrefixes === undefined
     || options.typePrefixes.length === 0

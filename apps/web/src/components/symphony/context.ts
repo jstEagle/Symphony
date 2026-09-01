@@ -63,6 +63,11 @@ export type SymphonyContextValue = {
   steer: (agentId: string, content: string) => Promise<void>;
   cancelOne: (agentId: string) => Promise<void>;
   loadAgentMessages: (agentId: string) => Promise<BootstrapEnvelope["messages"]>;
+  subscribeToAgent: (
+    agentId: string,
+    onEvent: (event: EventEnvelope) => void,
+    onReset?: () => void,
+  ) => () => void;
   loadAgentLogs: (agentId: string, after?: number) => Promise<AgentSessionLog>;
   markInboxRead: (id: string) => void;
   loadThreadMessages: (threadId: string) => Promise<BootstrapEnvelope["messages"]>;

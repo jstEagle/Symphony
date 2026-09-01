@@ -104,6 +104,33 @@ describe("runtime SSE reconnect boundary", () => {
     unsubscribe();
   });
 
+  it("builds an all-event stream URL for one agent transcript", async () => {
+    const calls: string[] = [];
+    const applied: number[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      calls.push(String(input));
+      return responseFor([eventFrame(6)]);
+    }));
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+
+    let unsubscribe = () => undefined;
+    unsubscribe = subscribeToRuntime(
+      5,
+      (event) => {
+        applied.push(event.cursor);
+        unsubscribe();
+      },
+      vi.fn(),
+      vi.fn(),
+      { agentId: "agent-1", projection: "all" },
+    );
+
+    await vi.waitFor(() => expect(applied).toEqual([6]), { timeout: 1_000 });
+    expect(calls[0]).toContain("/v1/events?after=5&agentId=agent-1");
+    expect(calls[0]).not.toContain("projection=ui");
+    unsubscribe();
+  });
+
   it("does not deliver a late frame after the subscription has been stopped", async () => {
     let release: ((result: { value: Uint8Array; done: boolean }) => void) | undefined;
     const applied: number[] = [];

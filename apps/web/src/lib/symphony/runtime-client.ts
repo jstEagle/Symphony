@@ -959,11 +959,19 @@ function normalizeCostMap(value: Record<string, JsonValue> | undefined): Record<
   return Object.fromEntries(Object.entries(value ?? {}).map(([id, cost]) => [id, normalizeCost(cost)]));
 }
 
+export type RuntimeSubscriptionOptions = Readonly<{
+  /** Scope the stream to one durable agent. Agent streams omit the UI filter
+   * so native message, reasoning, and tool deltas remain observable. */
+  agentId?: string;
+  projection?: "ui" | "all";
+}>;
+
 export function subscribeToRuntime(
   cursor: number | string,
   onEvent: (event: EventEnvelope) => void,
   onReset: () => void,
   onConnection: (state: "connecting" | "live" | "stale") => void,
+  options: RuntimeSubscriptionOptions = {},
 ) {
   const controller = new AbortController();
   let currentCursor = Number(cursor) || 0;
@@ -996,7 +1004,10 @@ export function subscribeToRuntime(
     connecting = true;
     onConnection("connecting");
     try {
-      const url = `${symphonyConfig.apiBasePath}/events?after=${currentCursor}&projection=ui`;
+      const params = new URLSearchParams({ after: String(currentCursor) });
+      if (options.agentId) params.set("agentId", options.agentId);
+      if (options.projection !== "all") params.set("projection", "ui");
+      const url = `${symphonyConfig.apiBasePath}/events?${params.toString()}`;
       const response = await fetch(url, {
         signal: controller.signal,
         credentials: "same-origin",
