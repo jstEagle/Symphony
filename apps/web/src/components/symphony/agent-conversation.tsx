@@ -34,6 +34,7 @@ export function AgentConversation({
     agentId: string,
     onEvent: (event: EventEnvelope) => void,
     onReset?: () => void,
+    onConnection?: (state: "connecting" | "live" | "stale") => void,
   ) => () => void;
   onSteer: (agentId: string, content: string) => Promise<void>;
   onCancel: (agentId: string) => Promise<void>;
@@ -42,6 +43,7 @@ export function AgentConversation({
   const [loaded, setLoaded] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [streamState, setStreamState] = useState<"connecting" | "live" | "stale">("connecting");
   const refreshInFlight = useRef(false);
   const refreshTimer = useRef<number | null>(null);
   const transcriptSignature = useRef("");
@@ -72,6 +74,7 @@ export function AgentConversation({
     transcriptSignature.current = "";
     setLoaded(false);
     setError(null);
+    setStreamState("connecting");
     void refresh();
     if (!subscribeToAgent) return;
     const scheduleRefresh = () => {
@@ -81,7 +84,7 @@ export function AgentConversation({
         void refresh();
       }, 80);
     };
-    const unsubscribe = subscribeToAgent(detail.id, scheduleRefresh, scheduleRefresh);
+    const unsubscribe = subscribeToAgent(detail.id, scheduleRefresh, scheduleRefresh, setStreamState);
     return () => {
       unsubscribe();
       if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
@@ -152,6 +155,12 @@ export function AgentConversation({
       {error ? (
         <div className="absolute inset-x-4 top-3 z-10 rounded-lg border border-destructive/25 bg-background/95 px-3 py-2 text-xs text-destructive shadow-sm backdrop-blur">
           {error}
+        </div>
+      ) : null}
+      {streamState === "stale" ? (
+        <div className="flex shrink-0 items-center gap-2 border-b border-warning/20 bg-warning/6 px-3 py-2 text-[10px] text-warning">
+          <AgentLoader kind={loader} size={13} label="Reconnecting agent transcript" tone="warning" />
+          Reconnecting to the durable transcript…
         </div>
       ) : null}
       <AssistantRuntimeProvider runtime={runtime}>

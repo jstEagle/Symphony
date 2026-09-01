@@ -602,7 +602,7 @@ type AgentTileProps = {
   selected: boolean;
   external: boolean;
   loadMessages: (agentId: string) => Promise<ConversationMessage[]>;
-  subscribeToAgent: (agentId: string, onEvent: (event: EventEnvelope) => void, onReset?: () => void) => () => void;
+  subscribeToAgent: (agentId: string, onEvent: (event: EventEnvelope) => void, onReset?: () => void, onConnection?: (state: "connecting" | "live" | "stale") => void) => () => void;
   loadLogs: (agentId: string, after?: number) => Promise<AgentSessionLogRecord>;
   onSteer: (agentId: string, content: string) => Promise<void>;
   onCancel: (agentId: string) => Promise<void>;

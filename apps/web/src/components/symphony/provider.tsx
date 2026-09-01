@@ -1054,13 +1054,14 @@ export function SymphonyProvider({ children, windowId = "main:server" }: { child
     agentId: string,
     onEvent: (event: EventEnvelope) => void,
     onReset: () => void = () => undefined,
+    onConnection: (state: "connecting" | "live" | "stale") => void = () => undefined,
   ) => {
     if (mode === "preview") return () => undefined;
     return subscribeToRuntime(
       subscriptionStart.current.cursor,
       onEvent,
       onReset,
-      () => undefined,
+      onConnection,
       { agentId, projection: "all" },
     );
   }, [mode]);

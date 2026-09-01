@@ -67,6 +67,7 @@ export type SymphonyContextValue = {
     agentId: string,
     onEvent: (event: EventEnvelope) => void,
     onReset?: () => void,
+    onConnection?: (state: "connecting" | "live" | "stale") => void,
   ) => () => void;
   loadAgentLogs: (agentId: string, after?: number) => Promise<AgentSessionLog>;
   markInboxRead: (id: string) => void;
