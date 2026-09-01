@@ -835,7 +835,7 @@ export class TriggerManager {
     this.active = options.paused !== true;
   }
 
-  register(ir: WorkflowIr, options: { mode?: "active" | "pending" } = {}): void {
+  register(ir: WorkflowIr, options: { mode?: "active" | "pending" | "paused" } = {}): void {
     for (const job of this.jobs.get(ir.definition.id) ?? []) job.stop();
     this.jobs.delete(ir.definition.id);
     this.pending.delete(ir.definition.id);
@@ -843,6 +843,7 @@ export class TriggerManager {
       this.pending.set(ir.definition.id, ir);
       return;
     }
+    if (options.mode === "paused") return;
     const registered: Cron[] = [];
     for (const trigger of ir.definition.triggers) {
       if (trigger.type !== "cron") continue;
@@ -882,6 +883,16 @@ export class TriggerManager {
     const ir = this.pending.get(workflowId);
     if (!ir) return false;
     this.register(ir, { mode: "active" });
+    return true;
+  }
+
+  /** Pause one workflow's recurring triggers without stopping other schedules. */
+  pause(workflowId: string): boolean {
+    const jobs = this.jobs.get(workflowId);
+    if (!jobs && !this.pending.has(workflowId)) return false;
+    for (const job of jobs ?? []) job.stop();
+    this.jobs.delete(workflowId);
+    this.pending.delete(workflowId);
     return true;
   }
 

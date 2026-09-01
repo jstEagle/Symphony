@@ -379,7 +379,7 @@ const WorkflowTriggerPolicySchema = z.object({
   workflowId: z.string().min(1),
   revision: z.number().int().positive(),
   hash: z.string().min(8),
-  mode: z.enum(["active", "pending"]),
+  mode: z.enum(["active", "pending", "paused"]),
   source: z.enum(["user", "agent"]),
   // Optional for policies written before workflow proposals carried actor
   // ownership; old user policies remain active and old agent proposals stay
@@ -1990,14 +1990,15 @@ export class SymphonyDaemon {
         }));
         return this.json(response, 201, receipt.result);
       }
-      const workflowActivation = url.pathname.match(/^\/v1\/workflows\/([^/]+)\/activate$/u);
+      const workflowActivation = url.pathname.match(/^\/v1\/workflows\/([^/]+)\/(activate|deactivate)$/u);
       if (workflowActivation && request.method === "POST") {
         const workflowId = decodeURIComponent(workflowActivation[1] as string);
-        this.requireFullAccessAgent(request, "activate a workflow");
+        const action = workflowActivation[2] as "activate" | "deactivate";
+        this.requireFullAccessAgent(request, `${action} a workflow`);
         this.requireWorkflowActivationAccess(request, workflowId);
         const receipt = await this.command(CommandSchema.parse({
           idempotencyKey: this.requireIdempotencyKey(request),
-          type: "workflow.activate",
+          type: action === "activate" ? "workflow.activate" : "workflow.deactivate",
           payload: { workflowId },
           actor: this.commandActor(request),
         }));
@@ -6211,7 +6212,22 @@ export class SymphonyDaemon {
         if (this.loaded.config.workflows.triggersEnabled) {
           if (!this.triggers.approve(workflowId)) this.registerWorkflowTriggers(ir);
         }
+        this.store.appendEvent({ type: "workflow.trigger.activated", workflowId, runId: null, agentId: command.actor.type === "agent" ? command.actor.id : null, occurredAt: nowIso(), payload: { revision: record.revision, actor: command.actor.type }, provenance: { source: command.actor.type === "agent" ? "workflow" : "user" } });
         result = { ...record, triggerState: "active" } as unknown as JsonValue;
+      } else if (command.type === "workflow.deactivate") {
+        const payload = command.payload as Record<string, JsonValue>;
+        const workflowId = typeof payload.workflowId === "string" ? payload.workflowId : "";
+        const record = workflowId ? this.store.getWorkflow(workflowId) : null;
+        if (!record) throw new HttpError(404, `Workflow not found: ${workflowId}`);
+        const policy = this.workflowTriggerPolicy(workflowId);
+        if (command.actor.type === "agent" && (policy === null || policy === "invalid" || policy.source !== "agent" || policy.actorId !== command.actor.id)) {
+          throw new HttpError(403, "An authenticated agent may deactivate only its own workflow proposals.");
+        }
+        const ir = new WorkflowCompiler().compile(record.definition, record.revision);
+        this.persistWorkflowTriggerPolicy(ir, "paused", command.actor.type === "agent" ? "agent" : "user", command.actor.type === "agent" ? command.actor.id : null);
+        this.triggers.pause(workflowId);
+        this.store.appendEvent({ type: "workflow.trigger.paused", workflowId, runId: null, agentId: command.actor.type === "agent" ? command.actor.id : null, occurredAt: nowIso(), payload: { revision: record.revision, actor: command.actor.type }, provenance: { source: command.actor.type === "agent" ? "workflow" : "user" } });
+        result = { ...record, triggerState: "paused" } as unknown as JsonValue;
       } else if (command.type === "workflow.run") {
         const payload = command.payload as Record<string, JsonValue>;
         result = this.workflows.start(
@@ -6310,6 +6326,16 @@ export class SymphonyDaemon {
         if (registered && policy !== null && policy !== "invalid" && policy.mode === "active") {
           if (this.loaded.config.workflows.triggersEnabled) this.registerWorkflowTriggers(new WorkflowCompiler().compile(registered.definition, registered.revision));
           return this.settleRecoveredCommandReceipt(receipt, { ...registered, triggerState: "active" } as unknown as JsonValue);
+        }
+      }
+      if (command.type === "workflow.deactivate") {
+        const payload = command.payload as Record<string, JsonValue>;
+        const workflowId = typeof payload.workflowId === "string" ? payload.workflowId : "";
+        const registered = workflowId ? this.store.getWorkflow(workflowId) : null;
+        const policy = workflowId ? this.workflowTriggerPolicy(workflowId) : null;
+        if (registered && policy !== null && policy !== "invalid" && policy.mode === "paused") {
+          this.triggers.pause(workflowId);
+          return this.settleRecoveredCommandReceipt(receipt, { ...registered, triggerState: "paused" } as unknown as JsonValue);
         }
       }
       if (command.type === "agent.present") {
@@ -6969,7 +6995,7 @@ export class SymphonyDaemon {
         && policy.hash === record.hash;
       return {
         ...record,
-        triggerState: policy === "invalid" ? "pending" : matches && policy.mode === "pending" ? "pending" : "active",
+        triggerState: policy === "invalid" ? "pending" : matches ? policy.mode : "active",
       } as unknown as JsonValue;
     });
   }

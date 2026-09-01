@@ -34,10 +34,12 @@ describe("Symphony MCP workflow authority", () => {
     expect(readOnlyTools).not.toContain("register_workflow");
     expect(readOnlyTools).not.toContain("run_workflow");
     expect(readOnlyTools).not.toContain("activate_workflow");
+    expect(readOnlyTools).not.toContain("deactivate_workflow");
 
     const creatorTools = await toolNames(true);
     expect(creatorTools).toContain("register_workflow");
     expect(creatorTools).toContain("run_workflow");
     expect(creatorTools).toContain("activate_workflow");
+    expect(creatorTools).toContain("deactivate_workflow");
   });
 });

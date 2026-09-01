@@ -509,6 +509,18 @@ export async function activateWorkflow(
   });
 }
 
+/** Pause one workflow's recurring triggers while retaining its immutable definition. */
+export async function deactivateWorkflow(
+  workflowId: string,
+  idempotencyKey: string,
+): Promise<WorkflowRevisionRecord> {
+  return request<WorkflowRevisionRecord>(`/workflows/${encodeURIComponent(workflowId)}/deactivate`, {
+    method: "POST",
+    headers: mutationHeaders(idempotencyKey),
+    body: "{}",
+  });
+}
+
 /**
  * Objective mutations deliberately keep the request key out of the JSON
  * payload. The daemon derives the durable request key from Idempotency-Key,

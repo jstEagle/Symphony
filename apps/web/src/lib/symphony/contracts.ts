@@ -120,7 +120,7 @@ export type WorkflowRevisionRecord = {
   ir: JsonValue;
   hash: string;
   createdAt: string;
-  triggerState?: "active" | "pending";
+  triggerState?: "active" | "pending" | "paused";
 };
 
 /** The immutable plan snapshot returned with a durable objective detail. */

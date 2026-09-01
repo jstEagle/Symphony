@@ -795,6 +795,14 @@ if (canCreate) {
     `/v1/workflows/${encodeURIComponent(workflowId)}/activate`,
     mutation("activate-workflow", extra.requestId, {}),
   )));
+
+  server.registerTool("deactivate_workflow", {
+    description: "Pause your own Symphony workflow schedule without deleting its immutable definition or affecting other workflows. It can be reactivated later.",
+    inputSchema: { workflowId: z.string().min(1) },
+  }, async ({ workflowId }, extra) => result(await api(
+    `/v1/workflows/${encodeURIComponent(workflowId)}/deactivate`,
+    mutation("deactivate-workflow", extra.requestId, {}),
+  )));
 }
 
 server.registerTool("cancel_run", {

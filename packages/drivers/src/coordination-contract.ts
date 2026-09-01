@@ -43,6 +43,7 @@ export const SYMPHONY_COORDINATION_TOOLS = [
   { name: "list_workflows", category: "inspection", minimumAccess: "read-only" },
   { name: "register_workflow", category: "workflow", minimumAccess: "full-access" },
   { name: "activate_workflow", category: "workflow", minimumAccess: "full-access", requiresCreationAuthority: true },
+  { name: "deactivate_workflow", category: "workflow", minimumAccess: "full-access", requiresCreationAuthority: true },
   { name: "run_workflow", category: "workflow", minimumAccess: "full-access" },
   { name: "cancel_run", category: "workflow", minimumAccess: "full-access" },
   { name: "list_plugin_tools", category: "inspection", minimumAccess: "read-only" },

@@ -150,6 +150,33 @@ describe("daemon workflow trigger activation policy", () => {
       expect(second.triggers.isPending("agent-scheduled")).toBe(false);
       expect(second.triggers.activeTriggerCount("agent-scheduled")).toBe(1);
 
+      const pause = await postWithRetry(`http://127.0.0.1:${port}/v1/workflows/agent-scheduled/deactivate`, {
+        method: "POST",
+        headers: {
+          "idempotency-key": "agent-pause-scheduled",
+          "x-symphony-agent-id": "workflow-author",
+          "x-symphony-agent-token": second.agents.tokenFor("workflow-author"),
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      expect(pause.status).toBe(200);
+      expect(second.triggers.isPending("agent-scheduled")).toBe(false);
+      expect(second.triggers.activeTriggerCount("agent-scheduled")).toBe(0);
+
+      const resume = await postWithRetry(`http://127.0.0.1:${port}/v1/workflows/agent-scheduled/activate`, {
+        method: "POST",
+        headers: {
+          "idempotency-key": "agent-resume-scheduled",
+          "x-symphony-agent-id": "workflow-author",
+          "x-symphony-agent-token": second.agents.tokenFor("workflow-author"),
+          "content-type": "application/json",
+        },
+        body: "{}",
+      });
+      expect(resume.status).toBe(200);
+      expect(second.triggers.activeTriggerCount("agent-scheduled")).toBe(1);
+
       const userBody = JSON.stringify(scheduledDefinition("user-scheduled", "0 0 1 1 *"));
       const userResponse = await postWithRetry(`http://127.0.0.1:${port}/v1/workflows`, {
         method: "POST",

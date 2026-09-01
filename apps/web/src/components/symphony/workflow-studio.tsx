@@ -27,6 +27,7 @@ import { useSymphony } from "@/components/symphony/context";
 import type { JsonValue, WorkflowRevisionRecord } from "@/lib/symphony/contracts";
 import {
   activateCapability,
+  deactivateWorkflow,
   activateWorkflow,
   type CapabilityActivationInput,
   deprecateCapability,
@@ -146,6 +147,21 @@ export function WorkflowStudio({ onOpenObjective, studioMode: controlledStudioMo
     }
   };
 
+  const submitDeactivation = async () => {
+    if (!runtime || !selected || activating) return;
+    setActivating(true);
+    setRegistrationError(null);
+    try {
+      await deactivateWorkflow(selected.id, newIdempotencyKey());
+      setRegistrationSuccess(`${selected.id} schedule is paused. Its immutable definition remains available to resume later.`);
+      await queryClient.invalidateQueries({ queryKey: ["symphony", "bootstrap"] });
+    } catch (error) {
+      setRegistrationError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setActivating(false);
+    }
+  };
+
   const mutateCapability = async (
     action: "activate" | "deprecate",
     record: RenderCapabilityVersionRecord,
@@ -226,7 +242,8 @@ export function WorkflowStudio({ onOpenObjective, studioMode: controlledStudioMo
                   <p className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 font-mono text-[9px] text-muted-foreground/80"><span>{selected.id}</span><span className="text-border">/</span><span title={selected.hash}>sha256:{selected.hash.slice(0, 12)}…</span><span className="text-border">/</span><span>registered {formatDate(selected.createdAt)}</span></p>
                 </div>
                 <div className="flex flex-wrap items-center justify-end gap-2">
-                  {selected.triggerState === "pending" ? <Button variant="outline" size="sm" onClick={() => void submitActivation()} disabled={activating} title="Promote this agent-authored schedule after inspection">{activating ? <AgentLoader kind="square" size={13} label="Activating schedule" /> : <Clock className="size-3.5" />}{activating ? "Activating…" : "Activate schedule"}</Button> : null}
+                  {selected.triggerState === "pending" || selected.triggerState === "paused" ? <Button variant="outline" size="sm" onClick={() => void submitActivation()} disabled={activating} title={selected.triggerState === "pending" ? "Promote this agent-authored schedule after inspection" : "Resume this paused workflow schedule"}>{activating ? <AgentLoader kind="square" size={13} label="Activating schedule" /> : <Clock className="size-3.5" />}{activating ? "Activating…" : selected.triggerState === "pending" ? "Activate schedule" : "Resume schedule"}</Button> : null}
+                  {selected.triggerState === "active" && workflowHasCron(selected) ? <Button variant="ghost" size="sm" onClick={() => void submitDeactivation()} disabled={activating} title="Pause this workflow's recurring schedule">{activating ? <AgentLoader kind="square" size={13} label="Pausing schedule" /> : <Clock className="size-3.5" />}{activating ? "Pausing…" : "Pause schedule"}</Button> : null}
                   <Button size="sm" onClick={() => onOpenObjective(selected)} title="Open objective setup with this exact workflow revision"><PlayCircle className="size-3.5" /> Use in objective</Button>
                 </div>
               </header>
@@ -268,7 +285,7 @@ function toActivationTrigger(trigger: CapabilityTrigger): NonNullable<Capability
 function WorkflowListItem({ record, selected, onSelect }: { record: WorkflowRevisionRecord; selected: boolean; onSelect: () => void }) {
   const model = buildWorkflowVisualModel(record);
   return <button type="button" onClick={onSelect} className={cn("group mb-1 w-full rounded-lg border px-3 py-2.5 text-left transition-colors", selected ? "border-foreground/20 bg-accent/70" : "border-transparent hover:border-border/80 hover:bg-muted/35")} aria-current={selected ? "true" : undefined}>
-    <div className="flex items-start gap-2"><span className={cn("mt-1.5 size-1.5 shrink-0 rounded-full", record.triggerState === "pending" ? "bg-warning" : selected ? "bg-info" : "bg-muted-foreground/45")} /><span className="min-w-0 flex-1"><span className="block truncate text-[12px] font-medium text-foreground/90">{model.name}</span><span className="mt-1 block truncate font-mono text-[9px] text-muted-foreground">{record.id}</span></span><span className="flex shrink-0 items-center gap-1.5"><span className={cn("hidden rounded border px-1.5 py-0.5 font-mono text-[9px] sm:inline", record.triggerState === "pending" ? "border-warning/25 bg-warning/8 text-warning" : "border-border/75 text-muted-foreground")}>{record.triggerState === "pending" ? "pending" : `r${record.revision}`}</span>{record.triggerState === "pending" ? <span className="rounded border border-border/75 px-1.5 py-0.5 font-mono text-[9px] text-muted-foreground sm:hidden">r{record.revision}</span> : null}</span></div>
+    <div className="flex items-start gap-2"><span className={cn("mt-1.5 size-1.5 shrink-0 rounded-full", record.triggerState === "pending" ? "bg-warning" : record.triggerState === "paused" ? "bg-muted-foreground/60" : selected ? "bg-info" : "bg-muted-foreground/45")} /><span className="min-w-0 flex-1"><span className="block truncate text-[12px] font-medium text-foreground/90">{model.name}</span><span className="mt-1 block truncate font-mono text-[9px] text-muted-foreground">{record.id}</span></span><span className="flex shrink-0 items-center gap-1.5"><span className={cn("hidden rounded border px-1.5 py-0.5 font-mono text-[9px] sm:inline", record.triggerState === "pending" ? "border-warning/25 bg-warning/8 text-warning" : record.triggerState === "paused" ? "border-border/75 bg-muted/30 text-muted-foreground" : "border-border/75 text-muted-foreground")}>{record.triggerState === "pending" ? "pending" : record.triggerState === "paused" ? "paused" : `r${record.revision}`}</span>{record.triggerState === "pending" || record.triggerState === "paused" ? <span className="rounded border border-border/75 px-1.5 py-0.5 font-mono text-[9px] text-muted-foreground sm:hidden">r{record.revision}</span> : null}</span></div>
   </button>;
 }
 
@@ -351,4 +368,11 @@ function StudioState({ title, detail, loading = false }: { title: string; detail
 function CapabilitiesError({ detail, onRetry }: { detail: string; onRetry: () => void }) { return <main className="grid min-h-0 flex-1 place-items-center bg-background px-6 text-center"><div className="max-w-md"><WarningCircle className="mx-auto size-6 text-warning/80" /><h2 className="mt-3 text-sm font-medium text-foreground/90">Capabilities unavailable</h2><p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">{detail}</p><Button variant="outline" size="sm" className="mt-4" onClick={onRetry}>Try again</Button></div></main>; }
 function Notice({ tone, icon, children, onDismiss }: { tone: "success" | "danger"; icon: React.ReactNode; children: React.ReactNode; onDismiss: () => void }) { return <div className={cn("flex items-start gap-2 border-b px-5 py-2.5 text-[10px] md:px-8", tone === "success" ? "border-success/15 bg-success/6 text-success" : "border-destructive/20 bg-destructive/6 text-destructive")} role="status"><span className="mt-0.5 size-3.5">{icon}</span><span className="min-w-0 flex-1 leading-5">{children}</span><button type="button" className="text-current/70 hover:text-current" onClick={onDismiss} aria-label="Dismiss notice">×</button></div>; }
 function workflowKey(record: Pick<WorkflowRevisionRecord, "id" | "revision">): string { return `${record.id}@${record.revision}`; }
+
+function workflowHasCron(record: WorkflowRevisionRecord): boolean {
+  const definition = record.definition;
+  if (!definition || typeof definition !== "object" || Array.isArray(definition)) return false;
+  const triggers = (definition as Record<string, unknown>).triggers;
+  return Array.isArray(triggers) && triggers.some((trigger) => Boolean(trigger && typeof trigger === "object" && !Array.isArray(trigger) && (trigger as Record<string, unknown>).type === "cron"));
+}
 function formatDate(value: string): string { const date = new Date(value); return Number.isNaN(date.getTime()) ? value : new Intl.DateTimeFormat(undefined, { dateStyle: "medium" }).format(date); }
