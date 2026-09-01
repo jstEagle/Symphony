@@ -225,7 +225,11 @@ describe("ObjectiveSupervisionRunner durable integration contract", () => {
 
     // A fresh runner must observe the durable assignment and never create a
     // second native agent for the same materialized item.
-    const restarted = new ObjectiveSupervisionRunner(fixture.runtime, fixture.repository, fixture.agents as never, fixture.store, { authority });
+    const restartedRuntime = new ObjectiveRuntime(fixture.repository, {
+      id: () => `restarted-id-${Date.now()}`,
+      now: () => "2026-09-01T00:00:04.000Z",
+    });
+    const restarted = new ObjectiveSupervisionRunner(restartedRuntime, fixture.repository, fixture.agents as never, fixture.store, { authority });
     const waiting = await restarted.step(run.runId);
     expect(waiting.action).toBe("waiting");
     expect(fixture.nativeLaunches).toHaveLength(1);
@@ -236,8 +240,8 @@ describe("ObjectiveSupervisionRunner durable integration contract", () => {
     fixture.store.saveAgent({ ...agent, status: "completed", output: { id: "a" }, finishedAt: "2026-09-01T00:00:02.000Z", updatedAt: "2026-09-01T00:00:02.000Z" });
     fixture.store.appendEvent({ type: "agent.completed", workflowId: run.workflowId, runId: run.runId, agentId: agent.id, occurredAt: "2026-09-01T00:00:02.000Z", payload: { output: { id: "a" } }, provenance: { source: "daemon" } });
     await restarted.step(run.runId);
-    expect(fixture.runtime.controlState(run.runId)?.snapshot.frontier).toHaveLength(1);
-    expect(fixture.runtime.controlState(run.runId)?.snapshot.executions.filter((entry) => entry.fanoutScope)).toHaveLength(2);
+    expect(restartedRuntime.controlState(run.runId)?.snapshot.frontier).toHaveLength(1);
+    expect(restartedRuntime.controlState(run.runId)?.snapshot.executions.filter((entry) => entry.fanoutScope)).toHaveLength(2);
 
     const secondDispatch = await restarted.step(run.runId);
     expect(secondDispatch.action).toBe("dispatched");
