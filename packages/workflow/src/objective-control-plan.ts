@@ -1146,6 +1146,12 @@ function resolveFanoutItems(
 ): ObjectiveControlFanoutValue[] {
   const source = getPath(contextFromSnapshot(snapshot, scope), node.source);
   if (!Array.isArray(source)) throw new Error(`Objective fan-out ${node.id} source ${node.source} must resolve to an array.`);
+  // Snapshot execution/frontier caps are durable safety boundaries. Refuse an
+  // expansion that cannot be represented atomically instead of partially
+  // materializing work and leaving the objective unrecoverably stuck.
+  if (source.length > 1_024) {
+    throw new Error(`Objective fan-out ${node.id} has ${source.length} items; durable materialization is limited to 1024 items.`);
+  }
   const seen = new Map<string, number>();
   return source.map((value, index) => {
     const baseKey = fanoutItemKey(value, index, node.aggregation?.keyPath);
@@ -1483,6 +1489,37 @@ function cancelParallelSiblings(
   return current;
 }
 
+/** Fail-fast fan-out semantics: a failed item cancels queued/running siblings
+ * in the same materialization so a restart cannot resurrect work that can no
+ * longer contribute to the aggregate. */
+function cancelFanoutSiblings(
+  snapshot: ObjectiveControlPlanSnapshot,
+  parent: ObjectiveControlExecutionKey,
+  failedChild: ObjectiveControlExecutionKey,
+  now: string,
+): ObjectiveControlPlanSnapshot {
+  const failedScope = recordFor(snapshot, failedChild)?.fanoutScope;
+  if (!failedScope) return snapshot;
+  const parentId = objectiveControlExecutionId(parent);
+  let current = snapshot;
+  for (const entry of snapshot.executions) {
+    const scope = entry.fanoutScope;
+    if (!scope || objectiveControlExecutionId(scope.fanoutExecution) !== parentId) continue;
+    if (objectiveControlExecutionId(entry.key) === objectiveControlExecutionId(failedChild) || isTerminal(entry.state)) continue;
+    current = replaceExecution(current, entry.key, {
+      state: "cancelled",
+      error: "Cancelled because a fan-out item failed.",
+      finishedAt: now,
+    });
+    current = {
+      ...current,
+      frontier: removeFrontier(current.frontier, entry.key),
+      exitReasons: { ...current.exitReasons, [objectiveControlExecutionId(entry.key)]: "cancelled" },
+    };
+  }
+  return current;
+}
+
 function settleParent(
   plan: ObjectiveControlPlan,
   snapshot: ObjectiveControlPlanSnapshot,
@@ -1506,6 +1543,7 @@ function settleParent(
 
     if (!isSuccess(childRecord.state)) {
       current = cancelParallelSiblings(plan, current, parent, child, now);
+      current = cancelFanoutSiblings(current, parent, child, now);
       current = replaceExecution(current, parent, { state: "failed", error: childRecord.error ?? "Child control execution failed.", finishedAt: now });
       current = {
         ...current,

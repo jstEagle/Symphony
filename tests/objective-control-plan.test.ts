@@ -167,6 +167,29 @@ describe("objective control plan compiler and reducer", () => {
     expect(snapshot.executions.find((entry) => entry.key.nodeId === "map-items")?.output).toEqual([{ result: "A" }, { result: "B" }]);
   });
 
+  it("fails a fan-out fast and durably cancels sibling items", () => {
+    const { plan, snapshot: initial } = fixture([{
+      id: "map-items",
+      type: "fanout",
+      source: "items",
+      concurrency: null,
+      itemTemplate: agent("item-worker"),
+    }], { items: [{ id: "a" }, { id: "b" }] });
+    let snapshot = ack(plan, initial);
+    let intent = nextObjectiveControlIntent(plan, snapshot);
+    if (intent.kind !== "fanout") throw new Error("expected fan-out materialization");
+    snapshot = applyObjectiveControlAcknowledgement(plan, snapshot, {
+      kind: "fanout", intentId: intent.intentId, requestKey: "fanout-materialize-failure", sourceHash: intent.sourceHash, fanoutItems: intent.items, now,
+    });
+    intent = nextObjectiveControlIntent(plan, snapshot);
+    if (intent.kind !== "agent") throw new Error("expected fan-out item agent");
+    snapshot = applyObjectiveControlAcknowledgement(plan, snapshot, {
+      kind: "agent", intentId: intent.intentId, requestKey: "fanout-agent-failure", attemptId: intent.attemptId, state: "failed", error: "item failed", now,
+    });
+    expect(snapshot.executions.filter((entry) => entry.fanoutScope).map((entry) => entry.state).sort()).toEqual(["cancelled", "failed"]);
+    expect(snapshot.executions.find((entry) => entry.key.nodeId === "map-items")?.state).toBe("failed");
+  });
+
   it("pins the saved workflow tree without flattening control flow", () => {
     const { plan } = fixture([
       {
