@@ -203,7 +203,7 @@ describe("Symphony MCP objective projections", () => {
     const listing = await client.listTools();
     expect(listing.tools.map((tool) => tool.name)).toContain("get_objective_strategy");
     expect(listing.tools.map((tool) => tool.name)).toContain("revise_objective_strategy");
-    expect(listing.tools.find((tool) => tool.name === "get_objective_strategy")?.description).toContain("durable materializer");
+    expect(listing.tools.find((tool) => tool.name === "get_objective_strategy")?.description).toContain("executable durable maps");
     expect(listing.tools.find((tool) => tool.name === "revise_objective_strategy")?.description).toContain("stable item bindings");
     expect(listing.tools.find((tool) => tool.name === "preview_objective_strategy")?.description).toContain("do not materialize child executions");
 

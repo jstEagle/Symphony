@@ -84,7 +84,7 @@ const ObjectiveCreateInputSchema = z.object({
   spec: ObjectiveSpecSchema,
   tasks: z.array(ObjectiveTaskSchema).max(128).default([]),
   context: z.record(z.string(), JsonValueSchema).default({}),
-  controlPlan: ObjectiveControlPlanSchema.nullable().optional().describe("Optional initial tree-shaped objective strategy; the daemon pins and validates it during admission. Control fanout nodes are durable map blueprints (source + itemTemplate + bounded or null/unlimited concurrency) and are currently surfaced fail-closed until the objective materializer is available; use a registered workflow for executable fanout."),
+  controlPlan: ObjectiveControlPlanSchema.nullable().optional().describe("Optional initial tree-shaped objective strategy; the daemon pins and validates it during admission. Control fanout nodes are executable durable map steps: source resolves a runtime array, itemTemplate receives item/itemIndex/itemKey bindings, concurrency is a positive integer or null for unlimited, and results reduce deterministically."),
 }).strict();
 
 const ObjectivePlanCommitInputSchema = z.object({
@@ -187,7 +187,7 @@ const ObjectiveStrategyMutationInputSchema = z.object({
     preserveLineage: z.literal(true),
   }).strict().optional(),
   maxIterations: z.number().int().positive().optional(),
-  node: ObjectiveControlNodeSchema.optional().describe("Typed strategy node. A fanout node maps a runtime array at source through itemTemplate, exposing item, itemIndex, and stable itemKey bindings; set concurrency to a positive integer or null for unlimited concurrency. Objective fanout is currently a durable blueprint that waits for materialization, so use register_workflow/run_workflow when the map must execute now."),
+  node: ObjectiveControlNodeSchema.optional().describe("Typed strategy node. A fanout node is an executable durable map: it resolves a runtime array at source, runs itemTemplate with item/itemIndex/itemKey bindings, accepts a positive concurrency cap or null for unlimited concurrency, and reduces results as an array, keyed object, or merged object."),
 }).strict();
 
 const ObjectiveSignalDeliveryInputSchema = z.object({
@@ -627,7 +627,7 @@ server.registerTool("publish_objective_artifact", {
 )));
 
 server.registerTool("get_objective_strategy", {
-  description: "Read the current durable control strategy for an objective run: its immutable control-plan head and revision, execution snapshot, and append-only mutation history. Symphony owns this cross-harness strategy; native harness subagents are ephemeral implementation tactics. Fanout nodes are shown as source/itemTemplate/concurrency/reducer blueprints; objective execution currently waits for their durable materializer rather than dispatching the blueprint accidentally. Use a registered workflow for executable fanout. The daemon scopes the result to the authenticated agent's objective lineage.",
+  description: "Read the current durable control strategy for an objective run: its immutable control-plan head and revision, execution snapshot, and append-only mutation history. Symphony owns this cross-harness strategy; native harness subagents are ephemeral implementation tactics. Fanout nodes are executable durable maps; inspect their source, itemTemplate, concurrency, stable item bindings, reducer, materialized child scopes, and join state. The daemon scopes the result to the authenticated agent's objective lineage.",
   inputSchema: {
     runId: z.string().min(1).describe("The durable objective run ID."),
   },
@@ -642,7 +642,7 @@ server.registerTool("deliver_objective_signal", {
 )));
 
 server.registerTool("revise_objective_strategy", {
-  description: "Submit one typed compare-and-swap mutation to an objective's durable Symphony strategy. The daemon binds the authenticated actor and idempotency key, derives the resulting revision and snapshot server-side, and emits a semantic invalidation event. Fanout nodes are valid agent-authored map blueprints with a runtime source, itemTemplate, positive or null/unlimited concurrency, stable item bindings, and an optional array/object/merge reducer; they remain fail-closed until objective materialization is implemented. Never send or rely on a caller-computed resulting plan/snapshot; rebase after a deterministic revision conflict.",
+  description: "Submit one typed compare-and-swap mutation to an objective's durable Symphony strategy. The daemon binds the authenticated actor and idempotency key, derives the resulting revision and snapshot server-side, and emits a semantic invalidation event. Fanout nodes are executable agent-authored maps with a runtime source, itemTemplate, positive or null/unlimited concurrency, stable item bindings, and an optional array/object/merge reducer; the supervisor materializes child scopes, enforces capacity, cancels siblings on failure, and joins results deterministically. Never send or rely on a caller-computed resulting plan/snapshot; rebase after a deterministic revision conflict.",
   inputSchema: ObjectiveStrategyMutationInputSchema,
 }, async ({ runId, ...input }, extra) => result(await api(
   `/v1/objectives/${encodeURIComponent(runId)}/strategy`,
