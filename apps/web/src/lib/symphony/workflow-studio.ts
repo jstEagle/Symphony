@@ -1,6 +1,6 @@
 import type { JsonValue, WorkflowRevisionRecord } from "./contracts";
 
-export type WorkflowStepType = "agent" | "sequence" | "parallel" | "if" | "while" | "set" | "evaluate" | "timer" | "signal";
+export type WorkflowStepType = "agent" | "sequence" | "parallel" | "fanout" | "if" | "while" | "set" | "evaluate" | "timer" | "signal";
 
 export type WorkflowBranch = Readonly<{
   label: "then" | "else";
@@ -33,7 +33,7 @@ export type WorkflowJsonValidation = Readonly<{
   value?: JsonValue;
 }>;
 
-const STEP_TYPES = new Set<WorkflowStepType>(["agent", "sequence", "parallel", "if", "while", "set", "evaluate", "timer", "signal"]);
+const STEP_TYPES = new Set<WorkflowStepType>(["agent", "sequence", "parallel", "fanout", "if", "while", "set", "evaluate", "timer", "signal"]);
 const ROOT_KEYS = new Set(["id", "name", "mission", "workspace", "inputSchema", "output", "steps", "triggers"]);
 const MISSION_KEYS = new Set(["statement", "keyResults"]);
 const WORKSPACE_KEYS = new Set(["path", "remoteRepository", "startingRef", "dirtyPolicy"]);
@@ -41,6 +41,7 @@ const STEP_KEYS: Record<WorkflowStepType, ReadonlySet<string>> = {
   agent: new Set(["id", "type", "dependsOn", "objective", "model", "harness", "permissions", "outputSchema", "routing", "workspace"]),
   sequence: new Set(["id", "type", "dependsOn", "steps"]),
   parallel: new Set(["id", "type", "dependsOn", "steps"]),
+  fanout: new Set(["id", "type", "dependsOn", "source", "itemTemplate", "concurrency", "aggregation"]),
   while: new Set(["id", "type", "dependsOn", "condition", "steps", "maxIterations"]),
   if: new Set(["id", "type", "dependsOn", "condition", "then", "else"]),
   set: new Set(["id", "type", "dependsOn", "value"]),
@@ -130,7 +131,7 @@ function validateSteps(
     else if (ids.has(id)) errors.push(`${stepPath}.id duplicates ${id}.`);
     else ids.add(id);
     if (typeof type !== "string" || !STEP_TYPES.has(type as WorkflowStepType)) {
-      errors.push(`${stepPath}.type must be one of agent, sequence, parallel, if, while, set, evaluate, timer, signal.`);
+      errors.push(`${stepPath}.type must be one of agent, sequence, parallel, fanout, if, while, set, evaluate, timer, signal.`);
       return;
     }
     const stepType = type as WorkflowStepType;
@@ -152,6 +153,20 @@ function validateSteps(
       if (typeof raw.signalKey !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/u.test(raw.signalKey)) errors.push(`${stepPath}.signalKey must be a stable signal key.`);
       if (raw.expiresAfterMs !== undefined && raw.expiresAfterMs !== null && (typeof raw.expiresAfterMs !== "number" || !Number.isInteger(raw.expiresAfterMs) || raw.expiresAfterMs <= 0)) errors.push(`${stepPath}.expiresAfterMs must be a positive integer or null.`);
       if (raw.payloadSchema !== undefined && !isRecord(raw.payloadSchema)) errors.push(`${stepPath}.payloadSchema must be an object.`);
+    }
+    if (stepType === "fanout") {
+      requireString(raw, "source", stepPath, errors);
+      if (!isRecord(raw.itemTemplate)) errors.push(`${stepPath}.itemTemplate must be an object.`);
+      else validateSteps([raw.itemTemplate], `${stepPath}.itemTemplate`, errors, new Set(), new Map());
+      if (raw.concurrency !== undefined && raw.concurrency !== null && (typeof raw.concurrency !== "number" || !Number.isInteger(raw.concurrency) || raw.concurrency <= 0)) errors.push(`${stepPath}.concurrency must be a positive integer or null.`);
+      if (raw.aggregation !== undefined) {
+        if (!isRecord(raw.aggregation)) errors.push(`${stepPath}.aggregation must be an object.`);
+        else {
+          validateKeys(raw.aggregation, new Set(["mode", "keyPath"]), `${stepPath}.aggregation`, errors);
+          if (!["array", "object", "merge"].includes(String(raw.aggregation.mode))) errors.push(`${stepPath}.aggregation.mode must be array, object, or merge.`);
+          if (raw.aggregation.keyPath !== undefined && typeof raw.aggregation.keyPath !== "string") errors.push(`${stepPath}.aggregation.keyPath must be a string.`);
+        }
+      }
     }
     if (stepType === "sequence" || stepType === "parallel" || stepType === "while") {
       const nested = raw.steps;
@@ -272,6 +287,8 @@ function visualNode(value: unknown, depth: number): WorkflowVisualNode | null {
   if (!step || !id || !type || !STEP_TYPES.has(type)) return null;
   const children = (type === "sequence" || type === "parallel" || type === "while")
     ? asArray(step.steps).map((item) => visualNode(item, depth + 1)).filter((item): item is WorkflowVisualNode => item !== null)
+    : type === "fanout"
+      ? [visualNode(step.itemTemplate, depth + 1)].filter((item): item is WorkflowVisualNode => item !== null)
     : [];
   const branches: WorkflowBranch[] = type === "if"
     ? ([
@@ -309,6 +326,12 @@ function stepDetail(step: Record<string, unknown>, type: WorkflowStepType, child
     return `Wait ${duration} · daemon-owned due time${step.expiresAfterMs === null ? " · no expiry" : step.expiresAfterMs === undefined ? "" : ` · expires after ${Math.round(Number(step.expiresAfterMs) / 1_000)}s`}`;
   }
   if (type === "signal") return `Wait for ${asString(step.signalKey) ?? "external signal"} · daemon-owned subscription`;
+  if (type === "fanout") {
+    const source = asString(step.source) ?? "source unavailable";
+    const concurrency = step.concurrency === null ? "unlimited" : typeof step.concurrency === "number" ? String(step.concurrency) : "unlimited";
+    const aggregation = asString(asRecord(step.aggregation)?.mode) ?? "array";
+    return `Map ${source} · ${aggregation} results · ${concurrency} concurrent`;
+  }
   if (type === "if" || type === "while") {
     const condition = asRecord(step.condition);
     const expression = [asString(condition?.path), asString(condition?.op), condition?.value === undefined ? undefined : JSON.stringify(condition.value)].filter(Boolean).join(" ");

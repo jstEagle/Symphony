@@ -93,6 +93,29 @@ describe("workflow studio view model", () => {
     expect(model.steps[0]?.detail).not.toContain("%");
   });
 
+  it("accepts and visualizes runtime fan-out blueprints", () => {
+    const fanoutDefinition = {
+      ...definition,
+      steps: [{
+        id: "map-files",
+        type: "fanout",
+        source: "steps.files",
+        concurrency: 4,
+        aggregation: { mode: "object", keyPath: "path" },
+        itemTemplate: { id: "inspect-file", type: "agent", objective: "Inspect {{item.path}}", outputSchema: {} },
+      }],
+    };
+    const result = validateWorkflowJson(JSON.stringify(fanoutDefinition));
+    expect(result.valid).toBe(true);
+    const model = buildWorkflowVisualModel({ ...record, definition: fanoutDefinition as unknown as JsonValue });
+    expect(model.steps[0]).toMatchObject({
+      id: "map-files",
+      type: "fanout",
+      detail: "Map steps.files · object results · 4 concurrent",
+      steps: [{ id: "inspect-file", type: "agent" }],
+    });
+  });
+
   it("validates dependency references and exposes prerequisite edges in the structure", () => {
     const dependentDefinition = {
       ...definition,
