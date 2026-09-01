@@ -12,6 +12,7 @@ import {
   ObjectiveTaskSchema,
   ObjectiveTaskRecordSchema,
   ObjectiveControlPlanSchema,
+  ObjectiveControlPlanSnapshotSchema,
   ObjectiveControlMutationSchema,
   isObjectivePolicyHashValid,
   objectivePolicyHash,
@@ -805,7 +806,13 @@ export class ObjectiveRuntime {
         // frontier. Derive and acknowledge each target against a scoped
         // frontier; deriving only the global next intent would repeatedly see
         // the first waiting suspension and silently leave its siblings live.
-        const scopedSnapshot = ObjectiveControlPlanSnapshotSchema.parse({ ...state.snapshot, frontier: [current.key] });
+        const scopedSnapshot = ObjectiveControlPlanSnapshotSchema.parse({
+          ...state.snapshot,
+          frontier: [
+            current.key,
+            ...state.snapshot.frontier.filter((entry) => objectiveControlExecutionId(entry) !== objectiveControlExecutionId(current.key)),
+          ],
+        });
         const intent = nextObjectiveControlIntent(state.revision.plan, scopedSnapshot, this.now());
         if ((intent.kind !== "timer" && intent.kind !== "signal") || objectiveControlExecutionId(intent.execution) !== objectiveControlExecutionId(execution.key)) continue;
         state = this.acknowledgeControlAction(runId, {
@@ -892,7 +899,17 @@ export class ObjectiveRuntime {
     // Keep the override private and scope only intent derivation/reduction;
     // the persisted snapshot still contains every other frontier entry.
     const controlSnapshot = executionOverride
-      ? ObjectiveControlPlanSnapshotSchema.parse({ ...state.snapshot, frontier: [executionOverride] })
+      ? ObjectiveControlPlanSnapshotSchema.parse({
+          ...state.snapshot,
+          // Move the requested execution to the front for intent derivation,
+          // but retain every other frontier entry. Applying the reducer to a
+          // snapshot containing only the target would silently drop sibling
+          // work from the durable frontier.
+          frontier: [
+            executionOverride,
+            ...state.snapshot.frontier.filter((entry) => objectiveControlExecutionId(entry) !== objectiveControlExecutionId(executionOverride)),
+          ],
+        })
       : state.snapshot;
     const intent = nextObjectiveControlIntent(state.revision.plan, controlSnapshot, this.now());
     if (intent.intentId !== acknowledgement.intentId) {

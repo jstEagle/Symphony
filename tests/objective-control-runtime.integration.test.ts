@@ -6,13 +6,19 @@ import {
   AgentRecordSchema,
   AgentWorkOrderSchema,
   ObjectiveControlPlanSchema,
+  ObjectiveControlPlanSnapshotSchema,
   objectiveControlExecutionId,
   type AgentRecord,
   type AgentWorkOrder,
   type JsonValue,
   type ObjectiveControlPlan,
 } from "@symphony/protocol";
-import { WorkflowCompiler, type WorkflowDefinition } from "../packages/workflow/src/index.js";
+import {
+  applyObjectiveControlAcknowledgement,
+  nextObjectiveControlIntent,
+  WorkflowCompiler,
+  type WorkflowDefinition,
+} from "../packages/workflow/src/index.js";
 import { compileObjectiveControlPlan } from "../packages/workflow/src/objective-control-plan.js";
 import { ObjectiveRuntime, type ObjectiveRuntimeAuthority } from "../packages/workflow/src/objective-runtime.js";
 import { ObjectiveApprovalExpiryProcessor } from "../packages/workflow/src/objective-approval-expiry.js";
@@ -67,6 +73,30 @@ function plan(): ObjectiveControlPlan {
         ...(compiled.root.steps[0] as object),
         inputs: [{ kind: "file", path: "/tmp/control-runtime/input.json" }],
       }],
+    },
+  });
+}
+
+function parallelSignalPlan(): ObjectiveControlPlan {
+  const base = plan();
+  const signal = (id: string, signalKey: string) => ({
+    id,
+    sourceNodeId: id,
+    sourcePath: `root.${id}`,
+    dependsOn: [],
+    label: id,
+    type: "signal" as const,
+    signalKey,
+    expiresAfterMs: 60_000,
+    payloadSchema: { status: "string" },
+  });
+  return ObjectiveControlPlanSchema.parse({
+    ...base,
+    id: "control-runtime-parallel-signals",
+    root: {
+      ...base.root,
+      type: "parallel",
+      steps: [signal("signal-a", "deployment.a"), signal("signal-b", "deployment.b")],
     },
   });
 }
@@ -280,6 +310,45 @@ describe("durable objective control runtime integration", () => {
     await restarted.step(run.runId);
     expect(fixture.runtime.get(run.runId).state).toBe("succeeded");
     expect(fixture.repository.getLatestObjectiveControlSnapshot(run.runId)?.sequence).toBeGreaterThan(4);
+  });
+
+  it("cancels every waiting suspension in a parallel frontier", async () => {
+    const fixture = makeFixture();
+    const controlPlan = parallelSignalPlan();
+    const run = createObjective(fixture, controlPlan, "par-cancel");
+    const runner = new ObjectiveSupervisionRunner(fixture.runtime, fixture.repository, { create: fixture.create } as never, fixture.store, { authority });
+
+    await runner.step(run.runId); // enter the parallel root and materialize both signal executions
+    await runner.step(run.runId); // subscribe signal-a through the regular supervisor path
+
+    const current = fixture.runtime.controlState(run.runId);
+    if (!current) throw new Error("parallel control state was not persisted");
+    const signalA = current.snapshot.executions.find((entry) => entry.key.nodeId === "signal-a")?.key;
+    const signalB = current.snapshot.executions.find((entry) => entry.key.nodeId === "signal-b")?.key;
+    if (!signalA || !signalB) throw new Error("parallel signal executions were not materialized");
+    const scoped = ObjectiveControlPlanSnapshotSchema.parse({ ...current.snapshot, frontier: [signalB] });
+    const signalBIntent = nextObjectiveControlIntent(controlPlan, scoped, "2026-09-01T00:00:01.000Z");
+    expect(signalBIntent).toMatchObject({ kind: "signal", operation: "subscribe", execution: signalB });
+    const bothWaiting = applyObjectiveControlAcknowledgement(controlPlan, scoped, {
+      kind: "signal",
+      intentId: signalBIntent.intentId,
+      requestKey: "control-runtime-parallel-signal-b-subscribe",
+      signalKey: "deployment.b",
+      since: "2026-09-01T00:00:01.000Z",
+      expiresAt: "2026-09-01T00:01:01.000Z",
+      now: "2026-09-01T00:00:01.000Z",
+    });
+    const merged = ObjectiveControlPlanSnapshotSchema.parse({ ...bothWaiting, frontier: [signalA, signalB] });
+    expect(fixture.repository.saveObjectiveControlSnapshot(merged)).toBe(true);
+
+    const cancelled = fixture.runtime.cancelControlSuspensions(run.runId, authority);
+    expect(cancelled).not.toBeNull();
+    const executions = cancelled?.snapshot.executions.filter((entry) => entry.key.nodeId === "signal-a" || entry.key.nodeId === "signal-b") ?? [];
+    expect(executions).toHaveLength(2);
+    expect(executions.map((entry) => entry.suspension?.status)).toEqual(["cancelled", "cancelled"]);
+    expect(executions.map((entry) => entry.state)).toEqual(["cancelled", "cancelled"]);
+    expect(cancelled?.snapshot.frontier.some((entry) => entry.key.nodeId === "signal-a" || entry.key.nodeId === "signal-b")).toBe(false);
+    expect(fixture.repository.listObjectiveControlSuspensions(run.runId).every((entry) => entry.status === "cancelled")).toBe(true);
   });
 
   it("holds an approval-gated control agent until its durable approval is resolved", async () => {

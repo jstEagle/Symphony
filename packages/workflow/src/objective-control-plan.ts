@@ -1216,10 +1216,20 @@ function cancelParallelSiblings(
   for (const entry of snapshot.executions) {
     if (!siblings.some((sibling) => objectiveControlExecutionId(sibling) === objectiveControlExecutionId(entry.key) || isDescendantOf(plan, entry.key, sibling))) continue;
     if (isTerminal(entry.state)) continue;
+    const waitingSuspension = entry.suspension?.status === "waiting" ? {
+      ...entry.suspension,
+      status: "cancelled" as const,
+      terminalReason: "cancelled" as const,
+      settledAt: now,
+    } : null;
     current = replaceExecution(current, entry.key, {
-      state: "failed",
+      // External waits have a distinct terminal suspension state. Keeping a
+      // waiting timer/signal attached to a failed sibling leaves an impossible
+      // projection that cannot be resumed or cancelled after a restart.
+      state: waitingSuspension ? "cancelled" : "failed",
       error: "Cancelled because a parallel sibling failed.",
       finishedAt: now,
+      ...(waitingSuspension ? { suspension: waitingSuspension } : {}),
     });
     current = {
       ...current,
