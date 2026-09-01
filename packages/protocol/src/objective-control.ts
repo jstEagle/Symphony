@@ -1078,7 +1078,7 @@ export const ObjectiveControlFanoutIntentSchema = z
       context.addIssue({ code: "custom", path: ["children"], message: "Fan-out join children must match materialized item executions" });
     }
   });
-export type ObjectiveControlFanoutIntent = z.infer<typeof ObjectiveControlFanoutIntentSchema>;
+export type ObjectiveControlFanoutProtocolIntent = z.infer<typeof ObjectiveControlFanoutIntentSchema>;
 
 /** Wire receipt for durable fan-out expansion/reduction. */
 export const ObjectiveControlFanoutAcknowledgementSchema = z
