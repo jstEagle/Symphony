@@ -238,6 +238,29 @@ describe("ObjectiveSupervisionRunner durable integration contract", () => {
     await restarted.step(run.runId);
     expect(fixture.runtime.controlState(run.runId)?.snapshot.frontier).toHaveLength(1);
     expect(fixture.runtime.controlState(run.runId)?.snapshot.executions.filter((entry) => entry.fanoutScope)).toHaveLength(2);
+
+    const secondDispatch = await restarted.step(run.runId);
+    expect(secondDispatch.action).toBe("dispatched");
+    expect(secondDispatch.intent.kind).toBe("agent");
+    expect(fixture.nativeLaunches).toHaveLength(2);
+    expect(fixture.orders[1]?.objective).toBe("Process b as b.");
+    const secondOrder = fixture.orders[1];
+    if (!secondOrder) throw new Error("second fan-out dispatch order was not recorded");
+    const secondAgent = agentFor(fixture, secondOrder);
+    fixture.store.saveAgent({ ...secondAgent, status: "completed", output: { id: "b" }, finishedAt: "2026-09-01T00:00:03.000Z", updatedAt: "2026-09-01T00:00:03.000Z" });
+    fixture.store.appendEvent({ type: "agent.completed", workflowId: run.workflowId, runId: run.runId, agentId: secondAgent.id, occurredAt: "2026-09-01T00:00:03.000Z", payload: { output: { id: "b" } }, provenance: { source: "daemon" } });
+    const observed = await restarted.step(run.runId);
+    expect(observed.intent.kind).toBe("agent");
+    const joined = await restarted.step(run.runId);
+    expect(joined.intent.kind).toBe("fanout");
+    expect(joined.action).toBe("dispatched");
+    const joinedAgain = await restarted.step(run.runId);
+    expect(joinedAgain.intent.kind).toBe("join");
+    expect(joinedAgain.action).toBe("dispatched");
+    const completed = await restarted.step(run.runId);
+    expect(completed.intent.kind).toBe("complete");
+    expect(completed.action).toBe("settled");
+    expect(fixture.runtime.get(run.runId).state).toBe("succeeded");
   });
 
   it("recovers a dispatched frontier without launching duplicate native work", async () => {
