@@ -350,6 +350,16 @@ server.registerTool("list_workflows", {
   inputSchema: {},
 }, async () => result(await api("/v1/workflows")));
 
+server.registerTool("preview_workflow", {
+  description: "Validate and inspect an agent-authored Symphony workflow without registering or activating it. The daemon compiler returns the stable workflow ID, next immutable revision (or the existing revision when unchanged), content hash, mission, and flattened step IDs. Use this before register_workflow when designing dynamic fanout, loops, signals, or approval-aware plans.",
+  inputSchema: {
+    definition: z.record(z.string(), z.unknown()).describe("A complete candidate Symphony workflow definition."),
+  },
+}, async ({ definition }) => result(await api("/v1/workflows/preview", {
+  method: "POST",
+  body: JSON.stringify(definition),
+})));
+
 server.registerTool("list_capabilities", {
   description: "List the daemon-backed, versioned Symphony capability library. This is a read-only projection of durable capability definitions and provenance; it is separate from native ephemeral subagent tools and does not infer or execute a capability.",
   inputSchema: { capabilityId: CapabilityIdSchema.optional() },

@@ -497,6 +497,28 @@ export async function registerWorkflow(
   });
 }
 
+export type WorkflowPreview = Readonly<{
+  valid: true;
+  workflowId: string;
+  revision: number;
+  hash: string;
+  unchanged: boolean;
+  stepIds: string[];
+  mission: JsonValue;
+}>;
+
+/** Validate a candidate workflow through the daemon compiler without persisting it. */
+export async function previewWorkflow(
+  definition: JsonValue,
+  signal?: AbortSignal,
+): Promise<WorkflowPreview> {
+  return request<WorkflowPreview>("/workflows/preview", {
+    method: "POST",
+    body: JSON.stringify(definition),
+    signal,
+  });
+}
+
 /** Promote an agent-authored workflow schedule after explicit user/agent review. */
 export async function activateWorkflow(
   workflowId: string,

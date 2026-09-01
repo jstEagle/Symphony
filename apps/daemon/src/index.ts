@@ -1981,6 +1981,36 @@ export class SymphonyDaemon {
         return this.json(response, 200, this.agents.list({ ...(runId ? { runId } : {}), activeOnly: url.searchParams.get("active") === "true" }));
       }
       if (url.pathname === "/v1/agents" && request.method === "POST") return this.json(response, 202, await this.createAgent(request, await body(request)));
+      if (url.pathname === "/v1/workflows/preview" && request.method === "POST") {
+        // Preview is deliberately side-effect free: agents can validate and
+        // inspect a proposed orchestration before spending a registration
+        // revision or activating a schedule. The compiler remains the single
+        // authoritative workflow-shape validator.
+        this.authenticatedRequestActor(request, "preview a workflow", false);
+        const definition = z.record(z.string(), JsonValueSchema).parse(await body(request));
+        const id = typeof definition.id === "string" ? definition.id : "";
+        const previous = id ? this.store.getWorkflow(id) : null;
+        const candidateRevision = (previous?.revision ?? 0) + 1;
+        let candidate;
+        try {
+          candidate = new WorkflowCompiler().compile(definition, candidateRevision);
+        } catch (error) {
+          // A preview is a validation boundary: malformed workflow programs
+          // are client errors, never an internal daemon failure.
+          throw new HttpError(400, error instanceof Error ? error.message : String(error));
+        }
+        const unchanged = previous?.hash === candidate.hash;
+        const revision = unchanged ? previous.revision : candidate.revision;
+        return this.json(response, 200, {
+          valid: true,
+          workflowId: candidate.definition.id,
+          revision,
+          hash: candidate.hash,
+          unchanged,
+          stepIds: candidate.stepIds,
+          mission: candidate.mission,
+        });
+      }
       if (url.pathname === "/v1/workflows" && request.method === "GET") return this.json(response, 200, this.workflowReadProjection());
       if (url.pathname === "/v1/workflows" && request.method === "POST") {
         this.requireFullAccessAgent(request, "register a workflow revision");

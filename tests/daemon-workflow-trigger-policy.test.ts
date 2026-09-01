@@ -194,4 +194,66 @@ describe("daemon workflow trigger activation policy", () => {
       await second.close();
     }
   });
+
+  it("previews candidate workflows without registering or advancing the registry", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-workflow-preview-daemon-"));
+    temporary.push(root);
+    const port = await availablePort();
+    config(root, port);
+    seedFullAccessAgent(root);
+    const daemon = await startDaemon({ rootDirectory: root, noPlugins: true, secretStore: testSecretStore(), credentialPlatform: "linux" });
+    const definition = scheduledDefinition("preview-only");
+    try {
+      const preview = await postWithRetry(`http://127.0.0.1:${port}/v1/workflows/preview`, {
+        method: "POST",
+        headers: { "content-type": "application/json", connection: "close" },
+        body: JSON.stringify(definition),
+      });
+      expect(preview.status).toBe(200);
+      const body = await preview.json() as {
+        valid: boolean;
+        workflowId: string;
+        revision: number;
+        hash: string;
+        unchanged: boolean;
+        stepIds: string[];
+        mission: { id: string; revision: number; hash: string; statement: string; keyResults: string[] };
+      };
+      expect(body).toMatchObject({
+        valid: true,
+        workflowId: "preview-only",
+        revision: 1,
+        unchanged: false,
+        stepIds: ["value"],
+        mission: { id: "preview-only", revision: 1, statement: "Run the scheduled objective.", keyResults: [] },
+      });
+      expect(body.hash).toMatch(/^[a-f0-9]{64}$/u);
+      expect(body.mission.hash).toMatch(/^[a-f0-9]{64}$/u);
+      expect(daemon.store.getWorkflow("preview-only")).toBeNull();
+
+      const invalid = await postWithRetry(`http://127.0.0.1:${port}/v1/workflows/preview`, {
+        method: "POST",
+        headers: { "content-type": "application/json", connection: "close" },
+        body: JSON.stringify({ ...definition, steps: [{ id: "value", type: "set", value: true }, { id: "value", type: "set", value: false }] }),
+      });
+      expect(invalid.status).toBe(400);
+
+      const registration = await postWithRetry(`http://127.0.0.1:${port}/v1/workflows`, {
+        method: "POST",
+        headers: { "idempotency-key": "preview-register", "content-type": "application/json", connection: "close" },
+        body: JSON.stringify(definition),
+      });
+      expect(registration.status).toBe(201);
+
+      const repeated = await postWithRetry(`http://127.0.0.1:${port}/v1/workflows/preview`, {
+        method: "POST",
+        headers: { "content-type": "application/json", connection: "close" },
+        body: JSON.stringify(definition),
+      });
+      expect(repeated.status).toBe(200);
+      await expect(repeated.json()).resolves.toMatchObject({ workflowId: "preview-only", revision: 1, unchanged: true, stepIds: ["value"] });
+    } finally {
+      await daemon.close();
+    }
+  });
 });

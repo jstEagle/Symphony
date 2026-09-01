@@ -31,12 +31,14 @@ async function toolNames(canCreate: boolean): Promise<string[]> {
 describe("Symphony MCP workflow authority", () => {
   it("exposes both workflow mutations only to agents allowed to create", async () => {
     const readOnlyTools = await toolNames(false);
+    expect(readOnlyTools).toContain("preview_workflow");
     expect(readOnlyTools).not.toContain("register_workflow");
     expect(readOnlyTools).not.toContain("run_workflow");
     expect(readOnlyTools).not.toContain("activate_workflow");
     expect(readOnlyTools).not.toContain("deactivate_workflow");
 
     const creatorTools = await toolNames(true);
+    expect(creatorTools).toContain("preview_workflow");
     expect(creatorTools).toContain("register_workflow");
     expect(creatorTools).toContain("run_workflow");
     expect(creatorTools).toContain("activate_workflow");
