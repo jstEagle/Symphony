@@ -43,7 +43,8 @@ export function toThreadMessages(messages: ConversationMessage[]): ThreadMessage
  *
  * Only stable identities are used to coalesce records here:
  * - the durable message id, or
- * - a native part/tool id when a provider recreated the message envelope.
+ * - a native part/tool id plus the original creation timestamp when a provider
+ *   recreated the message envelope.
  * Identity-free text is intentionally never deduped.
  */
 export function coalesceConversationTurns(messages: ConversationMessage[]): ConversationMessage[] {
@@ -79,7 +80,9 @@ export function mergeConversationMessageBatch(
  * Merge snapshots from the bootstrap response, a complete-thread fetch, and
  * the SSE stream. The daemon normally gives every message one durable id;
  * native providers can still recreate an envelope during reconnect, so a
- * stable native part/tool id is a second, conservative identity fence.
+ * stable native part/tool id at the same creation timestamp is a second,
+ * conservative identity fence. Tool-call ids are scoped to a native harness
+ * run and may be reused after a turn or harness switch.
  *
  * This deliberately does not compare text, timestamps alone, or adjacent
  * roles. Repeated prompts and repeated assistant prose are valid conversation
@@ -211,7 +214,11 @@ function stablePartIdentities(message: ConversationMessage): Set<string> {
 }
 
 function hasSameStablePartIdentity(left: ConversationMessage, right: ConversationMessage): boolean {
-  if (left.threadId !== right.threadId || renderRole(left.role) !== renderRole(right.role)) return false;
+  if (
+    left.threadId !== right.threadId
+    || renderRole(left.role) !== renderRole(right.role)
+    || left.createdAt !== right.createdAt
+  ) return false;
   const leftIds = stablePartIdentities(left);
   const rightIds = stablePartIdentities(right);
   if (leftIds.size === 0 || rightIds.size === 0) return false;

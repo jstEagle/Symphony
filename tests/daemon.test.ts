@@ -738,6 +738,10 @@ describe("local daemon API", () => {
       expect(bootstrap.agents).toHaveLength(1_005);
       expect(new Set(bootstrap.agents.map((agent) => agent.id)).size).toBe(1_005);
       expect(bootstrap.agents.every((agent) => agent.status === "lost")).toBe(true);
+      const listed = await fetch(`http://127.0.0.1:${port}/v1/agents`).then((response) => response.json()) as Array<{ id: string; status: string }>;
+      expect(listed).toHaveLength(1_005);
+      expect(new Set(listed.map((agent) => agent.id)).size).toBe(1_005);
+      expect(listed.every((agent) => agent.status === "lost")).toBe(true);
       expect(daemon.store.listAgents({ activeOnly: true, limit: 2_000 })).toEqual([]);
     } finally {
       await daemon.close();

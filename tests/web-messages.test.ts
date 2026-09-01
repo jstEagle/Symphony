@@ -234,6 +234,49 @@ describe("web conversation projection", () => {
     expect(coalesceConversationTurns([bootstrap, stream])).toEqual([stream]);
   });
 
+  it("preserves tool-call ids reused by a later harness turn", () => {
+    const firstUser: ConversationMessage = {
+      id: "user-1",
+      threadId: "thread-1",
+      role: "user",
+      parts: [{ type: "text", text: "Inspect with Codex" }],
+      createdAt: "2026-08-30T21:13:07.000Z",
+    };
+    const firstAssistant: ConversationMessage = {
+      id: "assistant-codex",
+      threadId: "thread-1",
+      role: "assistant",
+      parts: [{ type: "tool-call", toolCallId: "tool-1", toolName: "list_agents", args: {} }],
+      createdAt: "2026-08-30T21:13:08.000Z",
+    };
+    const secondUser: ConversationMessage = {
+      id: "user-2",
+      threadId: "thread-1",
+      role: "user",
+      parts: [{ type: "text", text: "Continue with Claude" }],
+      createdAt: "2026-08-30T21:14:07.000Z",
+    };
+    const secondAssistant: ConversationMessage = {
+      id: "assistant-claude",
+      threadId: "thread-1",
+      role: "assistant",
+      parts: [{ type: "tool-call", toolCallId: "tool-1", toolName: "read_file", args: { path: "README.md" } }],
+      createdAt: "2026-08-30T21:14:08.000Z",
+    };
+
+    expect(toThreadMessages([
+      firstUser,
+      firstAssistant,
+      secondUser,
+      secondAssistant,
+    ]).map((message) => message.id)).toEqual([
+      "user-1",
+      "assistant-codex",
+      "user-2",
+      "assistant-claude",
+    ]);
+  });
+
   it("preserves repeated identity-free assistant prose as separate messages", () => {
     const first: ConversationMessage = {
       id: "assistant-a",

@@ -121,7 +121,6 @@ export function CommandPalette({ open, onOpenChange, handle, directory, defaultG
     ...visibleChats.map((item) => ({
       run: () => {
         onSelectConversation(item.conversation.id);
-        if (isMobile) setOpenMobile(false);
       },
     })),
   ];
@@ -138,7 +137,11 @@ export function CommandPalette({ open, onOpenChange, handle, directory, defaultG
     return () => window.cancelAnimationFrame(frame);
   }, [open]);
 
-  const execute = (run: () => void) => { onOpenChange(false); run(); };
+  const execute = (run: () => void) => {
+    onOpenChange(false);
+    if (isMobile) setOpenMobile(false);
+    run();
+  };
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange} handle={handle}>
@@ -169,7 +172,6 @@ export function CommandPalette({ open, onOpenChange, handle, directory, defaultG
               meta={result && search?.method === "openrouter-rerank" ? `${Math.round(result.score * 100)}%` : item.conversation.updatedLabel}
               onClick={() => execute(() => {
                 onSelectConversation(item.conversation.id);
-                if (isMobile) setOpenMobile(false);
               })} />;
           })}</PaletteSection> : null}
           {!loading && visibleActions.length === 0 && visibleChats.length === 0 ? <div className="grid min-h-36 place-items-center px-6 text-center text-xs text-muted-foreground"><div><Archive className="mx-auto mb-2 size-5" />No matching command or chat</div></div> : null}

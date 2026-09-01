@@ -58,6 +58,11 @@ describe("command palette local fallback", () => {
     expect(source).toContain("if (isMobile) setOpenMobile(false);");
   });
 
+  it("closes the mobile sidebar for every palette command, not only chat results", () => {
+    const source = readFileSync(fileURLToPath(new URL("../apps/web/src/components/symphony/command-palette.tsx", import.meta.url)), "utf8");
+    expect(source).toMatch(/const execute = \(run: \(\) => void\) => \{[\s\S]*?if \(isMobile\) setOpenMobile\(false\);[\s\S]*?run\(\);/u);
+  });
+
   it("ranks available operator actions and never exposes permission-denied actions", () => {
     const actions = [
       { id: "trace", label: "Open Trace", detail: "Inspect event evidence" },

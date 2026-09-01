@@ -1387,7 +1387,23 @@ export class AgentCoordinator {
   }
 
   list(options: { runId?: string; activeOnly?: boolean } = {}): AgentRecord[] {
-    return this.store.listAgents(options);
+    // The bootstrap projection already walks the durable agent directory in
+    // keyset pages. Keep the public coordinator/API listing on the same
+    // authority path instead of inheriting storage's bounded convenience
+    // default (1,000 rows), which silently hid older agents from MCP and
+    // direct `/v1/agents` consumers once a graph grew past that size.
+    const agents: AgentRecord[] = [];
+    let cursor: AgentListCursor | undefined;
+    do {
+      const page = this.store.listAgentPage({
+        ...options,
+        limit: 1_000,
+        ...(cursor ? { cursor } : {}),
+      });
+      agents.push(...page.agents);
+      cursor = page.nextCursor ?? undefined;
+    } while (cursor);
+    return agents;
   }
 
   get(agentId: string): AgentRecord {

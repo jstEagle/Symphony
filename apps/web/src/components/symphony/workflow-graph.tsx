@@ -190,10 +190,11 @@ export const WorkflowGraph = memo(function WorkflowGraph({ nodes, edges, selecte
             <button
               key={node.id}
               type="button"
-              disabled={!node.agentId || !onSelect}
-              onPointerDown={(event) => event.stopPropagation()}
-              onClick={() => onSelect?.(node)}
-              className={`symphony-graph-node absolute flex cursor-pointer items-center gap-3 rounded-xl border bg-card/96 px-4 text-left shadow-sm backdrop-blur-xl transition-[border-color,background-color,box-shadow] hover:bg-muted/85 disabled:cursor-default ${selected ? "border-foreground/85 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_12%,transparent)]" : "border-border/85"}`}
+              aria-disabled={!node.agentId || !onSelect}
+              onClick={() => {
+                if (node.agentId) onSelect?.(node);
+              }}
+              className={`symphony-graph-node absolute flex cursor-pointer items-center gap-3 rounded-xl border bg-card/96 px-4 text-left shadow-sm backdrop-blur-xl transition-[border-color,background-color,box-shadow] hover:bg-muted/85 ${selected ? "border-foreground/85 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_12%,transparent)]" : "border-border/85"}`}
               style={{ left: node.x, top: node.y, width: GRAPH_NODE_WIDTH, height: GRAPH_NODE_HEIGHT }}
               data-agent-id={node.agentId}
               data-ledger-id={node.ledgerId ?? node.id}
