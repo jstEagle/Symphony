@@ -16,7 +16,7 @@ import {
 } from "@/components/symphony/workspace-navigation";
 import { readStudioMode, readWorkspaceTab, writeStudioMode, writeWorkspaceTab, type StudioMode } from "@/lib/symphony/workspace-tabs";
 import { SidebarInset, SidebarProvider, SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
-import { createDialogHandle } from "@/components/ui/dialog";
+import { createDialogHandle, DialogTrigger } from "@/components/ui/dialog";
 import {
   AssistantRuntimeProvider,
   CompositeAttachmentAdapter,
@@ -250,6 +250,7 @@ function SymphonyShell() {
           openAgentIds={openAgentIds}
           onCloseAgent={closeAgent}
           externalAgentIds={externalAgentIds}
+          commandPaletteHandle={commandPaletteHandle}
           onOpenObjective={openNewObjective}
           workspaceTab={workspaceTab}
           onWorkspaceTabChange={onWorkspaceTabChange}
@@ -289,6 +290,7 @@ function AssistantConversation({
   openAgentIds,
   onCloseAgent,
   externalAgentIds,
+  commandPaletteHandle,
   onOpenObjective,
   workspaceTab,
   onWorkspaceTabChange,
@@ -298,6 +300,7 @@ function AssistantConversation({
   openAgentIds: string[];
   onCloseAgent: (agentId: string) => void;
   externalAgentIds: ReadonlySet<string>;
+  commandPaletteHandle: ReturnType<typeof createDialogHandle>;
   onOpenObjective: (workflow?: WorkflowRevisionRecord) => void;
   workspaceTab: WorkspaceTab;
   onWorkspaceTabChange: (tab: WorkspaceTab) => void;
@@ -485,7 +488,18 @@ function AssistantConversation({
               <div className="flex h-11 items-center justify-between gap-3 px-2.5">
                 <div className="flex min-w-0 items-center gap-2">
                   {(sidebar.isMobile ? !sidebar.openMobile : !sidebar.open) ? (
-                    <SidebarTrigger className="size-7 shrink-0 text-muted-foreground hover:bg-muted/50 hover:text-foreground" aria-label="Open sidebar" />
+                    <>
+                      <SidebarTrigger className="size-7 shrink-0 text-muted-foreground hover:bg-muted/50 hover:text-foreground" aria-label="Open sidebar" />
+                      <DialogTrigger
+                        handle={commandPaletteHandle}
+                        aria-label="Open command palette"
+                        title="Search or run a command"
+                        render={<button type="button" />}
+                        className="grid size-7 shrink-0 cursor-pointer place-items-center rounded-md text-muted-foreground outline-none transition-colors hover:bg-muted/50 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring"
+                      >
+                        <ListMagnifyingGlass className="size-3.5" />
+                      </DialogTrigger>
+                    </>
                   ) : null}
                   {live ? (
                     <AgentLoader

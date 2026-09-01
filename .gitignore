@@ -5,6 +5,7 @@ coverage/
 *.tsbuildinfo
 *.log
 .DS_Store
+:memory:
 
 # Runtime state and secrets
 .symphony/

@@ -1,4 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { studioModeForCommand } from "../apps/web/src/components/symphony/command-palette.js";
 import { rankFuzzyMatches, rankPaletteActions } from "../apps/web/src/lib/symphony/palette-search.js";
 import {
@@ -41,6 +43,13 @@ describe("command palette local fallback", () => {
       { id: "two", text: "Theme settings" },
     ];
     expect(rankFuzzyMatches(chats, "dwr", (item) => item.text).map((item) => item.id)).toEqual(["one"]);
+  });
+
+  it("keeps a command-palette trigger in the main header when the sidebar is collapsed", () => {
+    const source = readFileSync(fileURLToPath(new URL("../apps/web/src/components/symphony/assistant.tsx", import.meta.url)), "utf8");
+    expect(source).toContain('aria-label="Open command palette"');
+    expect(source).toContain("handle={commandPaletteHandle}");
+    expect(source).toContain("Search or run a command");
   });
 
   it("ranks available operator actions and never exposes permission-denied actions", () => {
