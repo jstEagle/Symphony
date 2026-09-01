@@ -10,6 +10,7 @@ vi.mock("@/symphony.config", () => ({
 
 import {
   fetchBootstrap,
+  runtimeBootstrapRefetchInterval,
   subscribeToRuntime,
 } from "../apps/web/src/lib/symphony/runtime-client.js";
 
@@ -56,6 +57,14 @@ afterEach(() => {
 });
 
 describe("runtime SSE reconnect boundary", () => {
+  it("keeps retrying an unavailable runtime bootstrap until a daemon reload succeeds", () => {
+    expect(runtimeBootstrapRefetchInterval("runtime", { data: undefined, error: new Error("daemon restarting") })).toBe(3_000);
+    expect(runtimeBootstrapRefetchInterval("runtime", { data: undefined })).toBe(3_000);
+    expect(runtimeBootstrapRefetchInterval("runtime", { data: { runtimeEpoch: "epoch-1" }, error: new Error("stale request") })).toBe(3_000);
+    expect(runtimeBootstrapRefetchInterval("runtime", { data: { runtimeEpoch: "epoch-1" }, error: null })).toBe(false);
+    expect(runtimeBootstrapRefetchInterval("preview", { data: undefined, error: new Error("ignored") })).toBe(false);
+  });
+
   it("applies only strictly newer cursors and resumes from the last applied cursor", async () => {
     const calls: string[] = [];
     const applied: number[] = [];

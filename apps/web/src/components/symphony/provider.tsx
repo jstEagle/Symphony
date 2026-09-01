@@ -45,6 +45,7 @@ import {
   resolveMode,
   sendThreadMessage,
   isRetryableRuntimeRequestError,
+  runtimeBootstrapRefetchInterval,
   steerAgent as steerAgentRequest,
   subscribeToRuntime,
   updateThread,
@@ -185,6 +186,7 @@ export function SymphonyProvider({ children, windowId = "main:server" }: { child
     enabled: modeResolved,
     queryFn: ({ signal }) => fetchBootstrap(mode, signal),
     retry: mode === "runtime" ? 1 : 0,
+    refetchInterval: (query) => runtimeBootstrapRefetchInterval(mode, query.state),
     refetchOnWindowFocus: true,
   });
 

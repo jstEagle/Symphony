@@ -62,6 +62,19 @@ export type RuntimeCatalog = {
   models: ModelDescriptor[];
 };
 
+/**
+ * Keep a runtime reload recoverable when the daemon is between generations.
+ * React Query retains errors after its bounded retry budget is exhausted, so
+ * the provider must continue checking until an authoritative bootstrap is
+ * available. Once data is healthy, the interval stops.
+ */
+export function runtimeBootstrapRefetchInterval(
+  mode: RuntimeMode,
+  state: { data?: unknown; error?: unknown },
+): number | false {
+  return mode === "runtime" && (!state.data || state.error) ? 3_000 : false;
+}
+
 /** Durable capability registry responses. The daemon remains authoritative. */
 export type CapabilityMutationResult = Readonly<{
   status: "committed" | "replayed" | "conflict" | "rejected";
