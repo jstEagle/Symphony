@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { AgentWorkOrderSchema, resolveChildPermission, type EventEnvelope } from "../packages/protocol/src/index.js";
-import { SymphonyStore, type AgentListCursor } from "../packages/storage/src/index.js";
+import { AgentWorkOrderSchema, resolveChildPermission, type EventEnvelope, UsageEventSchema, WorkflowPlanMutationInputSchema } from "../packages/protocol/src/index.js";
+import { SymphonyStore, type AgentListCursor, type WorkflowPlanMutationRecord, type WorkflowRunPlanRecord } from "../packages/storage/src/index.js";
 
 const temporary: string[] = [];
 afterEach(() => {
@@ -24,6 +24,77 @@ describe("protocol and durable storage", () => {
     expect(order.permissions).toBe("full-access");
     expect(resolveChildPermission("read-only", "full-access")).toBe("read-only");
     expect(resolveChildPermission("full-access")).toBe("full-access");
+  });
+
+  it("keeps plan mutation author identity outside the client input schema", () => {
+    const input = WorkflowPlanMutationInputSchema.parse({
+      version: 1,
+      runId: "run",
+      expectedPlanRevision: 0,
+      operation: "append",
+      steps: [{ id: "next", type: "set", value: true }],
+      reason: "The review requested one more verification step.",
+    });
+    expect(input).toMatchObject({ runId: "run", expectedPlanRevision: 0, operation: "append" });
+    expect(() => WorkflowPlanMutationInputSchema.parse({
+      ...input,
+      authorAgentId: "forged-agent",
+    })).toThrow();
+    expect(() => WorkflowPlanMutationInputSchema.parse({
+      ...input,
+      steps: Array.from({ length: 129 }, () => ({ type: "set", value: true })),
+    })).toThrow();
+  });
+
+  it("persists per-run plan overlays with an independent CAS revision and idempotent mutations", () => {
+    const directory = mkdtempSync(join(tmpdir(), "symphony-store-plans-"));
+    temporary.push(directory);
+    const store = new SymphonyStore(join(directory, "state.sqlite"));
+    const timestamp = new Date().toISOString();
+    const plan: WorkflowRunPlanRecord = {
+      version: 1,
+      runId: "plan-run",
+      workflowId: "workflow",
+      workflowRevision: 7,
+      workflowHash: "immutable-workflow-hash",
+      planRevision: 0,
+      steps: [{ id: "initial", type: "set", value: true }],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    expect(store.saveWorkflowRunPlan(plan)).toBe(true);
+    expect(store.saveWorkflowRunPlan(plan)).toBe(false);
+    expect(store.getWorkflowRunPlan(plan.runId)).toEqual(plan);
+
+    const mutation: WorkflowPlanMutationRecord = {
+      version: 1,
+      idempotencyKey: "plan-mutation-1",
+      runId: plan.runId,
+      authorAgentId: "author-agent",
+      expectedPlanRevision: 0,
+      resultingPlanRevision: 1,
+      operation: "append",
+      steps: [{ id: "appended", type: "set", value: "later" }],
+      reason: "Continue after the initial step.",
+      createdAt: timestamp,
+    };
+    const nextPlan: WorkflowRunPlanRecord = {
+      ...plan,
+      planRevision: 1,
+      steps: [...plan.steps, ...mutation.steps],
+      updatedAt: new Date(Date.parse(timestamp) + 1).toISOString(),
+    };
+    expect(store.saveWorkflowPlanMutation(mutation)).toBe(true);
+    expect(store.saveWorkflowPlanMutation(mutation)).toBe(false);
+    expect(store.saveWorkflowRunPlan(nextPlan, { expectedPlanRevision: mutation.expectedPlanRevision })).toBe(true);
+    expect(store.saveWorkflowRunPlan({ ...nextPlan, planRevision: 2 }, { expectedPlanRevision: 0 })).toBe(false);
+    expect(store.getWorkflowRunPlan(plan.runId)).toEqual(nextPlan);
+    expect(store.getWorkflowPlanMutation(mutation.idempotencyKey)).toEqual(mutation);
+    expect(store.listWorkflowPlanMutations({ runId: plan.runId })).toEqual([mutation]);
+    expect(store.listWorkflowRunPlans({ workflowId: plan.workflowId })).toEqual([nextPlan]);
+    expect(nextPlan.workflowRevision).toBe(7);
+    expect(nextPlan.planRevision).toBe(1);
+    store.close();
   });
 
   it("persists monotonic events, idempotent receipts, and chat groups", () => {
@@ -146,6 +217,38 @@ describe("protocol and durable storage", () => {
     ]);
     expect(seen.map((event) => event.cursor)).toEqual([...seen].map((event) => event.cursor).sort((a, b) => a - b));
     stop();
+    store.close();
+  });
+
+  it("dedupes one native usage replay without collapsing an identical event from another agent", () => {
+    const directory = mkdtempSync(join(tmpdir(), "symphony-store-usage-identity-"));
+    temporary.push(directory);
+    const store = new SymphonyStore(join(directory, "state.sqlite"));
+    const usage = UsageEventSchema.parse({
+      id: "usage-a-1",
+      workflowId: "workflow",
+      runId: "run",
+      agentId: "agent-a",
+      objectiveAttemptId: "objective-attempt:one",
+      nativeTurnId: "native-turn-1",
+      nativeEventId: "native-event-1",
+      model: "fixture",
+      harness: "pi",
+      inputTokens: 1,
+      outputTokens: 2,
+      cacheReadTokens: null,
+      costAmount: 0,
+      currency: "USD",
+      basis: "harness-reported",
+      priceSnapshotId: null,
+      recordedAt: new Date().toISOString(),
+    });
+    store.recordUsage(usage);
+    store.recordUsage({ ...usage, id: "usage-a-replay", recordedAt: new Date(Date.parse(usage.recordedAt) + 1).toISOString() });
+    store.recordUsage({ ...usage, id: "usage-b-1", agentId: "agent-b" });
+    expect(store.listUsage({ runId: "run" })).toHaveLength(2);
+    expect(store.listUsage({ runId: "run", agentId: "agent-a" })).toHaveLength(1);
+    expect(store.listUsage({ runId: "run", agentId: "agent-b" })).toHaveLength(1);
     store.close();
   });
 

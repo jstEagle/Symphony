@@ -6,16 +6,17 @@ import type {
   DriverDoctorResult,
   DriverEvent,
   DriverLifecycleOptions,
+  DriverMessageRequest,
   DriverSession,
   DriverStartRequest,
   JsonValue,
   ModelDescriptor,
   WorkerDriver,
 } from "@symphony/protocol";
-import { buildAgentPrompt } from "./prompt.js";
+import { buildAgentPrompt, coordinationPromptOptions } from "./prompt.js";
 import { HostedJsonLineProcess } from "./hosted-process.js";
 import { JsonLineProcess, asObject, asString, type JsonLineRpcTransport } from "./process.js";
-import { capabilities, deepString, emit, makeSession, receipt, record, type Emit } from "./common.js";
+import { canonicalNativeEventId, capabilities, deepString, emit, makeSession, messageRequest, record, withMessageIdentity, type Emit } from "./common.js";
 
 type ActivePi = {
   rpc: JsonLineRpcTransport;
@@ -26,6 +27,10 @@ type ActivePi = {
   outputText: string;
   usage: unknown;
   terminalError: string | null;
+  turnSequence: number;
+  nativeTurnId: string | null;
+  streamSequence: number;
+  pendingMessage: DriverMessageRequest | null;
 };
 
 export class PiDriver implements WorkerDriver {
@@ -119,6 +124,10 @@ export class PiDriver implements WorkerDriver {
         outputText: "",
         usage: null,
         terminalError: null,
+        turnSequence: 1,
+        nativeTurnId: `${sessionId}:turn:1`,
+        streamSequence: 0,
+        pendingMessage: null,
       };
       this.active.set(sessionId, active);
       this.persistActive(active);
@@ -126,7 +135,7 @@ export class PiDriver implements WorkerDriver {
       // Pi acknowledges a prompt once it has been accepted or rejected. Keep
       // startup inside that boundary so a detached controller never leaves an
       // ambiguous, unobserved command response in flight.
-      await this.submitPrompt(active, buildAgentPrompt(request.workOrder));
+      await this.submitPrompt(active, buildAgentPrompt(request.workOrder, coordinationPromptOptions(request)));
       return makeSession(this.id, sessionId, {
         agentId: request.agentId,
         sessionFile: typeof state.sessionFile === "string" ? state.sessionFile : null,
@@ -166,6 +175,10 @@ export class PiDriver implements WorkerDriver {
           outputText: asString(retained.outputText) ?? "",
           usage: retained.usage ?? null,
           terminalError: asString(retained.terminalError) ?? null,
+          turnSequence: typeof retained.turnSequence === "number" && Number.isSafeInteger(retained.turnSequence) ? retained.turnSequence : 1,
+          nativeTurnId: asString(retained.nativeTurnId) ?? `${session.nativeSessionId}:turn:1`,
+          streamSequence: typeof retained.streamSequence === "number" && Number.isSafeInteger(retained.streamSequence) ? retained.streamSequence : 0,
+          pendingMessage: retainedMessageDispatch(retained),
         };
         // Register before activation: activate() synchronously projects every
         // durable frame missed by the previous daemon generation.
@@ -181,7 +194,7 @@ export class PiDriver implements WorkerDriver {
         );
         return {
           ...session,
-          state: active.running ? "running" : active.settled ? "completed" : "idle",
+          state: active.pendingMessage ? "unknown" : active.running ? "running" : active.settled ? "completed" : "idle",
           metadata: { ...session.metadata, transportReusable: rpc.isReusable() },
         };
       }
@@ -198,6 +211,10 @@ export class PiDriver implements WorkerDriver {
         outputText: "",
         usage: null,
         terminalError: null,
+        turnSequence: 0,
+        nativeTurnId: null,
+        streamSequence: 0,
+        pendingMessage: null,
       };
       this.active.set(session.nativeSessionId, active);
       this.persistActive(active);
@@ -213,20 +230,32 @@ export class PiDriver implements WorkerDriver {
     }
   }
 
-  async sendMessage(session: DriverSession, message: string): Promise<{ receiptId: string; queued: boolean }> {
+  async sendMessage(session: DriverSession, message: string, request?: DriverMessageRequest): Promise<{ receiptId: string; queued: boolean }> {
     const active = this.require(session);
+    const durable = messageRequest(message, request);
+    if (active.pendingMessage) {
+      if (active.pendingMessage.requestId !== durable.requestId || active.pendingMessage.contentHash !== durable.contentHash) {
+        throw new Error("Pi native message is already pending with a different durable identity.");
+      }
+      return { receiptId: durable.requestId, queued: false };
+    }
     if (active.running) {
-      active.rpc.send({ type: "steer", message });
-      return receipt(false);
+      active.pendingMessage = durable;
+      this.persistActive(active);
+      active.rpc.send({ type: "steer", message, requestId: durable.requestId, contentHash: durable.contentHash });
+      return { receiptId: durable.requestId, queued: false };
     }
     active.running = true;
     active.settled = false;
     active.outputText = "";
     active.usage = null;
     active.terminalError = null;
+    active.turnSequence += 1;
+    active.nativeTurnId = `${active.sessionId}:turn:${active.turnSequence}`;
+    active.pendingMessage = durable;
     this.persistActive(active);
-    await this.submitPrompt(active, message);
-    return receipt(false);
+    await this.submitPrompt(active, message, durable);
+    return { receiptId: durable.requestId, queued: false };
   }
 
   async cancel(session: DriverSession): Promise<void> {
@@ -259,8 +288,16 @@ export class PiDriver implements WorkerDriver {
     const extension = existsSync(builtExtension) ? builtExtension : sourceExtension;
     if (existsSync(extension)) args.push("--extension", extension);
     if (request.workOrder.permissions === "read-only") {
-      const coordinationTools = ["list_agents", "send_message", "observe_agent", "get_session_logs", "cancel_agent", "present_ui", "list_workflows", "list_plugin_tools"];
-      if (request.coordination.canCreate) coordinationTools.push("create_agent");
+      const coordinationTools = [
+        "list_agents", "send_message", "observe_agent", "get_session_logs", "cancel_agent",
+        "present_ui", "list_workflows", "list_plugin_tools", "list_objectives", "get_objective",
+      ];
+      if (request.coordination.canCreate) {
+        coordinationTools.push(
+          "create_agent", "create_objective", "commit_objective_plan",
+          "checkpoint_objective", "request_objective_approval",
+        );
+      }
       args.push("--tools", ["read", "grep", "find", "ls", ...coordinationTools].join(","));
     }
     if (request.resolvedModel !== "auto") args.push("--model", request.resolvedModel);
@@ -326,29 +363,41 @@ export class PiDriver implements WorkerDriver {
   private onMessage(message: Record<string, unknown>, consumer: Emit): void {
     const type = asString(message.type) ?? "unknown";
     const hostEventId = asString(message.__symphonyHostEventId);
-    const emitMessage = (kind: DriverEvent["kind"], payload: unknown) => emit(
-      consumer,
-      kind,
-      payload,
-      hostEventId ? `${hostEventId}:${kind}` : undefined,
-    );
+    const active = this.findActive(consumer);
+    const nativeTurnId = active?.nativeTurnId;
+    const emitMessage = (kind: DriverEvent["kind"], payload: unknown, nativeEventId?: string) => {
+      const providerId = nativeEventId || hostEventId ? null : this.providerEventId(message);
+      const needsStreamSequence = active !== undefined
+        && ["message.delta", "reasoning.delta", "tool.started", "tool.updated", "tool.completed", "usage.recorded"].includes(kind);
+      const streamSequence = needsStreamSequence && providerId === null && !hostEventId
+        ? ++active.streamSequence
+        : null;
+      if (streamSequence !== null && active) this.persistActive(active);
+      const enrichedPayload = streamSequence === null || payload === null || typeof payload !== "object" || Array.isArray(payload)
+        ? payload
+        : { ...(payload as Record<string, unknown>), nativeSequence: streamSequence };
+      const identityPayload = withMessageIdentity(enrichedPayload, active?.pendingMessage ?? null);
+      const identity = nativeEventId
+        ?? (hostEventId ? `${hostEventId}:${kind}` : undefined)
+        ?? (providerId !== null && active && nativeTurnId ? `${nativeTurnId}:event:${providerId}` : undefined)
+        ?? (active ? canonicalNativeEventId("pi", `${active.sessionId}:${nativeTurnId ?? "unknown"}`, kind, enrichedPayload) : undefined);
+      emit(consumer, kind, identityPayload, identity);
+    };
     if (type === "response" && asString(message.command) === "prompt" && message.success === false) {
-      const active = this.findActive(consumer);
       const error = asString(message.error) ?? "Pi rejected the prompt before acceptance.";
       if (active) {
         active.terminalError = error;
         this.failActive(active);
       }
-      emitMessage("run.failed", { error, response: message });
+      emitMessage("run.failed", { error, response: message, nativeTurnId }, nativeTurnId ? `${nativeTurnId}:failed` : undefined);
     } else if (type === "agent_start") {
-      const active = this.findActive(consumer);
       if (active) {
         active.running = true;
         active.settled = false;
         active.terminalError = null;
         this.persistActive(active);
       }
-      emitMessage("run.started", message);
+      emitMessage("run.started", { ...message, nativeTurnId }, nativeTurnId ? `${nativeTurnId}:started` : undefined);
     }
     else if (type === "agent_end") {
       const active = this.findActive(consumer);
@@ -358,7 +407,6 @@ export class PiDriver implements WorkerDriver {
       }
       emitMessage("log", message);
     } else if (type === "agent_settled") {
-      const active = this.findActive(consumer);
       let terminalError: string | null = null;
       if (active) {
         active.running = false;
@@ -372,12 +420,17 @@ export class PiDriver implements WorkerDriver {
             usage: active.usage,
             costAmount: typeof cost.total === "number" ? cost.total : null,
             basis: typeof cost.total === "number" ? "provider-reported" : "harness-reported",
-          });
+            nativeTurnId: active.nativeTurnId,
+          }, active.nativeTurnId ? `${active.nativeTurnId}:usage` : undefined);
         }
-        emitMessage("output.completed", { text: active.outputText });
+        emitMessage("output.completed", { text: active.outputText, nativeTurnId: active.nativeTurnId }, active.nativeTurnId ? `${active.nativeTurnId}:output` : undefined);
       }
-      if (terminalError) emitMessage("run.failed", { error: terminalError, response: message });
-      else emitMessage("run.completed", message);
+      if (terminalError) emitMessage("run.failed", { error: terminalError, response: message, nativeTurnId }, nativeTurnId ? `${nativeTurnId}:failed` : undefined);
+      else emitMessage("run.completed", { ...message, nativeTurnId }, nativeTurnId ? `${nativeTurnId}:completed` : undefined);
+      if (active?.pendingMessage) {
+        active.pendingMessage = null;
+        this.persistActive(active);
+      }
     } else if (type === "message_end") {
       const active = this.findActive(consumer);
       if (active) {
@@ -401,28 +454,32 @@ export class PiDriver implements WorkerDriver {
           { text, ...(replace ? { replace: true } : {}) },
         );
       }
-    } else if (type === "tool_execution_start") emitMessage("tool.started", message);
-    else if (type === "tool_execution_update") emitMessage("tool.updated", message);
-    else if (type === "tool_execution_end") emitMessage("tool.completed", message);
+    } else if (type === "tool_execution_start") emitMessage("tool.started", { ...message, nativeTurnId });
+    else if (type === "tool_execution_update") emitMessage("tool.updated", { ...message, nativeTurnId });
+    else if (type === "tool_execution_end") emitMessage("tool.completed", { ...message, nativeTurnId });
     else emitMessage("log", message);
   }
 
-  private async submitPrompt(active: ActivePi, message: string): Promise<void> {
+  private async submitPrompt(active: ActivePi, message: string, request?: DriverMessageRequest): Promise<void> {
     try {
-      const response = asObject(await active.rpc.command("prompt", { message }, 0));
+      const response = asObject(await active.rpc.command("prompt", {
+        message,
+        ...(request ? { requestId: request.requestId, contentHash: request.contentHash } : {}),
+      }, 0));
       if (response.success !== false) return;
       active.terminalError = asString(response.error) ?? "Pi rejected the prompt before acceptance.";
+      if (request && active.pendingMessage?.requestId === request.requestId) active.pendingMessage = null;
       this.failActive(active);
       const hostEventId = asString(response.__symphonyHostEventId);
       emit(
         active.emit,
         "run.failed",
-        { error: active.terminalError, response },
-        hostEventId ? `${hostEventId}:run.failed` : undefined,
+        withMessageIdentity({ error: active.terminalError, response, nativeTurnId: active.nativeTurnId }, request ?? null),
+        hostEventId ? `${hostEventId}:run.failed` : active.nativeTurnId ? `${active.nativeTurnId}:failed` : undefined,
       );
     } catch (error) {
       this.failActive(active);
-      emit(active.emit, "run.failed", { error: error instanceof Error ? error.message : String(error) });
+      emit(active.emit, "run.failed", withMessageIdentity({ error: error instanceof Error ? error.message : String(error) }, request ?? active.pendingMessage));
     }
   }
 
@@ -452,6 +509,10 @@ export class PiDriver implements WorkerDriver {
       outputText: active.outputText,
       usage: this.jsonValue(active.usage),
       terminalError: active.terminalError,
+      turnSequence: active.turnSequence,
+      nativeTurnId: active.nativeTurnId,
+      streamSequence: active.streamSequence,
+      pendingMessage: active.pendingMessage as unknown as JsonValue,
     };
   }
 
@@ -477,6 +538,18 @@ export class PiDriver implements WorkerDriver {
     if (text) active.outputText = text;
   }
 
+  private providerEventId(message: Record<string, unknown>): string | null {
+    const event = record(message.assistantMessageEvent ?? message.event);
+    const values = [
+      message.eventId, message.event_id, message.sequence, message.seq, message.id,
+      message.toolCallId, message.tool_call_id, message.callId, message.call_id,
+      event.eventId, event.event_id, event.sequence, event.seq, event.id,
+    ];
+    const value = values.find((candidate): candidate is string | number =>
+      typeof candidate === "string" || (typeof candidate === "number" && Number.isSafeInteger(candidate)));
+    return value === undefined ? null : String(value);
+  }
+
   private responseData(value: unknown): Record<string, unknown> {
     const response = asObject(value);
     return asObject(response.data ?? response);
@@ -487,6 +560,15 @@ export class PiDriver implements WorkerDriver {
     if (!active) throw new Error(`Pi session is not active: ${session.nativeSessionId}`);
     return active;
   }
+}
+
+function retainedMessageDispatch(state: Record<string, unknown>): DriverMessageRequest | null {
+  const value = record(state.pendingMessage);
+  const attemptId = asString(value.attemptId);
+  const requestId = asString(value.requestId);
+  const contentHash = asString(value.contentHash);
+  if (!attemptId || !requestId || !contentHash) return null;
+  return { attemptId, requestId, contentHash };
 }
 
 function nonNegative(value: unknown): number | null {

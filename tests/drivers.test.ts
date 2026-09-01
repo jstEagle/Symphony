@@ -86,6 +86,41 @@ describe("native driver compatibility", () => {
     expect(buildConductorTurnPrompt("Spawn a reviewer")).toContain("use Symphony create_agent when exposed");
   });
 
+  it("keeps Objective Runtime guidance explicit for workers and the depth boundary", () => {
+    const worker = AgentWorkOrderSchema.parse({
+      workflowId: "workflow",
+      runId: "run",
+      depth: 1,
+      mission: { id: "mission", revision: 1, hash: "12345678", statement: "Advance the work." },
+      objective: "Implement one objective task.",
+      outputSchema: {},
+      workspace: { path: "/tmp" },
+    });
+    const names = [
+      "list_objectives", "get_objective", "create_objective", "commit_objective_plan",
+      "checkpoint_objective", "request_objective_approval",
+    ];
+    const workerContract = buildSymphonyOperatingContract(worker, { canCreate: true });
+    for (const name of names) expect(workerContract).toContain(name);
+    expect(workerContract).toContain("durable Symphony objective");
+    expect(workerContract).toContain("repeatable or schema-driven orchestration");
+    expect(workerContract).toContain("Native harness subagents remain available");
+
+    const boundaryContract = buildSymphonyOperatingContract(worker, { canCreate: false });
+    expect(boundaryContract).toContain("list_objectives or get_objective is exposed");
+    expect(boundaryContract).toContain("objective mutations");
+    expect(boundaryContract).toContain("unavailable at this delegation boundary");
+  });
+
+  it("gives the conductor turn concrete Objective Runtime routing guidance", () => {
+    const prompt = buildConductorTurnPrompt("Continue the objective.");
+    for (const phrase of [
+      "list_objectives", "get_objective", "create_objective", "commit_objective_plan",
+      "checkpoint_objective", "request_objective_approval", "durable objectives",
+      "repeatable or schema-driven orchestration", "native subagents",
+    ]) expect(prompt).toContain(phrase);
+  });
+
   it("treats an empty worker output schema as an unstructured response contract", () => {
     const order = AgentWorkOrderSchema.parse({
       workflowId: "workflow",

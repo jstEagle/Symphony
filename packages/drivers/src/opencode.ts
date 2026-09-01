@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { createOpencodeClient, type Event as OpenCodeEvent, type OpencodeClient } from "@opencode-ai/sdk";
 import { environmentWithoutDaemonSecret, type SecretStore, type SymphonyConfig } from "@symphony/config";
 import type {
@@ -6,14 +6,15 @@ import type {
   DriverDoctorResult,
   DriverEvent,
   DriverLifecycleOptions,
+  DriverMessageRequest,
   DriverSession,
   DriverStartRequest,
   JsonValue,
   ModelDescriptor,
   WorkerDriver,
 } from "@symphony/protocol";
-import { buildAgentPrompt } from "./prompt.js";
-import { capabilities, emit, makeSession, receipt, record, stringifyError, type Emit } from "./common.js";
+import { buildAgentPrompt, coordinationPromptOptions } from "./prompt.js";
+import { capabilities, emit, makeSession, messageRequest, record, stringifyError, withMessageIdentity, type Emit } from "./common.js";
 import { HostedRawLineProcess } from "./hosted-process.js";
 
 type ServerHandle = {
@@ -38,6 +39,10 @@ type ActiveOpenCode = {
   runPending: boolean;
   cancelRequested: boolean;
   closed: boolean;
+  turnSequence: number;
+  nativeTurnId: string | null;
+  streamSequence: number;
+  pendingMessage: DriverMessageRequest | null;
   cancelPromise?: Promise<void>;
   terminalReconciliation?: Promise<ReconciledTurnState>;
   subscription?: {
@@ -138,7 +143,7 @@ export class OpenCodeDriver implements WorkerDriver {
       options?.signal.throwIfAborted();
       const initialTurn = { id: `initial:${request.agentId}`, state: "dispatching" as const };
       this.checkpointInitialTurn(server, sessionId, initialTurn);
-      await this.prompt(sessionId, request, buildAgentPrompt(request.workOrder), active);
+      await this.prompt(sessionId, request, buildAgentPrompt(request.workOrder, coordinationPromptOptions(request)), active);
       this.checkpointInitialTurn(server, sessionId, { ...initialTurn, state: "accepted" });
       options?.signal.throwIfAborted();
       this.assertActive(sessionId, active, "startup");
@@ -186,6 +191,17 @@ export class OpenCodeDriver implements WorkerDriver {
       if (!found.data) throw new Error(`OpenCode session not found: ${session.nativeSessionId}`);
       options?.signal.throwIfAborted();
       active = this.makeActive(client, onEvent, request.workOrder.workspace.path, server, true);
+      const retainedState = record(server?.retainedAdapterState());
+      active.turnSequence = typeof retainedState.turnSequence === "number" && Number.isSafeInteger(retainedState.turnSequence)
+        ? retainedState.turnSequence
+        : this.turnSequenceFromNativeId(
+            typeof retainedState.nativeTurnId === "string" ? retainedState.nativeTurnId : session.nativeRunId,
+          );
+      active.nativeTurnId = typeof retainedState.nativeTurnId === "string" ? retainedState.nativeTurnId : session.nativeRunId;
+      active.streamSequence = typeof retainedState.streamSequence === "number" && Number.isSafeInteger(retainedState.streamSequence)
+        ? retainedState.streamSequence
+        : 0;
+      active.pendingMessage = retainedMessageDispatch(retainedState);
       const previous = this.active.get(session.nativeSessionId);
       if (previous) await this.closeActive(session.nativeSessionId, previous);
       this.active.set(session.nativeSessionId, active);
@@ -199,9 +215,12 @@ export class OpenCodeDriver implements WorkerDriver {
       const running = nativeStatus === "busy" || nativeStatus === "retry";
       active.runPending = running;
       emit(onEvent, "session.started", { sessionId: session.nativeSessionId, resumed: true, nativeStatus });
-      if (running) emit(onEvent, "run.started", { sessionId: session.nativeSessionId, resumed: true, nativeStatus });
+      // A retained durable follow-up marker without transcript correlation is
+      // outcome-unknown, even when OpenCode reports the session busy. Do not
+      // project a misleading running event during that recovery window.
+      if (running && !active.pendingMessage) emit(onEvent, "run.started", { sessionId: session.nativeSessionId, resumed: true, nativeStatus });
       const recoveredState = running
-        ? "running"
+        ? active.pendingMessage ? "unknown" : "running"
         : await this.reconcilePersistedTurn(session.nativeSessionId, active);
       const initialTurn = this.retainedInitialTurn(server);
       const previousTurnMayBeActive = session.state === "running" || session.state === "starting" || session.state === "unknown";
@@ -220,24 +239,41 @@ export class OpenCodeDriver implements WorkerDriver {
     }
   }
 
-  async sendMessage(session: DriverSession, message: string): Promise<{ receiptId: string; queued: boolean }> {
+  async sendMessage(session: DriverSession, message: string, request?: DriverMessageRequest): Promise<{ receiptId: string; queued: boolean }> {
     const active = this.require(session);
+    const durable = messageRequest(message, request);
+    if (active.pendingMessage) {
+      if (active.pendingMessage.requestId === durable.requestId && active.pendingMessage.contentHash === durable.contentHash) {
+        return { receiptId: durable.requestId, queued: false };
+      }
+      if (active.runPending) {
+        throw new Error("OpenCode native message is already pending with a different durable identity.");
+      }
+      active.pendingMessage = null;
+      this.persistStreamState(active);
+    }
     active.outputText = "";
     active.runPending = true;
     active.cancelRequested = false;
     delete active.cancelPromise;
     delete active.terminalReconciliation;
+    active.turnSequence += 1;
+    active.nativeTurnId = `${session.nativeSessionId}:turn:${active.turnSequence}`;
+    active.pendingMessage = durable;
+    this.persistNativeTurn(active);
+    this.persistStreamState(active);
     const response = await active.client.session.promptAsync({
       path: { id: session.nativeSessionId },
       query: { directory: active.directory },
-      body: { parts: [{ type: "text", text: message }] },
+      body: { parts: [{ type: "text", text: message }], messageID: durable.requestId },
     });
     if (response.error) {
       active.runPending = false;
       throw new Error(JSON.stringify(response.error));
     }
     this.assertActive(session.nativeSessionId, active, "message submission");
-    return receipt(false);
+    this.persistStreamState(active);
+    return { receiptId: durable.requestId, queued: false };
   }
 
   async cancel(session: DriverSession): Promise<void> {
@@ -516,6 +552,9 @@ export class OpenCodeDriver implements WorkerDriver {
     active.cancelRequested = false;
     delete active.cancelPromise;
     delete active.terminalReconciliation;
+    active.turnSequence += 1;
+    active.nativeTurnId = `${sessionId}:turn:${active.turnSequence}`;
+    this.persistNativeTurn(active);
     const tools = request.workOrder.permissions === "read-only"
       ? { bash: false, shell: false, edit: false, write: false, patch: false, task: false }
       : undefined;
@@ -530,6 +569,11 @@ export class OpenCodeDriver implements WorkerDriver {
       },
     });
     if (response.error) throw new Error(JSON.stringify(response.error));
+    // Only add the resumable stream checkpoint after OpenCode acknowledges the
+    // prompt. The pre-ack checkpoint above deliberately contains only the
+    // stable Symphony dispatch identity, so an ambiguous request cannot be
+    // mistaken for a provider-accepted turn.
+    this.persistStreamState(active);
   }
 
   private async subscribe(sessionId: string, active: ActiveOpenCode): Promise<void> {
@@ -556,30 +600,34 @@ export class OpenCodeDriver implements WorkerDriver {
             emit(active.emit, "log", { message: "OpenCode reported a session error without a session id; the shared event was not assigned to this agent.", event });
             continue;
           }
-          if (event.type === "session.status" && record(properties.status).type === "busy") emit(active.emit, "run.started", event);
+          if (event.type === "session.status" && record(properties.status).type === "busy") {
+            emit(active.emit, "run.started", withMessageIdentity({ ...event, nativeTurnId: active.nativeTurnId }, active.pendingMessage), active.nativeTurnId ? `${active.nativeTurnId}:started` : undefined);
+          }
           else if (event.type === "session.idle") {
             if (!active.runPending) continue;
             active.runPending = false;
             if (active.cancelRequested) {
               active.cancelRequested = false;
-              emit(active.emit, "run.cancelled", event);
+              emit(active.emit, "run.cancelled", withMessageIdentity({ ...event, nativeTurnId: active.nativeTurnId }, active.pendingMessage), active.nativeTurnId ? `${active.nativeTurnId}:cancelled` : undefined);
             } else {
               const state = await this.reconcilePersistedTurn(sessionId, active);
               if (state === "idle" || state === "unknown") {
                 // A live idle event is itself terminal evidence even if the
                 // transcript endpoint is briefly unavailable. Recovery does
                 // not have this evidence and therefore stays conservative.
-                emit(active.emit, "output.completed", { text: active.outputText });
-                emit(active.emit, "run.completed", event);
+                emit(active.emit, "output.completed", withMessageIdentity({ text: active.outputText, nativeTurnId: active.nativeTurnId }, active.pendingMessage), active.nativeTurnId ? `${active.nativeTurnId}:output` : undefined);
+                emit(active.emit, "run.completed", withMessageIdentity({ ...event, nativeTurnId: active.nativeTurnId }, active.pendingMessage), active.nativeTurnId ? `${active.nativeTurnId}:completed` : undefined);
+                this.clearPendingMessage(active);
               }
             }
           }
           else if (event.type === "session.error") {
             if (!active.runPending) continue;
             active.runPending = false;
-            emit(active.emit, "run.failed", event);
+            emit(active.emit, "run.failed", withMessageIdentity({ ...event, nativeTurnId: active.nativeTurnId }, active.pendingMessage), active.nativeTurnId ? `${active.nativeTurnId}:failed` : undefined);
+            this.clearPendingMessage(active);
           }
-          else if (event.type === "file.edited") emit(active.emit, "file.changed", event);
+          else if (event.type === "file.edited") emit(active.emit, "file.changed", event, this.eventIdentity(sessionId, active, "file.changed", event));
           else if (event.type === "message.part.updated") {
             const part = record(properties.part);
             if (part.type === "text") {
@@ -589,19 +637,17 @@ export class OpenCodeDriver implements WorkerDriver {
               emit(
                 active.emit,
                 "message.delta",
-                { text: delta ?? part.text ?? "", replace: delta === null, messageId: part.id ?? null },
-                delta === null && typeof part.id === "string" ? this.nativePartEventId(sessionId, part.id, "text") : undefined,
+                withMessageIdentity({ text: delta ?? part.text ?? "", replace: delta === null, messageId: part.id ?? null, nativeTurnId: active.nativeTurnId }, active.pendingMessage),
+                this.eventIdentity(sessionId, active, "message.delta", event, typeof part.id === "string" ? part.id : null),
               );
             }
             else if (part.type === "reasoning") emit(
               active.emit,
               "reasoning.delta",
-              { text: properties.delta ?? part.text ?? "", replace: typeof properties.delta !== "string", messageId: part.id ?? null, part },
-              typeof properties.delta !== "string" && typeof part.id === "string"
-                ? this.nativePartEventId(sessionId, part.id, "reasoning")
-                : undefined,
+              withMessageIdentity({ text: properties.delta ?? part.text ?? "", replace: typeof properties.delta !== "string", messageId: part.id ?? null, part, nativeTurnId: active.nativeTurnId }, active.pendingMessage),
+              this.eventIdentity(sessionId, active, "reasoning.delta", event, typeof part.id === "string" ? part.id : null),
             );
-            else if (part.type === "tool") emit(active.emit, "tool.updated", part);
+            else if (part.type === "tool") emit(active.emit, "tool.updated", { ...part, nativeTurnId: active.nativeTurnId }, this.eventIdentity(sessionId, active, "tool.updated", event, typeof part.id === "string" ? part.id : null));
             else emit(active.emit, "log", event);
           }
         }
@@ -613,7 +659,7 @@ export class OpenCodeDriver implements WorkerDriver {
           if (active.runPending) {
             active.runPending = false;
             void this.abortBestEffort(active.client, sessionId, active.directory);
-            emit(active.emit, "run.failed", { error: stringifyError(error), source: "event-stream" });
+            emit(active.emit, "run.failed", withMessageIdentity({ error: stringifyError(error), source: "event-stream", nativeTurnId: active.nativeTurnId }, active.pendingMessage), active.nativeTurnId ? `${active.nativeTurnId}:failed` : undefined);
           } else {
             emit(active.emit, "log", { level: "error", message: stringifyError(error), source: "event-stream" });
           }
@@ -668,10 +714,29 @@ export class OpenCodeDriver implements WorkerDriver {
     };
     const messages = (Array.isArray(transcriptResponse.data) ? [...transcriptResponse.data] : [])
       .sort((left, right) => createdAt(left) - createdAt(right));
-    const latestUser = [...messages].reverse().find((message) => record(record(message).info).role === "user");
+    const pending = active.pendingMessage;
+    const latestUser = pending
+      ? messages.find((message) => record(record(message).info).id === pending.requestId)
+      : [...messages].reverse().find((message) => record(record(message).info).role === "user");
     const userInfo = record(record(latestUser).info);
     const userMessageId = typeof userInfo.id === "string" ? userInfo.id : null;
-    if (!userMessageId) return "idle";
+    if (!userMessageId || userInfo.role !== "user") {
+      if (pending) emit(active.emit, "log", { level: "error", message: "OpenCode recovery could not correlate the persisted transcript to the durable follow-up request; refusing to replay a previous user prompt.", source: "transcript-recovery", requestId: pending.requestId });
+      return pending ? "unknown" : "idle";
+    }
+    if (pending) {
+      const userParts = record(latestUser).parts;
+      const promptText = (Array.isArray(userParts) ? userParts : [])
+        .map((part) => record(part))
+        .filter((part) => part.type === "text" && typeof part.text === "string")
+        .map((part) => part.text as string)
+        .join("");
+      const promptHash = createHash("sha256").update(promptText, "utf8").digest("hex");
+      if (promptHash !== pending.contentHash) {
+        emit(active.emit, "log", { level: "error", message: "OpenCode recovery found the durable request id with different prompt content; refusing to complete an ambiguous native turn.", source: "transcript-recovery", requestId: pending.requestId });
+        return "unknown";
+      }
+    }
 
     const assistants = messages.filter((message) => {
       const info = record(record(message).info);
@@ -729,7 +794,7 @@ export class OpenCodeDriver implements WorkerDriver {
         emit(
           active.emit,
           "usage.recorded",
-          { costAmount: typeof info.cost === "number" ? info.cost : null, tokens: info.tokens ?? null, basis: "harness-reported" },
+          { costAmount: typeof info.cost === "number" ? info.cost : null, tokens: info.tokens ?? null, basis: "harness-reported", nativeTurnId: messageId },
           this.nativeMessageEventId(sessionId, messageId, "usage"),
         );
       }
@@ -746,24 +811,27 @@ export class OpenCodeDriver implements WorkerDriver {
           nativeError,
           sessionId,
           recovered: true,
+          nativeTurnId: userMessageId,
         },
         this.nativeTurnEventId(sessionId, userMessageId, "failed"),
       );
+      this.clearPendingMessage(active);
       return "failed";
     }
 
     emit(
       active.emit,
       "output.completed",
-      { text: active.outputText, sessionId, recovered: true },
+      { text: active.outputText, sessionId, recovered: true, nativeTurnId: userMessageId },
       this.nativeTurnEventId(sessionId, userMessageId, "output"),
     );
     emit(
       active.emit,
       "run.completed",
-      { sessionId, recovered: true, nativeMessageId: typeof lastInfo.id === "string" ? lastInfo.id : null },
+      { sessionId, recovered: true, nativeMessageId: typeof lastInfo.id === "string" ? lastInfo.id : null, nativeTurnId: userMessageId },
       this.nativeTurnEventId(sessionId, userMessageId, "completed"),
     );
+    this.clearPendingMessage(active);
     return "completed";
   }
 
@@ -780,6 +848,7 @@ export class OpenCodeDriver implements WorkerDriver {
       args: state.input ?? null,
       status,
       recovered: true,
+      nativeTurnId: sessionId,
       nativePart: part,
     };
     emit(consumer, "tool.started", payload, this.nativePartEventId(sessionId, partId, "tool-started"));
@@ -821,6 +890,104 @@ export class OpenCodeDriver implements WorkerDriver {
     return `opencode:${sessionId}:turn:${userMessageId}:${suffix}`;
   }
 
+  private eventIdentity(sessionId: string, active: ActiveOpenCode, kind: DriverEvent["kind"], payload: unknown, partId: string | null = null): string {
+    const providerId = this.providerEventId(payload);
+    if (partId) {
+      if (providerId) return this.nativePartEventId(sessionId, partId, `${kind}:${providerId}`);
+      active.streamSequence += 1;
+      this.persistStreamState(active);
+      return this.nativePartEventId(sessionId, partId, `${kind}:stream:${active.streamSequence}`);
+    }
+    if (providerId) return `opencode:${sessionId}:turn:${active.nativeTurnId ?? "unknown"}:event:${providerId}:${kind}`;
+    active.streamSequence += 1;
+    this.persistStreamState(active);
+    return `opencode:${sessionId}:turn:${active.nativeTurnId ?? "unknown"}:event:stream:${active.streamSequence}:${kind}`;
+  }
+
+  private providerEventId(payload: unknown): string | null {
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) return null;
+    const recordPayload = payload as Record<string, unknown>;
+    const properties = record(recordPayload.properties);
+    const values = [
+      recordPayload.id, recordPayload.eventId, recordPayload.event_id,
+      recordPayload.sequence, recordPayload.seq, recordPayload.offset,
+      properties.id, properties.eventId, properties.event_id,
+      properties.sequence, properties.seq, properties.offset,
+    ];
+    const value = values.find((candidate): candidate is string | number =>
+      typeof candidate === "string" || (typeof candidate === "number" && Number.isSafeInteger(candidate)));
+    return value === undefined ? null : String(value);
+  }
+
+  private turnSequenceFromNativeId(nativeTurnId: string | null): number {
+    const match = nativeTurnId?.match(/:turn:(\d+)$/u);
+    if (!match) return 0;
+    const sequence = Number(match[1]);
+    return Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : 0;
+  }
+
+  private persistStreamState(active: ActiveOpenCode): void {
+    if (!active.server) return;
+    try {
+      const retained = record(active.server.retainedAdapterState());
+      const shouldPersistTurnState = active.pendingMessage !== null
+        || Object.prototype.hasOwnProperty.call(retained, "turnSequence")
+        || Object.prototype.hasOwnProperty.call(retained, "nativeTurnId")
+        || Object.prototype.hasOwnProperty.call(retained, "streamSequence")
+        || Object.prototype.hasOwnProperty.call(retained, "pendingMessage");
+      active.server.updateProcessLease({
+        nativeRunId: active.nativeTurnId,
+        ...(shouldPersistTurnState ? {
+          adapterState: {
+            ...retained,
+            turnSequence: active.turnSequence,
+            nativeTurnId: active.nativeTurnId,
+            streamSequence: active.streamSequence,
+            pendingMessage: active.pendingMessage as unknown as JsonValue,
+          },
+        } : {}),
+      });
+    } catch {
+      // The runtime owns lease retirement; late stream callbacks are best
+      // effort after the service lease has already been released.
+    }
+  }
+
+  /**
+   * Checkpoint provider turn identity without changing Symphony's logical
+   * dispatch fence. In particular, this runs before promptAsync crosses the
+   * provider boundary, while `activeTurnId` must remain `initial:<agentId>`.
+   */
+  private persistNativeTurn(active: ActiveOpenCode): void {
+    if (!active.server) return;
+    try {
+      const retained = record(active.server.retainedAdapterState());
+      active.server.updateProcessLease({
+        nativeRunId: active.nativeTurnId,
+        ...(active.pendingMessage ? {
+          adapterState: {
+            ...retained,
+            pendingMessage: active.pendingMessage as unknown as JsonValue,
+            turnSequence: active.turnSequence,
+            nativeTurnId: active.nativeTurnId,
+          },
+        } : {}),
+      });
+    } catch {
+      // The runtime owns lease retirement; late stream callbacks are best
+      // effort after the service lease has already been released.
+    }
+  }
+
+  private clearPendingMessage(active: ActiveOpenCode): void {
+    // Keep the last accepted identity in the lease after terminal projection.
+    // A controller replay can then correlate the exact native transcript and
+    // return the same receipt without submitting a second prompt. A later
+    // distinct message replaces this historical marker in sendMessage().
+    if (!active.pendingMessage) return;
+    this.persistStreamState(active);
+  }
+
   private makeActive(
     client: OpencodeClient,
     onEvent: Emit,
@@ -836,6 +1003,10 @@ export class OpenCodeDriver implements WorkerDriver {
       runPending,
       cancelRequested: false,
       closed: false,
+      turnSequence: 0,
+      nativeTurnId: null,
+      streamSequence: 0,
+      pendingMessage: null,
       ...(server ? { server } : {}),
     };
   }
@@ -924,4 +1095,13 @@ export class OpenCodeDriver implements WorkerDriver {
     if (!active) throw new Error(`OpenCode session is not active: ${session.nativeSessionId}`);
     return active;
   }
+}
+
+function retainedMessageDispatch(state: Record<string, unknown>): DriverMessageRequest | null {
+  const value = record(state.pendingMessage);
+  const attemptId = typeof value.attemptId === "string" ? value.attemptId : null;
+  const requestId = typeof value.requestId === "string" ? value.requestId : null;
+  const contentHash = typeof value.contentHash === "string" ? value.contentHash : null;
+  if (!attemptId || !requestId || !contentHash) return null;
+  return { attemptId, requestId, contentHash };
 }

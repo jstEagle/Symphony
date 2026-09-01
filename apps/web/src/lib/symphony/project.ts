@@ -14,9 +14,7 @@ import type {
   InboxItem,
   JsonValue,
   RunSnapshot,
-  WorkEdge,
   WorkflowMission,
-  WorkNode,
 } from "./contracts";
 import {
   agentDisplayName,
@@ -30,6 +28,9 @@ import {
   loaderForHarness,
   relativeTime,
 } from "./format";
+import { layoutFromAgents } from "./graph-projection";
+
+export { layoutFromAgents } from "./graph-projection";
 
 const INBOX_GROUP_ID = "inbox";
 const ACTIVITY_EVENT_TYPES = new Set([
@@ -145,14 +146,29 @@ export function snapshotForThread(
     ?? envelope.runs.find((item) => item.workflowId === `chat:${thread.id}` || item.workflowId === thread.id);
   const mission = readMission(thread.mission);
   const { nodes, edges } = layoutFromAgents(relatedAgents);
-  const activity = eventsToActivity(events, relatedAgents);
   const liveCount = relatedAgents.filter((agent) => isActivelyWorkingAgent(agent.state)).length;
-  const relatedIds = new Set(relatedAgents.map((agent) => agent.id));
-  const traceEvents = events.filter((event) =>
-    (event.agentId !== null && relatedIds.has(event.agentId))
-    || event.runId === (run?.id ?? `chat-run:${thread.id}`)
-    || event.workflowId === (run?.workflowId ?? `chat:${thread.id}`),
-  );
+  const chatRunId = `chat-run:${thread.id}`;
+  const chatWorkflowId = `chat:${thread.id}`;
+  const relatedAgentIds = new Set(relatedAgents.map((agent) => agent.id));
+  const relatedRunIds = new Set<string>([chatRunId]);
+  const relatedWorkflowIds = new Set<string>([chatWorkflowId]);
+  if (run) {
+    relatedRunIds.add(run.id);
+    relatedWorkflowIds.add(run.workflowId);
+  }
+  for (const agent of relatedAgents) {
+    if (agent.runId) relatedRunIds.add(agent.runId);
+    if (agent.workflowId) relatedWorkflowIds.add(agent.workflowId);
+  }
+  const traceEvents = events.filter((event) => isEventLinkedToThread(
+    event,
+    relatedAgentIds,
+    relatedRunIds,
+    relatedWorkflowIds,
+    chatRunId,
+    chatWorkflowId,
+  ));
+  const activity = eventsToActivity(traceEvents, relatedAgents);
   return {
     runId: run?.id ?? `chat-run:${thread.id}`,
     workflowId: run?.workflowId ?? `chat:${thread.id}`,
@@ -168,6 +184,26 @@ export function snapshotForThread(
     traceEvents,
     cancelRequested: run?.cancelRequested,
   };
+}
+
+function isEventLinkedToThread(
+  event: EventEnvelope,
+  relatedAgentIds: ReadonlySet<string>,
+  relatedRunIds: ReadonlySet<string>,
+  relatedWorkflowIds: ReadonlySet<string>,
+  chatRunId: string,
+  chatWorkflowId: string,
+): boolean {
+  if (event.agentId !== null && relatedAgentIds.has(event.agentId)) return true;
+  if (event.runId === chatRunId) return true;
+  if (event.workflowId === chatWorkflowId && (event.runId === null || event.runId === chatRunId)) return true;
+
+  const matchesRun = event.runId !== null && relatedRunIds.has(event.runId);
+  const matchesWorkflow = event.workflowId !== null && relatedWorkflowIds.has(event.workflowId);
+  if (matchesRun && matchesWorkflow) return true;
+  // Registration events identify a workflow but have no run yet. They are
+  // safe to include only when that workflow was linked from this agent tree.
+  return event.type.startsWith("workflow.") && event.runId === null && matchesWorkflow;
 }
 
 export function projectInbox(
@@ -247,6 +283,7 @@ export function recordToAgent(record: AgentRecord, cost?: CostSummary): Agent {
   const objective = sanitizeLegacyAgentObjective(record.objective);
   return {
     id: record.id,
+    logicalAgentId: record.logicalAgentId,
     parentId: record.parentAgentId ?? undefined,
     depth: record.depth,
     name: agentDisplayName(objective, record.depth),
@@ -303,80 +340,6 @@ const NEUTRAL_COORDINATION_DIRECTIVE = "Observe delegated work without interrupt
 
 function sanitizeLegacyAgentObjective(objective: string): string {
   return objective.replace(LEGACY_REVIEW_DIRECTIVE, NEUTRAL_COORDINATION_DIRECTIVE);
-}
-
-export function layoutFromAgents(agents: Agent[]): { nodes: WorkNode[]; edges: WorkEdge[] } {
-  if (agents.length === 0) return { nodes: [], edges: [] };
-  const agentIds = new Set(agents.map((agent) => agent.id));
-  const byParent = new Map<string, Agent[]>();
-  for (const agent of agents) {
-    if (!agent.parentId || agent.parentId === agent.id || !agentIds.has(agent.parentId)) continue;
-    const key = agent.parentId;
-    const list = byParent.get(key) ?? [];
-    list.push(agent);
-    byParent.set(key, list);
-  }
-  for (const children of byParent.values()) children.sort(compareAgentsForLayout);
-
-  const nodes: WorkNode[] = [];
-  const edges: WorkEdge[] = [];
-  const placed = new Set<string>();
-  const visiting = new Set<string>();
-  const rowGap = 96;
-  const columnGap = 356;
-
-  const leafSpan = (agent: Agent): number => {
-    if (visiting.has(agent.id)) return 1;
-    visiting.add(agent.id);
-    const children = (byParent.get(agent.id) ?? []).filter((child) => !visiting.has(child.id));
-    const span = Math.max(1, children.reduce((total, child) => total + leafSpan(child), 0));
-    visiting.delete(agent.id);
-    return span;
-  };
-
-  const place = (agent: Agent, depth: number, topRow: number): number => {
-    if (placed.has(agent.id)) return 1;
-    placed.add(agent.id);
-    const children = (byParent.get(agent.id) ?? []).filter((child) => !placed.has(child.id));
-    const childSpans = children.map((child) => leafSpan(child));
-    const span = Math.max(1, childSpans.reduce((total, childSpan) => total + childSpan, 0));
-    const centerRow = children.length
-      ? topRow + (span - 1) / 2
-      : topRow;
-    nodes.push({
-      id: agent.id,
-      label: agent.name,
-      detail: `${agent.harness} · ${agent.access}`,
-      agentId: agent.id,
-      state: agent.state,
-      x: depth * columnGap,
-      y: centerRow * rowGap,
-    });
-    let childTop = topRow;
-    children.forEach((child, index) => {
-      edges.push({ from: agent.id, to: child.id, kind: "delegation" });
-      place(child, depth + 1, childTop);
-      childTop += childSpans[index] ?? 1;
-    });
-    return span;
-  };
-
-  const roots = agents
-    .filter((agent) => !agent.parentId || agent.parentId === agent.id || !agentIds.has(agent.parentId))
-    .sort(compareAgentsForLayout);
-  let nextRow = 0;
-  for (const root of roots) nextRow += place(root, 0, nextRow) + 1;
-  // Malformed persisted parent cycles should remain visible instead of disappearing.
-  for (const agent of agents) {
-    if (!placed.has(agent.id)) nextRow += place(agent, 0, nextRow) + 1;
-  }
-  return { nodes, edges };
-}
-
-function compareAgentsForLayout(left: Agent, right: Agent): number {
-  const leftAt = left.startedAt ?? left.updatedAt ?? "";
-  const rightAt = right.startedAt ?? right.updatedAt ?? "";
-  return leftAt.localeCompare(rightAt) || left.id.localeCompare(right.id);
 }
 
 function eventsToActivity(events: EventEnvelope[], agents: Agent[]): ActivityEvent[] {

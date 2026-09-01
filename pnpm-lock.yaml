@@ -234,6 +234,10 @@ importers:
         version: 5.1.4(typescript@5.9.3)(vite@7.3.6(@types/node@20.19.43)(jiti@2.7.0)(lightningcss@1.33.0)(tsx@4.23.13)(yaml@2.9.0))
 
   apps/worker-host:
+    dependencies:
+      '@symphony/protocol':
+        specifier: workspace:*
+        version: link:../../packages/protocol
     devDependencies:
       tsup:
         specifier: 8.5.1

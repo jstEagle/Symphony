@@ -4,10 +4,17 @@ import type { Writable } from "node:stream";
 import { environmentWithoutDaemonSecret } from "@symphony/config";
 import {
   WorkerHostConnection,
+  normalizeWorkerHostFrame,
   type WorkerHostBootstrap,
   type WorkerHostFrame,
 } from "@symphony/worker-host";
-import type { DriverProcessSupervisor, JsonValue, WorkerProcessLease } from "@symphony/protocol";
+import type {
+  DriverProcessSupervisor,
+  JsonValue,
+  WorkerEventContext,
+  WorkerEventEnvelope,
+  WorkerProcessLease,
+} from "@symphony/protocol";
 import {
   type JsonLineRpcTransport,
   type JsonObject,
@@ -31,6 +38,9 @@ type HostedCallbacks = {
   stdoutMode?: "json" | "raw";
   onStderr?: (line: string, nativeEventId?: string) => void;
   onUnexpectedExit?: (error: Error, nativeEventId?: string) => void;
+  /** Optional observer for the canonical raw host boundary. Native parsing remains unchanged. */
+  onWorkerEvent?: (event: WorkerEventEnvelope, frame: WorkerHostFrame) => void;
+  workerEventContext?: Omit<WorkerEventContext, "leaseId">;
 };
 
 export type HostedRawLineCallbacks = {
@@ -90,6 +100,7 @@ export class HostedJsonLineProcess implements JsonLineRpcTransport {
   private acceptingFrames = true;
   private detachPromise: Promise<void> | null = null;
   private released = false;
+  private retirementRequested = false;
   private workerRunning = true;
 
   constructor(spec: ProcessSpec & { processSupervisor: DriverProcessSupervisor }, callbacks: HostedCallbacks) {
@@ -374,6 +385,7 @@ export class HostedJsonLineProcess implements JsonLineRpcTransport {
         || (this.connection !== null && this.connectionGeneration > lostGeneration)
       ) return;
       const failure = error instanceof Error ? error : new Error(String(error));
+      this.requestProcessRetirement(failure);
       this.finish(failure);
     }).finally(() => {
       if (this.reconnectPromise === reconnect) this.reconnectPromise = null;
@@ -505,6 +517,7 @@ export class HostedJsonLineProcess implements JsonLineRpcTransport {
       spoolPath: plan.spoolPath,
       maxSpoolBytes: plan.maxSpoolBytes,
       maxSpoolFrames: plan.maxSpoolFrames,
+      ...(plan.controllerGraceMs === undefined ? {} : { controllerGraceMs: plan.controllerGraceMs }),
       command: spec.command,
       args: spec.args ?? [],
       cwd: spec.cwd ?? null,
@@ -590,6 +603,13 @@ export class HostedJsonLineProcess implements JsonLineRpcTransport {
     if (frame.seq <= this.lastProcessedSeq) return;
     if (frame.seq !== this.lastProcessedSeq + 1) {
       throw new Error(`Worker-host output sequence gap: expected ${this.lastProcessedSeq + 1}, received ${frame.seq}.`);
+    }
+    if (this.callbacks.onWorkerEvent && this.callbacks.workerEventContext) {
+      const event = normalizeWorkerHostFrame(frame, {
+        ...this.callbacks.workerEventContext,
+        leaseId: this.processLease.id,
+      });
+      this.callbacks.onWorkerEvent(event, frame);
     }
     let unexpectedExit: Error | null = null;
     if (frame.stream === "stdout") {
@@ -821,6 +841,21 @@ export class HostedJsonLineProcess implements JsonLineRpcTransport {
     if (!this.expectedClosing) {
       this.connection?.close();
       this.callbacks.onUnexpectedExit?.(error, nativeEventId);
+    }
+  }
+
+  private requestProcessRetirement(error: Error): void {
+    if (this.retirementRequested) return;
+    this.retirementRequested = true;
+    try {
+      this.supervisor.requestProcessRetirement?.(this.processLease.id, {
+        reason: "controller-lost",
+        error: error.message,
+      });
+    } catch {
+      // The controller has already lost its transport. If the store is
+      // unavailable, the worker-host grace timer remains the final fail-closed
+      // boundary and a later daemon can retry the durable reconciliation.
     }
   }
 

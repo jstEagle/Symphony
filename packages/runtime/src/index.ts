@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join, resolve } from "node:path";
@@ -7,10 +7,12 @@ import { z } from "zod";
 import { Ajv } from "ajv";
 import { ulid } from "ulid";
 import type { LoadedConfig, SecretStore } from "@symphony/config";
+import { extractStructuredOutput, inspectProcessIdentity, WorkerHostConnection, type ProcessIdentityInspection } from "@symphony/drivers";
 import type { DriverRegistry } from "@symphony/drivers";
-import { extractStructuredOutput, inspectProcessIdentity, type ProcessIdentityInspection } from "@symphony/drivers";
 import {
   AgentWorkOrderSchema,
+  normalizeDriverEvent,
+  type DriverMessageRequest,
   DriverSessionSchema,
   isTerminalAgentStatus,
   nowIso,
@@ -29,6 +31,7 @@ import {
   type RoutingTrace,
   type UsageEvent,
   type WorkerProcessLease,
+  type WorkerEventEnvelope,
 } from "@symphony/protocol";
 import type { AgentListCursor, SymphonyStore } from "@symphony/storage";
 
@@ -95,6 +98,81 @@ function driverFailureMessage(payload: JsonValue): string {
   }
   const serialized = JSON.stringify(payload);
   return serialized && serialized !== "null" ? serialized : "Native run failed.";
+}
+
+function metadataString(metadata: Record<string, JsonValue>, ...keys: string[]): string | null {
+  for (const key of keys) {
+    const value = metadata[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
+const DURABLE_DRIVER_EVENT_KINDS = new Set<DriverEvent["kind"]>([
+  "output.completed",
+  "run.completed",
+  "run.failed",
+  "run.cancelled",
+  "tool.started",
+  "tool.updated",
+  "tool.completed",
+  "usage.recorded",
+]);
+
+function durableDriverEventId(agent: AgentRecord, driverEvent: DriverEvent, runtimeTurnId?: string): string | null {
+  const nativeTurnId = nativeTurnIdFromPayload(driverEvent.payload);
+  const turnId = nativeTurnId ?? runtimeTurnId ?? agent.nativeRunId;
+  if (!turnId) return null;
+  const scope = [
+    agent.harness ?? agent.requestedHarness,
+    agent.nativeSessionId ?? agent.id,
+    agent.nativeRunId ?? "none",
+    turnId,
+  ].join(":");
+  const canonical = stableRuntimeJson({ kind: driverEvent.kind, scope, payload: driverEvent.payload });
+  return `runtime:${createHash("sha256").update(canonical).digest("hex")}`;
+}
+
+function nativeTurnIdFromPayload(payload: JsonValue): string | null {
+  const record = payload !== null && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as Record<string, JsonValue>
+    : {};
+  const direct = [record.nativeTurnId, record.turnId, record.turn_id, record.runId, record.run_id]
+    .find((value): value is string => typeof value === "string" && value.length > 0);
+  if (direct) return direct;
+  const usage = record.usage;
+  if (usage !== null && typeof usage === "object" && !Array.isArray(usage)) {
+    const nested = usage as Record<string, JsonValue>;
+    return [nested.nativeTurnId, nested.turnId, nested.turn_id, nested.runId, nested.run_id]
+      .find((value): value is string => typeof value === "string" && value.length > 0) ?? null;
+  }
+  return null;
+}
+
+function objectiveAttemptIdFromPayload(payload: JsonValue): string | null {
+  const record = payload !== null && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as Record<string, JsonValue>
+    : {};
+  const direct = record.objectiveAttemptId ?? record.objective_attempt_id;
+  if (typeof direct === "string" && direct.length > 0) return direct;
+  const usage = record.usage;
+  if (usage !== null && typeof usage === "object" && !Array.isArray(usage)) {
+    const nested = usage as Record<string, JsonValue>;
+    const nestedAttempt = nested.objectiveAttemptId ?? nested.objective_attempt_id;
+    if (typeof nestedAttempt === "string" && nestedAttempt.length > 0) return nestedAttempt;
+  }
+  return null;
+}
+
+function stableRuntimeJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableRuntimeJson).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{${Object.keys(value as Record<string, unknown>)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableRuntimeJson((value as Record<string, unknown>)[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 export class ModelRouter {
@@ -370,16 +448,50 @@ export class ModelRouter {
 }
 
 export class WorkspaceGuard {
-  async verify(order: AgentWorkOrder): Promise<void> {
-    const path = resolve(order.workspace.path);
-    if (!existsSync(path)) throw new Error(`Workspace does not exist: ${path}`);
-    if (order.workspace.dirtyPolicy === "local-only") return;
+  /**
+   * Resolve the caller's workspace to the path that Symphony is authorizing.
+   * AgentRecord.workspacePath is an immutable identity field, so this value
+   * becomes the durable filesystem grant for the lifetime of the agent.
+   */
+  async verify(order: AgentWorkOrder): Promise<string> {
+    const path = this.canonicalPath(order.workspace.path);
+    if (order.workspace.dirtyPolicy === "local-only") return path;
     const result = await execFileAsync("git", ["status", "--porcelain"], { cwd: path }).catch((error) => {
       throw new Error(`Workspace is not a Git repository: ${String(error)}`);
     });
     if (result.stdout.trim()) {
       if (order.workspace.dirtyPolicy === "require-clean") throw new Error("Workspace has uncommitted changes but require-clean was requested.");
       throw new Error("explicit-checkpoint requires the caller to create and reference a checkpoint before the agent starts.");
+    }
+    return path;
+  }
+
+  /**
+   * Re-resolve the requested path at the last possible point before a native
+   * process is launched. A symlink (or any other path component) can change
+   * between admission and dispatch; never let that turn an immutable grant
+   * into a different working directory.
+   */
+  verifyLaunch(requestedPath: string, grantedPath: string): string {
+    const currentPath = this.canonicalPath(requestedPath);
+    // Older stores may contain an absolute-but-not-realpathed workspacePath
+    // (notably macOS's /var -> /private/var alias). Normalize that historical
+    // representation for compatibility. New admissions persist the canonical
+    // path, so a changed symlink still compares against an immutable target.
+    const canonicalGrant = this.canonicalPath(grantedPath);
+    if (currentPath !== canonicalGrant) {
+      throw new Error(`Workspace changed after admission: expected ${canonicalGrant}, resolved ${currentPath}. Native launch was refused.`);
+    }
+    return currentPath;
+  }
+
+  private canonicalPath(requestedPath: string): string {
+    const resolved = resolve(requestedPath);
+    if (!existsSync(resolved)) throw new Error(`Workspace does not exist: ${resolved}`);
+    try {
+      return realpathSync.native(resolved);
+    } catch (error) {
+      throw new Error(`Workspace could not be resolved safely: ${resolved}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 }
@@ -712,11 +824,32 @@ export class UiUtilityService {
 
 type StartQueueEntry = { kind: "start"; order: AgentWorkOrder; record: AgentRecord };
 
+function durableMessageRequest(
+  agentId: string,
+  attemptId: string,
+  content: string,
+  existing?: { requestId?: string | undefined; contentHash?: string | undefined },
+): DriverMessageRequest {
+  const contentHash = createHash("sha256").update(content, "utf8").digest("hex");
+  if (existing?.contentHash && existing.contentHash !== contentHash) {
+    throw new Error(`Durable message ${attemptId} content hash does not match its persisted identity.`);
+  }
+  return {
+    attemptId,
+    requestId: existing?.requestId ?? `symphony:message:${agentId}:${attemptId}`,
+    contentHash,
+  };
+}
+
 const FollowUpDispatchSchema = z.object({
   version: z.literal(1),
   attemptId: z.string().min(1),
   agentId: z.string().min(1),
   content: z.string().min(1),
+  // Optional for records written by pre-identity daemons. They are upgraded
+  // to a deterministic identity on read before any native dispatch.
+  requestId: z.string().min(1).optional(),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/iu).optional(),
   state: z.enum(["queued", "dispatching", "delivered", "settled", "cancelled", "failed", "outcome-unknown"]),
   receiptId: z.string().nullable(),
   outcome: z.enum(["completed", "failed", "cancelled"]).optional(),
@@ -731,6 +864,8 @@ const SteeringDispatchSchema = z.object({
   attemptId: z.string().min(1),
   agentId: z.string().min(1),
   content: z.string().min(1),
+  requestId: z.string().min(1).optional(),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/iu).optional(),
   state: z.enum(["dispatching", "delivered", "settled", "failed", "outcome-unknown"]),
   receiptId: z.string().nullable(),
   queued: z.boolean().nullable(),
@@ -770,6 +905,8 @@ type SessionRetirementIntent = z.infer<typeof SessionRetirementIntentSchema>;
 type RecoveryDispatch = {
   attemptId: string;
   nativeSessionId: string;
+  requestId?: string;
+  contentHash?: string;
   state: "dispatching" | "delivered" | "failed" | "settled";
   createdAt: string;
   updatedAt: string;
@@ -823,9 +960,20 @@ function isReconnectableHostedDriver(driver: ResolvedHarness): boolean {
 }
 
 export class AgentCoordinator {
+  /**
+   * A native process exit normally reaches the coordinator through the driver
+   * callback. Keep a small, unref'd reconciliation loop as a second source of
+   * truth: a callback can be lost while the durable lease still proves that a
+   * process was attached. This is intentionally short enough to make a dead
+   * session visible, but long enough not to pollute native streams with a
+   * tight liveness loop.
+   */
+  private static readonly processReconciliationIntervalMs = 5_000;
   private readonly queue: QueueEntry[] = [];
   private readonly sessions = new Map<string, DriverSession>();
   private readonly terminalResolvers = new Map<string, () => void>();
+  /** Runtime fallback scope for native frames that carry no provider id. */
+  private readonly runtimeTurnIds = new Map<string, string>();
   private readonly createInFlight = new Map<string, Promise<AgentRecord>>();
   private readonly cancelInFlight = new Map<string, Promise<void>>();
   private readonly sessionRetirements = new Map<string, Promise<void>>();
@@ -836,7 +984,10 @@ export class AgentCoordinator {
   private readonly controllerOwnerId: string;
   private readonly controllerEpoch: number;
   private readonly adoptableProcessLeases = new Map<string, WorkerProcessLease>();
+  private readonly controllerLostProcessLeases = new Map<string, WorkerProcessLease>();
   private readonly processLeaseIds = new Map<string, string>();
+  private processReconciliationTimer: NodeJS.Timeout | null = null;
+  private processReconciliationInFlight = false;
   private acceptingDriverEvents = true;
   private running = 0;
 
@@ -883,6 +1034,7 @@ export class AgentCoordinator {
   reconcileWorkerProcesses(
     inspector: (identity: NonNullable<WorkerProcessLease["identity"]>) => ProcessIdentityInspection = inspectProcessIdentity,
   ): void {
+    this.controllerLostProcessLeases.clear();
     const oldLeases = this.store.listWorkerProcessLeases({ states: ["reserved", "running"] })
       .filter((lease) => lease.daemonOwnerId !== this.daemonOwnerId);
     const inspections = new Map<string, ProcessIdentityInspection>();
@@ -909,6 +1061,29 @@ export class AgentCoordinator {
       const inspection = inspections.get(lease.id)
         ?? { status: "unverified" as const, identity: null, detail: "Process inspection evidence was unavailable." };
       const agent = this.store.getAgent(lease.agentId);
+      const controllerLostRetirement = Boolean(
+        lease.state === "running"
+        && lease.retirementReason === "controller-lost"
+        && hostedTransport?.hostIdentity,
+      );
+      if (controllerLostRetirement && (inspection.status === "exact" || inspection.status === "unverified")) {
+        // This lease is an explicit durable kill request, not a candidate for
+        // native-session continuation. Keep it out of adoptableProcessLeases,
+        // including when the agent has already reached a terminal state.
+        this.processEvent(lease, "supervisor.host.adoption-pending", {
+          detail: inspection.detail,
+          previousDaemonOwnerId: lease.daemonOwnerId,
+          hostInstanceId: hostedTransport?.hostInstanceId ?? null,
+          ownerEpoch: hostedTransport?.ownerEpoch ?? null,
+          identityVerification: inspection.status,
+          retirementRequestedAt: lease.retirementRequestedAt,
+          retirementReason: lease.retirementReason,
+          signalAttempted: false,
+        });
+        const staged = this.store.getWorkerProcessLease(lease.id) ?? lease;
+        this.controllerLostProcessLeases.set(lease.id, staged);
+        continue;
+      }
       const canAdoptHostedProcess = Boolean(
         hostedTransport
         && isReconnectableHostedDriver(lease.driver)
@@ -1001,6 +1176,150 @@ export class AgentCoordinator {
         });
       }
     }
+
+    // Startup reconciliation above handles leases owned by the previous
+    // daemon generation. A previous callback may also have been lost in the
+    // current generation, so inspect this daemon's own leases as well.
+    this.reconcileActiveProcesses(inspector);
+  }
+
+  /**
+   * Reconcile leases owned by this daemon without attempting recovery or
+   * dispatch. The only terminal evidence accepted here is a durable lease
+   * transition, or strong process identity evidence proving that an attached
+   * process is dead/replaced. Live or unverified processes are left alone.
+   *
+   * This method is public so the daemon and deterministic tests can trigger a
+   * bounded pass explicitly. Browser/SSE lifecycle code must never call it to
+   * stop work: the native process and this durable lease remain authoritative.
+   */
+  reconcileActiveProcesses(
+    inspector: (identity: NonNullable<WorkerProcessLease["identity"]>) => ProcessIdentityInspection = inspectProcessIdentity,
+  ): void {
+    const leases = this.store.listWorkerProcessLeases({
+      daemonOwnerId: this.daemonOwnerId,
+      states: ["reserved", "running", "exited", "identity-mismatch", "orphaned", "unverified"],
+    });
+    const byAgent = new Map<string, WorkerProcessLease[]>();
+    for (const lease of leases) {
+      const current = byAgent.get(lease.agentId) ?? [];
+      current.push(lease);
+      byAgent.set(lease.agentId, current);
+    }
+
+    for (const agentLeases of byAgent.values()) {
+      const liveClaim = agentLeases.some((lease) => {
+        if (lease.state !== "reserved" && lease.state !== "running") return false;
+        const evidence = this.inspectProcessLease(lease, inspector);
+        return evidence?.status === "exact";
+      });
+      if (liveClaim) continue;
+
+      for (const lease of agentLeases) {
+        if (lease.state === "reserved" || lease.state === "running") {
+          const evidence = this.inspectProcessLease(lease, inspector);
+          if (!evidence || (evidence.status !== "dead" && evidence.status !== "mismatch")) continue;
+          const transitioned = this.store.transitionWorkerProcessLease(
+            lease.id,
+            [lease.state],
+            evidence.status === "dead"
+              ? {
+                  state: "exited",
+                  releasedAt: nowIso(),
+                  error: evidence.detail,
+                  activeTurnId: null,
+                }
+              : {
+                  state: "identity-mismatch",
+                  error: evidence.detail,
+                  activeTurnId: null,
+                },
+          );
+          if (!transitioned) continue;
+          this.processEvent(transitioned, evidence.status === "dead" ? "supervisor.process.exited" : "supervisor.identity-mismatch", {
+            detail: evidence.detail,
+            reconciliation: true,
+            signalAttempted: false,
+            identityVerification: evidence.status,
+          });
+          this.processLeaseIds.delete(lease.agentId);
+          this.reconcileAgentAfterProcessLoss(transitioned, evidence.detail, evidence.status);
+        } else if (lease.state === "exited" || lease.state === "identity-mismatch" || lease.state === "orphaned") {
+          // The driver may have released the lease successfully before its
+          // terminal event callback was delivered. Treat that durable state as
+          // terminal evidence, but preserve expected retirement of an idle
+          // reusable session (which intentionally exits with no error).
+          this.reconcileAgentAfterProcessLoss(lease, lease.error ?? "The native process is no longer attached.", lease.state === "exited" ? "dead" : "mismatch");
+        }
+      }
+    }
+  }
+
+  private inspectProcessLease(
+    lease: WorkerProcessLease,
+    inspector: (identity: NonNullable<WorkerProcessLease["identity"]>) => ProcessIdentityInspection,
+  ): ProcessIdentityInspection | null {
+    const identities = lease.transport.kind === "worker-host"
+      ? [lease.transport.hostIdentity, lease.transport.workerIdentity, lease.identity].filter(
+          (identity): identity is NonNullable<WorkerProcessLease["identity"]> => identity !== null,
+        )
+      : lease.identity ? [lease.identity] : [];
+    if (!identities.length) return null;
+
+    const inspections = identities.flatMap((identity) => {
+      try {
+        return [inspector(identity)];
+      } catch (error) {
+        return [{
+          status: "unverified" as const,
+          identity: null,
+          detail: `Process identity inspection failed: ${error instanceof Error ? error.message : String(error)}`,
+        }];
+      }
+    });
+    // A replacement identity is stronger than a liveness negative because it
+    // proves that this lease no longer names the process it started.
+    const mismatch = inspections.find((inspection) => inspection.status === "mismatch");
+    if (mismatch) return mismatch;
+    return inspections.find((inspection) => inspection.status === "dead")
+      ?? inspections.find((inspection) => inspection.status === "exact")
+      ?? inspections[0]
+      ?? null;
+  }
+
+  private reconcileAgentAfterProcessLoss(
+    lease: WorkerProcessLease,
+    detail: string,
+    evidence: "dead" | "mismatch",
+  ): void {
+    const agent = this.store.getAgent(lease.agentId);
+    if (!agent || isTerminalAgentStatus(agent.status)) return;
+    // A clean lease exit while a reusable idle/waiting session is being
+    // intentionally retired is not a crash. An error or a still-active turn
+    // makes the same state an authoritative unexpected process loss.
+    const hasActiveTurn = requiresRunContinuity(agent.status) || lease.activeTurnId !== null;
+    if (!hasActiveTurn && lease.state === "exited" && lease.error === null) return;
+    const error = evidence === "dead"
+      ? `The native process exited without delivering its terminal callback. ${detail}`
+      : `The native process identity no longer matches its durable lease. ${detail}`;
+    const interrupted = this.update(agent, {
+      status: "interrupted",
+      error,
+      finishedAt: nowIso(),
+    });
+    // Never let a missed callback keep a scheduler slot or a reusable
+    // in-memory session alive. Late native events are fenced by
+    // applyDriverEvent's terminal-state guard.
+    this.sessions.delete(agent.id);
+    this.resolveTerminal(agent.id);
+    this.event(interrupted, "agent.interrupted", {
+      error,
+      phase: "process-reconciliation",
+      processLeaseId: lease.id,
+      processState: lease.state,
+      continuity: evidence === "dead" ? "process-exit-reconciled" : "process-identity-reconciled",
+      signalAttempted: false,
+    });
   }
 
   async create(input: unknown): Promise<AgentRecord> {
@@ -1043,15 +1362,18 @@ export class AgentCoordinator {
     if (!this.daemonCredential.allowNewCredentials) {
       throw new Error("Symphony is preserving legacy daemon credentials for retained work and cannot create new agents until the external credential is reconciled.");
     }
-    await this.workspace.verify(order);
+    const workspacePath = await this.workspace.verify(order);
     const id = ulid();
     const now = nowIso();
+    const objectiveAttemptId = metadataString(order.metadata, "objectiveAttemptId", "attemptId");
     const record: AgentRecord = {
       id, logicalAgentId: order.id as string, workflowId: order.workflowId, runId: order.runId,
       parentAgentId: order.parentAgentId, depth: order.depth, objective: order.objective, missionHash: order.mission.hash,
-      requestedHarness: order.harness, requestedModel: order.model, harness: null, model: null,
+      requestedHarness: order.harness, requestedModel: order.model,
+      ...(objectiveAttemptId ? { objectiveAttemptId } : {}),
+      harness: null, model: null,
       permissions: order.permissions, status: "queued", nativeSessionId: null, nativeRunId: null,
-      workspacePath: resolve(order.workspace.path), output: null, error: null,
+      workspacePath, output: null, error: null,
       createdAt: now, updatedAt: now, startedAt: null, finishedAt: null,
     };
     this.store.durableTransaction(() => {
@@ -1141,6 +1463,7 @@ export class AgentCoordinator {
 
   quiesce(): void {
     this.acceptingDriverEvents = false;
+    this.stopProcessReconciliation();
   }
 
   async message(
@@ -1156,10 +1479,16 @@ export class AgentCoordinator {
       throw new Error(`Agent native session cannot accept another turn after ${agent.status}: ${agentId}`);
     }
 
-    // A message sent while a native turn is already running is steering for
-    // that supervised turn. It uses the slot already held by that turn rather
-    // than acquiring a second slot for the same native work.
-    if (agent.status === "running") return await this.steerRunningAgent(agent, agent.harness, session, content, options.attemptId);
+    // A message sent while a native turn is already running is steering only
+    // when the driver explicitly supports that operation. Drivers such as
+    // OpenCode and ACP start a new native prompt from sendMessage, so sending
+    // directly would overlap turns. Persist those messages and let the active
+    // terminal evidence release the existing slot before dispatching them.
+    if (agent.status === "running") {
+      const driver = this.drivers.get(agent.harness);
+      if (driver.capabilities.steer) return await this.steerRunningAgent(agent, agent.harness, session, content, options.attemptId);
+      return this.queueFollowUp(agent, content, options.attemptId, true);
+    }
 
     return this.queueFollowUp(this.get(agentId), content, options.attemptId);
   }
@@ -1190,10 +1519,18 @@ export class AgentCoordinator {
     };
   }
 
-  private queueFollowUp(agent: AgentRecord, content: string, attemptId = ulid()): { receiptId: string; queued: boolean } {
+  private queueFollowUp(
+    agent: AgentRecord,
+    content: string,
+    attemptId = ulid(),
+    preserveActiveTurn = false,
+  ): { receiptId: string; queued: boolean } {
     const agentId = agent.id;
     const previousFollowUp = this.followUpDispatch(agentId);
     if (previousFollowUp?.attemptId === attemptId) {
+      if (previousFollowUp.content !== content) {
+        throw new Error(`Agent follow-up ${attemptId} is already bound to different content.`);
+      }
       if (["queued", "dispatching", "delivered", "settled"].includes(previousFollowUp.state)) {
         return { receiptId: previousFollowUp.receiptId ?? attemptId, queued: previousFollowUp.state === "queued" };
       }
@@ -1204,18 +1541,26 @@ export class AgentCoordinator {
     }
 
     const now = nowIso();
+    const messageRequest = durableMessageRequest(agentId, attemptId, content, previousFollowUp ?? undefined);
     const dispatch = FollowUpDispatchSchema.parse({
       version: 1,
       attemptId,
       agentId,
       content,
+      requestId: messageRequest.requestId,
+      contentHash: messageRequest.contentHash,
       state: "queued",
       receiptId: null,
       createdAt: now,
       updatedAt: now,
     });
     this.store.durableTransaction(() => {
-      const updated = this.update(agent, { status: "waiting", output: null, error: null, finishedAt: null });
+      const updated = this.update(agent, {
+        ...(preserveActiveTurn ? {} : { status: "waiting" as const }),
+        output: null,
+        error: null,
+        finishedAt: null,
+      });
       this.store.setMetadata(this.followUpKey(agentId), dispatch as unknown as JsonValue);
       this.store.addAgentMessage({
         agentId,
@@ -1255,11 +1600,14 @@ export class AgentCoordinator {
       throw new Error(`Agent steering attempt ${durableAttemptId} already ended with ${existing.state}: ${existing.error ?? "delivery has not been proven"}`);
     }
     const timestamp = nowIso();
+    const messageRequest = durableMessageRequest(agent.id, durableAttemptId, content, existing ?? undefined);
     const dispatching = SteeringDispatchSchema.parse({
       version: 1,
       attemptId: durableAttemptId,
       agentId: agent.id,
       content,
+      requestId: messageRequest.requestId,
+      contentHash: messageRequest.contentHash,
       state: "dispatching",
       receiptId: null,
       queued: null,
@@ -1276,7 +1624,8 @@ export class AgentCoordinator {
       });
     });
     try {
-      const result = await this.drivers.get(harness).sendMessage(session, content);
+      const boundSession = this.bindAttempt(agent.id, durableAttemptId, session);
+      const result = await this.drivers.get(harness).sendMessage(boundSession, content, messageRequest);
       if (result.terminalBoundary) {
         const latest = this.get(agent.id);
         if (latest.status === "completed" || latest.status === "waiting") {
@@ -1531,6 +1880,145 @@ export class AgentCoordinator {
     return { promise, dispose: () => { if (!settled) { settled = true; stop(); } } };
   }
 
+  /**
+   * A hosted controller that exhausted reconnect is a durable kill request,
+   * not resumable work. Authenticate the successor controller, win the lease
+   * CAS, and then ask the worker host to terminate its native process group.
+   * The CAS deliberately happens before authentication so two daemons cannot
+   * both fence a healthy adopted controller and signal its worker.
+   */
+  private async retireControllerLostProcessLeases(): Promise<void> {
+    const leases = [...this.controllerLostProcessLeases.values()];
+    await Promise.all(leases.map((lease) => this.retireControllerLostProcessLease(lease)));
+  }
+
+  private async retireControllerLostProcessLease(staged: WorkerProcessLease): Promise<void> {
+    const current = this.store.getWorkerProcessLease(staged.id);
+    if (
+      !current
+      || current.state !== "running"
+      || current.retirementReason !== "controller-lost"
+      || current.transport.kind !== "worker-host"
+    ) return;
+    const transport = current.transport;
+    const ownerEpoch = Math.max(this.controllerEpoch, transport.ownerEpoch + 1);
+    const adopted = this.store.adoptWorkerProcessLease(
+      current.id,
+      current.revision,
+      this.daemonOwnerId,
+      { ...transport, controllerOwnerId: this.controllerOwnerId, ownerEpoch },
+    );
+    if (!adopted || adopted.transport.kind !== "worker-host") return;
+    this.processEvent(adopted, "supervisor.host.adopted", {
+      hostInstanceId: adopted.transport.hostInstanceId,
+      ownerEpoch,
+      continuity: "controller-lost-retirement-adopted",
+      retirementReason: "controller-lost",
+    });
+
+    let connection: WorkerHostConnection | null = null;
+    try {
+      const capability = createHmac("sha256", this.daemonSecret)
+        .update(`worker-host-capability:v1:${adopted.id}`)
+        .digest("hex");
+      connection = await WorkerHostConnection.connect({
+        socketPath: adopted.transport.endpoint,
+        leaseId: adopted.id,
+        capability,
+        ownerId: this.controllerOwnerId,
+        ownerEpoch,
+        after: adopted.transport.processedOutputSeq,
+      });
+      const accepted = connection.accepted ?? {};
+      if (accepted.hostInstanceId !== adopted.transport.hostInstanceId) {
+        throw new Error("Worker host instance identity changed during controller-lost retirement.");
+      }
+      const workerPid = accepted.workerPid;
+      if (
+        typeof workerPid !== "number"
+        || !Number.isSafeInteger(workerPid)
+        || workerPid <= 0
+        || (adopted.transport.workerIdentity?.pid !== undefined && adopted.transport.workerIdentity.pid !== workerPid)
+      ) {
+        throw new Error("Worker host native process identity changed during controller-lost retirement.");
+      }
+      const signal = await connection.request({
+        type: "signal",
+        commandId: `controller-lost-signal:${adopted.id}`,
+        signal: "SIGTERM",
+      });
+      if (signal.state !== "applied" && signal.state !== "rejected") {
+        throw new Error("Worker host did not settle the controller-lost retirement signal.");
+      }
+      const shutdown = await connection.request({
+        type: "shutdown",
+        commandId: `controller-lost-shutdown:${adopted.id}`,
+      });
+      if (shutdown.state !== "applied") {
+        throw new Error("Worker host rejected controller-lost retirement shutdown.");
+      }
+      await this.waitForWorkerHostClose(connection, 4_000);
+      const exited = this.store.transitionWorkerProcessLease(
+        adopted.id,
+        ["running"],
+        {
+          state: "exited",
+          releasedAt: nowIso(),
+          exitCode: null,
+          signal: "SIGTERM",
+          error: "Controller-lost worker-host retirement completed.",
+          activeTurnId: null,
+          retirementRequestedAt: null,
+          retirementReason: null,
+        },
+      );
+      if (!exited) return;
+      this.processLeaseIds.delete(adopted.agentId);
+      this.processEvent(exited, "supervisor.process.exited", {
+        signal: "SIGTERM",
+        error: exited.error,
+        retirementReason: "controller-lost",
+        reconciliation: true,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      // Adoption clears the intent. If authenticated termination could not be
+      // completed, restore the marker under the new owner so a later daemon can
+      // retry it instead of treating this orphan as healthy work.
+      const latest = this.store.getWorkerProcessLease(adopted.id);
+      if (latest?.daemonOwnerId === this.daemonOwnerId && latest.state === "running") {
+        const rearmed = this.store.durablyTouchWorkerProcessLease(adopted.id, {
+          retirementRequestedAt: latest.retirementRequestedAt ?? nowIso(),
+          retirementReason: "controller-lost",
+          error: detail,
+        });
+        if (rearmed) {
+          this.controllerLostProcessLeases.set(rearmed.id, rearmed);
+          this.processEvent(rearmed, "supervisor.host.adoption-pending", {
+            detail,
+            retirementRequestedAt: rearmed.retirementRequestedAt,
+            retirementReason: rearmed.retirementReason,
+            signalAttempted: false,
+          });
+        }
+      }
+    } finally {
+      connection?.close();
+    }
+  }
+
+  private async waitForWorkerHostClose(connection: WorkerHostConnection, timeoutMs: number): Promise<void> {
+    if (connection.socket.destroyed) return;
+    await Promise.race([
+      new Promise<void>((resolvePromise) => connection.once("close", resolvePromise)),
+      new Promise<void>((resolvePromise) => {
+        const timer = setTimeout(resolvePromise, timeoutMs);
+        timer.unref();
+      }),
+    ]);
+    if (!connection.socket.destroyed) throw new Error("Worker host did not close after controller-lost retirement.");
+  }
+
   observe(agentId: string, level: ObservationLevel): Promise<Observation> {
     return this.observer.observe(this.get(agentId), level);
   }
@@ -1538,6 +2026,7 @@ export class AgentCoordinator {
   async recover(): Promise<void> {
     this.failClosedUnknownFollowUpDispatches();
     this.failClosedUnknownSteeringDispatches();
+    await this.retireControllerLostProcessLeases();
     const retirementIntents = this.pendingSessionRetirementIntents();
     const agents: AgentRecord[] = [];
     let pageCursor: AgentListCursor | undefined;
@@ -1802,6 +2291,40 @@ export class AgentCoordinator {
           continuity: "lease-authoritative-native-identity",
         });
       }
+      // Cancellation is itself durable. If the daemon stopped after writing
+      // cancel-requested but before it removed the in-memory start queue
+      // entry, there is no native session to cancel or resume. Treat the
+      // persisted request as an authoritative terminal cancellation instead
+      // of turning the agent into lost work on restart. A retained worker-host
+      // lease is hydrated above and continues through normal cancellation
+      // recovery, so this branch only handles the proven no-session case.
+      if (agent.status === "cancel-requested" && !agent.nativeSessionId) {
+        const cancelled = this.store.durableTransaction(() => {
+          const latest = this.get(agent.id);
+          if (isTerminalAgentStatus(latest.status)) return latest;
+          const settled = this.update(latest, { status: "cancelled", error: null, finishedAt: nowIso() });
+          this.event(settled, "agent.cancelled", {
+            phase: "recovery",
+            continuity: "cancelled-before-native-session",
+          });
+          this.event(settled, "agent.recovered", {
+            previousStatus: latest.status,
+            recoveredStatus: settled.status,
+            continuity: "cancellation-settled-before-native-session",
+          });
+          return settled;
+        });
+        // A same-generation recovery call can still have the old queue entry
+        // in memory. Remove it before draining so it cannot consume a slot or
+        // race a terminal projection, even though launch also fences terminal
+        // agents defensively.
+        for (let index = this.queue.length - 1; index >= 0; index -= 1) {
+          const entry = this.queue[index];
+          if (entry?.kind === "start" && entry.record.id === agent.id) this.queue.splice(index, 1);
+        }
+        this.resolveTerminal(cancelled.id);
+        return;
+      }
       if (!agent.harness || !agent.nativeSessionId) {
         const message = agent.status === "starting"
           ? "The daemon stopped while the native start request was in flight. Its outcome is unknown, so Symphony will not dispatch the work order again automatically."
@@ -1830,6 +2353,11 @@ export class AgentCoordinator {
       try {
         const queuedFollowUp = this.followUpDispatch(agent.id);
         let restoringQueuedFollowUp = queuedFollowUp?.state === "queued";
+        const recoveryWorkspacePath = this.workspace.verifyLaunch(order.workspace.path, agent.workspacePath);
+        const recoveryOrder: AgentWorkOrder = {
+          ...order,
+          workspace: { ...order.workspace, path: recoveryWorkspacePath },
+        };
         const persistedSession = DriverSessionSchema.safeParse(
           this.store.getMetadata<JsonValue>(`driver-session:${agent.id}`),
         );
@@ -1861,7 +2389,7 @@ export class AgentCoordinator {
         });
         const resume = driver.resume(
           recoverySession,
-          this.startRequest(agent.id, order, agent.model ?? "auto"),
+          this.startRequest(agent.id, recoveryOrder, agent.model ?? "auto"),
           (event) => {
             const oldTerminalEvidence = restoringQueuedFollowUp
               && ["output.completed", "run.completed", "run.failed", "run.cancelled"].includes(event.kind);
@@ -2182,18 +2710,23 @@ export class AgentCoordinator {
     }
 
     const now = nowIso();
+    const prompt = this.recoveryPrompt(order);
+    const dispatchAttemptId = ulid();
+    const messageRequest = durableMessageRequest(previous.id, dispatchAttemptId, prompt);
     const dispatch: RecoveryDispatch = {
-      attemptId: ulid(),
+      attemptId: dispatchAttemptId,
       nativeSessionId: session.nativeSessionId,
+      requestId: messageRequest.requestId,
+      contentHash: messageRequest.contentHash,
       state: "dispatching",
       createdAt: now,
       updatedAt: now,
     };
     this.store.setMetadata(recoveryKey, dispatch as unknown as JsonValue);
+    this.beginRuntimeTurn(previous.id, dispatch.attemptId);
     this.superviseRecovered(previous.id);
-    const prompt = this.recoveryPrompt(order);
     try {
-      const receipt = await driver.sendMessage(session, prompt);
+      const receipt = await driver.sendMessage(session, prompt, messageRequest);
       if (!context.active) return;
       if (receipt.terminalBoundary) {
         const error = "The retained native session crossed a terminal result boundary before Symphony's recovery continuation was delivered. Symphony did not mark the undelivered continuation as running.";
@@ -2368,7 +2901,15 @@ export class AgentCoordinator {
     const value = this.store.getMetadata<JsonValue>(this.followUpKey(agentId));
     if (value === null) return null;
     const parsed = FollowUpDispatchSchema.safeParse(value);
-    return parsed.success ? parsed.data : null;
+    if (!parsed.success) return null;
+    const identity = durableMessageRequest(agentId, parsed.data.attemptId, parsed.data.content, parsed.data);
+    if (parsed.data.requestId === identity.requestId && parsed.data.contentHash === identity.contentHash) return parsed.data;
+    // Upgrade records written before native message identity was introduced.
+    // The attempt id and exact persisted content still provide a deterministic
+    // identity; no new random value is ever invented during recovery.
+    const upgraded = { ...parsed.data, ...identity };
+    this.store.setMetadata(this.followUpKey(agentId), upgraded as unknown as JsonValue);
+    return upgraded;
   }
 
   private steeringKey(agentId: string, attemptId: string): string {
@@ -2380,9 +2921,12 @@ export class AgentCoordinator {
     const value = this.store.getMetadata<JsonValue>(this.steeringKey(agentId, attemptId));
     if (value === null) return null;
     const parsed = SteeringDispatchSchema.safeParse(value);
-    return parsed.success && parsed.data.attemptId === attemptId && parsed.data.agentId === agentId
-      ? parsed.data
-      : null;
+    if (!parsed.success || parsed.data.attemptId !== attemptId || parsed.data.agentId !== agentId) return null;
+    const identity = durableMessageRequest(agentId, attemptId, parsed.data.content, parsed.data);
+    if (parsed.data.requestId === identity.requestId && parsed.data.contentHash === identity.contentHash) return parsed.data;
+    const upgraded = { ...parsed.data, ...identity };
+    this.store.setMetadata(this.steeringKey(agentId, attemptId), upgraded as unknown as JsonValue);
+    return upgraded;
   }
 
   private settleFollowUpDispatch(
@@ -2401,6 +2945,25 @@ export class AgentCoordinator {
     } as unknown as JsonValue);
   }
 
+  private runtimeTurnKey(agentId: string): string {
+    return `agent-native-turn:${agentId}`;
+  }
+
+  private currentRuntimeTurnId(agentId: string): string | null {
+    const inMemory = this.runtimeTurnIds.get(agentId);
+    if (inMemory) return inMemory;
+    const persisted = this.store.getMetadata<JsonValue>(this.runtimeTurnKey(agentId));
+    if (typeof persisted !== "string" || persisted.length === 0) return null;
+    this.runtimeTurnIds.set(agentId, persisted);
+    return persisted;
+  }
+
+  private beginRuntimeTurn(agentId: string, turnId = ulid()): string {
+    this.runtimeTurnIds.set(agentId, turnId);
+    this.store.setMetadata(this.runtimeTurnKey(agentId), turnId);
+    return turnId;
+  }
+
   private recoveryPrompt(order: AgentWorkOrder): string {
     return [
       "Symphony recovered this durable agent after its daemon restarted. Continue the same persisted work order from this native session; this is not a new task.",
@@ -2414,6 +2977,7 @@ export class AgentCoordinator {
 
   private superviseRecovered(agentId: string): void {
     if (this.terminalResolvers.has(agentId)) return;
+    this.currentRuntimeTurnId(agentId) ?? this.beginRuntimeTurn(agentId);
     let resolveTerminal!: () => void;
     const terminal = new Promise<void>((resolvePromise) => { resolveTerminal = resolvePromise; });
     this.terminalResolvers.set(agentId, resolveTerminal);
@@ -2437,11 +3001,127 @@ export class AgentCoordinator {
     }
   }
 
+  private applyFollowUpDelivery(
+    agentId: string,
+    dispatch: FollowUpDispatch,
+    dispatching: FollowUpDispatch,
+    session: DriverSession,
+    result: {
+      receiptId: string;
+      queued: boolean;
+      terminalBoundary?: boolean;
+      session?: DriverSession;
+    },
+  ): void {
+    if (result.terminalBoundary) {
+      const current = this.followUpDispatch(agentId);
+      const latest = this.get(agentId);
+      const requeueableState = current?.state === "dispatching"
+        || current?.state === "delivered"
+        || (current?.state === "settled" && current.outcome === "completed");
+      const requeueableAgent = !["failed", "cancelled", "interrupted", "lost"].includes(latest.status);
+      if (current?.attemptId === dispatch.attemptId && requeueableState && requeueableAgent) {
+        const requeued = FollowUpDispatchSchema.parse({
+          ...dispatching,
+          state: "queued",
+          receiptId: null,
+          updatedAt: nowIso(),
+        });
+        this.store.durableTransaction(() => {
+          this.store.setMetadata(this.followUpKey(agentId), requeued as unknown as JsonValue);
+          const waiting = this.update(latest, { status: "waiting", output: null, error: null, finishedAt: null });
+          this.event(waiting, "agent.message.boundary", {
+            receiptId: dispatch.attemptId,
+            nativeReceiptId: result.receiptId,
+            continuity: "terminal-boundary-requeued",
+          });
+          this.queue.push({ kind: "follow-up", dispatch: requeued });
+        });
+        this.drain();
+      }
+      return;
+    }
+
+    const updatedSession = this.applyMessageSessionUpdate(agentId, session, result.session);
+    const latest = this.get(agentId);
+    const delivered = FollowUpDispatchSchema.parse({
+      ...dispatching,
+      state: "delivered",
+      receiptId: result.receiptId,
+      updatedAt: nowIso(),
+    });
+    const current = this.followUpDispatch(agentId);
+    if (current?.attemptId === dispatch.attemptId && current.state === "dispatching") {
+      this.store.setMetadata(this.followUpKey(agentId), delivered as unknown as JsonValue);
+    }
+    if (!isTerminalAgentStatus(latest.status) && latest.status !== "cancel-requested") {
+      const running = this.update(latest, { status: "running", error: null, finishedAt: null });
+      this.event(running, "agent.message.sent", {
+        content: dispatch.content,
+        receiptId: dispatch.attemptId,
+        nativeReceiptId: result.receiptId,
+        nativeQueued: result.queued,
+        nativeSessionId: updatedSession.nativeSessionId,
+        nativeRunId: updatedSession.nativeRunId,
+        steering: false,
+      });
+    } else if (latest.status === "completed") {
+      this.settleFollowUpDispatch(agentId, "completed");
+    }
+  }
+
+  private failFollowUpDelivery(
+    agentId: string,
+    dispatch: FollowUpDispatch,
+    dispatching: FollowUpDispatch,
+    error: unknown,
+    terminalObserved = false,
+  ): void {
+    const message = error instanceof Error ? error.message : String(error);
+    const failure = `The follow-up message may have reached the native session, but its delivery could not be confirmed: ${message}`;
+    const current = this.followUpDispatch(agentId);
+    if (current?.attemptId === dispatch.attemptId && ["dispatching", "delivered", "settled"].includes(current.state)) {
+      this.store.setMetadata(this.followUpKey(agentId), {
+        ...current,
+        state: "outcome-unknown",
+        error: failure,
+        updatedAt: nowIso(),
+      } as unknown as JsonValue);
+    } else if (!current || current.attemptId !== dispatch.attemptId) {
+      this.store.setMetadata(this.followUpKey(agentId), {
+        ...dispatching,
+        state: "outcome-unknown",
+        error: failure,
+        updatedAt: nowIso(),
+      } as unknown as JsonValue);
+    }
+    const latest = this.get(agentId);
+    if (!terminalObserved && !isTerminalAgentStatus(latest.status)) {
+      const interrupted = this.update(latest, { status: "interrupted", error: failure, finishedAt: nowIso() });
+      this.sessions.delete(agentId);
+      this.event(interrupted, "agent.interrupted", {
+        error: failure,
+        phase: "follow-up-dispatch",
+        deliveryState: "unknown",
+        receiptId: dispatch.attemptId,
+      });
+    } else if (terminalObserved) {
+      this.event(latest, "agent.message.delivery-unknown", {
+        error: failure,
+        phase: "follow-up-dispatch",
+        deliveryState: "unknown",
+        receiptId: dispatch.attemptId,
+        terminalEvidence: true,
+      });
+    }
+    if (!terminalObserved) this.resolveTerminal(agentId);
+  }
+
   private async dispatchFollowUp(dispatch: FollowUpDispatch): Promise<void> {
     const persisted = this.followUpDispatch(dispatch.agentId);
     if (!persisted || persisted.attemptId !== dispatch.attemptId || persisted.state !== "queued") return;
     let agent = this.get(dispatch.agentId);
-    if (agent.status === "cancel-requested" || isTerminalAgentStatus(agent.status)) {
+    if (agent.status === "cancel-requested" || ["failed", "cancelled", "interrupted", "lost"].includes(agent.status)) {
       this.store.setMetadata(this.followUpKey(dispatch.agentId), {
         ...persisted,
         state: "cancelled",
@@ -2450,7 +3130,7 @@ export class AgentCoordinator {
       } as unknown as JsonValue);
       return;
     }
-    const session = this.sessions.get(dispatch.agentId);
+    let session = this.sessions.get(dispatch.agentId);
     if (!session || !agent.harness) {
       const error = "The retained native session disappeared before the queued follow-up could be dispatched.";
       this.store.setMetadata(this.followUpKey(dispatch.agentId), {
@@ -2481,90 +3161,42 @@ export class AgentCoordinator {
         scheduler: "bounded",
       });
     });
+    session = this.bindAttempt(agent.id, dispatch.attemptId, session);
+    this.beginRuntimeTurn(agent.id, dispatch.attemptId);
 
     try {
-      const delivery = this.drivers.get(agent.harness).sendMessage(session, dispatch.content);
+      const delivery = this.drivers.get(agent.harness).sendMessage(
+        session,
+        dispatch.content,
+        durableMessageRequest(agent.id, dispatch.attemptId, dispatch.content, dispatch),
+      );
       const first = await Promise.race([
         delivery.then((result) => ({ kind: "delivery" as const, result })),
         terminal.then(() => ({ kind: "terminal" as const })),
       ]);
-      if (first.kind === "terminal") return;
-      const result = first.result;
-      if (result.terminalBoundary) {
-        const current = this.followUpDispatch(agent.id);
-        const latest = this.get(agent.id);
-        const requeueableState = current?.state === "dispatching"
-          || current?.state === "delivered"
-          || (current?.state === "settled" && current.outcome === "completed");
-        const requeueableAgent = !["failed", "cancelled", "interrupted", "lost"].includes(latest.status);
-        if (current?.attemptId === dispatch.attemptId && requeueableState && requeueableAgent) {
-          const requeued = FollowUpDispatchSchema.parse({
-            ...dispatching,
-            state: "queued",
-            receiptId: null,
-            updatedAt: nowIso(),
-          });
-          this.store.durableTransaction(() => {
-            this.store.setMetadata(this.followUpKey(agent.id), requeued as unknown as JsonValue);
-            const waiting = this.update(latest, { status: "waiting", output: null, error: null, finishedAt: null });
-            this.event(waiting, "agent.message.boundary", {
-              receiptId: dispatch.attemptId,
-              nativeReceiptId: result.receiptId,
-              continuity: "terminal-boundary-requeued",
-            });
-            this.queue.push({ kind: "follow-up", dispatch: requeued });
-          });
-        }
+      if (first.kind === "terminal") {
+        // Terminal evidence releases the shared slot immediately. The native
+        // delivery may nevertheless resolve with a boundary receipt; process
+        // that receipt in the background so the durable follow-up can be
+        // requeued without holding capacity on an already-settled turn.
+        void delivery.then(
+          (result) => {
+            try {
+              this.applyFollowUpDelivery(agent.id, dispatch, dispatching, session, result);
+            } catch {
+              // The terminal evidence already settled this turn. A late
+              // boundary/receipt that cannot be projected must not resurrect
+              // or replay the follow-up.
+            }
+          },
+          (error) => this.failFollowUpDelivery(agent.id, dispatch, dispatching, error, true),
+        );
         return;
       }
-      const updatedSession = this.applyMessageSessionUpdate(agent.id, session, result.session);
-      const latest = this.get(agent.id);
-      const delivered = FollowUpDispatchSchema.parse({
-        ...dispatching,
-        state: "delivered",
-        receiptId: result.receiptId,
-        updatedAt: nowIso(),
-      });
-      const current = this.followUpDispatch(agent.id);
-      if (current?.attemptId === dispatch.attemptId && current.state === "dispatching") {
-        this.store.setMetadata(this.followUpKey(agent.id), delivered as unknown as JsonValue);
-      }
-      if (!isTerminalAgentStatus(latest.status) && latest.status !== "cancel-requested") {
-        const running = this.update(latest, { status: "running", error: null, finishedAt: null });
-        this.event(running, "agent.message.sent", {
-          content: dispatch.content,
-          receiptId: dispatch.attemptId,
-          nativeReceiptId: result.receiptId,
-          nativeQueued: result.queued,
-          nativeSessionId: updatedSession.nativeSessionId,
-          nativeRunId: updatedSession.nativeRunId,
-          steering: false,
-        });
-      } else if (latest.status === "completed") {
-        this.settleFollowUpDispatch(agent.id, "completed");
-      }
+      this.applyFollowUpDelivery(agent.id, dispatch, dispatching, session, first.result);
       await terminal;
     } catch (error) {
-      const latest = this.get(agent.id);
-      if (!isTerminalAgentStatus(latest.status)) {
-        const message = error instanceof Error ? error.message : String(error);
-        const failure = `The follow-up message may have reached the native session, but its delivery could not be confirmed: ${message}`;
-        this.store.setMetadata(this.followUpKey(agent.id), {
-          ...dispatching,
-          state: "outcome-unknown",
-          error: failure,
-          updatedAt: nowIso(),
-        } as unknown as JsonValue);
-        const interrupted = this.update(latest, { status: "interrupted", error: failure, finishedAt: nowIso() });
-        this.sessions.delete(agent.id);
-        this.event(interrupted, "agent.interrupted", {
-          error: failure,
-          phase: "follow-up-dispatch",
-          deliveryState: "unknown",
-          receiptId: dispatch.attemptId,
-        });
-      }
-      this.resolveTerminal(agent.id);
+      this.failFollowUpDelivery(agent.id, dispatch, dispatching, error);
     } finally {
       // A synchronous terminal event may have resolved and removed the waiter
       // before sendMessage itself returned. Deleting is safe in both orders.
@@ -2590,25 +3222,36 @@ export class AgentCoordinator {
         return;
       }
       if (isTerminalAgentStatus(current.status)) return;
-      current = this.update(current, { status: "starting", harness: route.harness, model: route.model, startedAt: nowIso() });
+        current = this.update(current, { status: "starting", harness: route.harness, model: route.model, startedAt: nowIso() });
       this.event(current, "agent.routed", { harness: route.harness, model: route.model, traceId: route.trace.id });
       const driver = this.drivers.get(route.harness);
       let resolveTerminal!: () => void;
       const terminal = new Promise<void>((resolvePromise) => { resolveTerminal = resolvePromise; });
       this.terminalResolvers.set(current.id, resolveTerminal);
+      const runtimeTurnId = this.beginRuntimeTurn(current.id);
       let acceptingStartupEvents = true;
       const session = await this.withLifecycleDeadline(
         current.id,
         "startup",
         this.loaded.config.agents.startupTimeoutMs ?? 60_000,
         (signal) => driver.start(
-          this.startRequest(current.id, entry.order, route.model),
+          this.startRequest(current.id, {
+            ...entry.order,
+            workspace: {
+              ...entry.order.workspace,
+              // The check and the request construction happen immediately
+              // before driver.start. Native adapters therefore receive the
+              // same canonical directory that was durably granted at
+              // admission, never a mutable symlink alias.
+              path: this.workspace.verifyLaunch(entry.order.workspace.path, current.workspacePath),
+            },
+          }, route.model),
           (event) => {
             if (acceptingStartupEvents && !signal.aborted) this.onDriverEvent(current.id, event);
           },
           {
             signal,
-            processSupervisor: this.processSupervisor(current.id, ulid(), route.harness),
+            processSupervisor: this.processSupervisor(current.id, runtimeTurnId, route.harness),
           },
         ),
         {
@@ -2746,6 +3389,42 @@ export class AgentCoordinator {
     return parsed;
   }
 
+  /** Bind a reused native session and its durable work order to one objective turn. */
+  private bindAttempt(agentId: string, attemptId: string, session: DriverSession): DriverSession {
+    let bound = session;
+    this.store.durableTransaction(() => {
+      const agent = this.get(agentId);
+      const rawOrder = this.store.getMetadata<JsonValue>(`work-order:${agentId}`);
+      const parsedOrder = rawOrder && typeof rawOrder === "object" && !Array.isArray(rawOrder)
+        ? AgentWorkOrderSchema.safeParse(rawOrder)
+        : null;
+      const existingAttemptId = agent.objectiveAttemptId
+        ?? (parsedOrder?.success ? metadataString(parsedOrder.data.metadata, "objectiveAttemptId", "attemptId") : null);
+      // Message attempt ids are also used for ordinary chat idempotency. Do
+      // not accidentally turn one of those into an objective budget identity;
+      // only an existing work-order binding or the canonical objective id
+      // namespaces may cross into usage attribution.
+      const requestedObjectiveId = /^objective-(?:attempt|planner):/u.test(attemptId) ? attemptId : null;
+      const objectiveId = requestedObjectiveId ?? existingAttemptId;
+      if (!objectiveId) return;
+      this.update(agent, { objectiveAttemptId: objectiveId, startedAt: nowIso() });
+      if (rawOrder) {
+        if (!parsedOrder?.success) throw new Error(`Persisted work order is invalid while binding objective attempt ${objectiveId}.`);
+        this.store.setMetadata(`work-order:${agentId}`, {
+          ...parsedOrder.data,
+          metadata: { ...parsedOrder.data.metadata, objectiveAttemptId: objectiveId },
+        } as unknown as JsonValue);
+      }
+      bound = DriverSessionSchema.parse({
+        ...session,
+        metadata: { ...session.metadata, objectiveAttemptId: objectiveId },
+      });
+      this.persistSession(agentId, bound);
+    });
+    this.sessions.set(agentId, bound);
+    return bound;
+  }
+
   private processSupervisor(agentId: string, attemptId: string, driver: ResolvedHarness): DriverProcessSupervisor {
     const retainedProcess = this.adoptableProcessLeases.has(agentId);
     const hosted = isReconnectableHostedDriver(driver)
@@ -2755,11 +3434,23 @@ export class AgentCoordinator {
       reserveProcess: (spec) => {
         const adoptable = this.adoptableProcessLeases.get(agentId);
         if (adoptable) {
+          const cwdMatches = adoptable.cwd === spec.cwd || (
+            adoptable.cwd !== null
+            && spec.cwd !== null
+            && (() => {
+              try {
+                this.workspace.verifyLaunch(spec.cwd as string, adoptable.cwd as string);
+                return true;
+              } catch {
+                return false;
+              }
+            })()
+          );
           const exactSpec = adoptable.driver === driver
             && adoptable.role === spec.role
             && adoptable.command === spec.command
             && JSON.stringify(adoptable.args) === JSON.stringify(spec.args)
-            && adoptable.cwd === spec.cwd;
+            && cwdMatches;
           if (!exactSpec) {
             throw new Error(`Retained worker-host lease ${adoptable.id} does not match the requested native process. Symphony will not spawn a duplicate.`);
           }
@@ -2828,10 +3519,13 @@ export class AgentCoordinator {
           exitCode: null,
           signal: null,
           error: null,
+          retirementRequestedAt: null,
+          retirementReason: null,
           revision: 0,
         };
         this.store.saveWorkerProcessLease(lease);
         this.processLeaseIds.set(agentId, lease.id);
+        this.startProcessReconciliation();
         this.processEvent(lease, "supervisor.process.reserved", {
           role: lease.role,
           command: lease.command,
@@ -2902,6 +3596,25 @@ export class AgentCoordinator {
         if (this.processLeaseIds.get(agentId) === leaseId) this.processLeaseIds.delete(agentId);
         return existing;
       },
+      requestProcessRetirement: (leaseId, request) => {
+        const current = this.store.getWorkerProcessLease(leaseId);
+        if (!current || current.daemonOwnerId !== this.daemonOwnerId) {
+          throw new Error(`Current daemon does not own worker process lease: ${leaseId}`);
+        }
+        const requested = this.store.durablyTouchWorkerProcessLease(leaseId, {
+          retirementRequestedAt: nowIso(),
+          retirementReason: request.reason,
+          error: request.error ?? current.error,
+        });
+        if (!requested) throw new Error(`Worker process lease is unavailable for retirement: ${leaseId}`);
+        this.processEvent(requested, "supervisor.host.adoption-pending", {
+          retirementRequestedAt: requested.retirementRequestedAt,
+          retirementReason: requested.retirementReason,
+          detail: request.error ?? "Hosted controller lost reconnect authority.",
+          signalAttempted: false,
+        });
+        return requested;
+      },
     };
     if (hosted) {
       supervisor.workerHostPlan = (leaseId) => {
@@ -2928,6 +3641,11 @@ export class AgentCoordinator {
           afterSeq: lease.transport.processedOutputSeq,
           maxSpoolBytes: this.loaded.config.workerHosts.maxSpoolBytes,
           maxSpoolFrames: this.loaded.config.workerHosts.maxSpoolFrames,
+          // The host's standalone default is intentionally short, but a
+          // daemon crash needs enough time for its bounded recovery attempt
+          // to reconnect and replay the durable spool. Include one controller
+          // reconnect window so the host cannot retire during that handoff.
+          controllerGraceMs: (this.loaded.config.agents.recoveryTimeoutMs ?? 30_000) + 5_000,
         };
       };
       supervisor.adoptProcess = (leaseId, expectedRevision, transport) => {
@@ -2944,6 +3662,7 @@ export class AgentCoordinator {
         );
         if (!adopted) throw new Error(`Worker-host lease adoption lost its compare-and-swap race: ${leaseId}`);
         this.processLeaseIds.set(agentId, adopted.id);
+        this.startProcessReconciliation();
         this.processEvent(adopted, "supervisor.host.adopted", {
           hostInstanceId: adopted.transport.kind === "worker-host" ? adopted.transport.hostInstanceId : null,
           ownerEpoch: adopted.transport.kind === "worker-host" ? adopted.transport.ownerEpoch : null,
@@ -2975,6 +3694,32 @@ export class AgentCoordinator {
     this.store.touchWorkerProcessLease(lease.id, { lastEventCursor: event.cursor });
   }
 
+  private startProcessReconciliation(): void {
+    if (this.processReconciliationTimer || !this.acceptingDriverEvents) return;
+    const timer = setInterval(() => {
+      if (this.processReconciliationInFlight || !this.acceptingDriverEvents) return;
+      this.processReconciliationInFlight = true;
+      try {
+        this.reconcileActiveProcesses();
+      } catch {
+        // A store can be closed by a host-level shutdown before quiesce reaches
+        // this coordinator. Stop the unref'd watchdog rather than surfacing an
+        // asynchronous exception after the authority is gone.
+        this.stopProcessReconciliation();
+      } finally {
+        this.processReconciliationInFlight = false;
+      }
+    }, AgentCoordinator.processReconciliationIntervalMs);
+    timer.unref();
+    this.processReconciliationTimer = timer;
+  }
+
+  private stopProcessReconciliation(): void {
+    if (this.processReconciliationTimer) clearInterval(this.processReconciliationTimer);
+    this.processReconciliationTimer = null;
+    this.processReconciliationInFlight = false;
+  }
+
   private startRequest(agentId: string, order: AgentWorkOrder, model: string) {
     const builtMcp = resolve(this.loaded.rootDirectory, "apps", "mcp", "dist", "index.js");
     const sourceMcp = resolve(this.loaded.rootDirectory, "apps", "mcp", "src", "index.ts");
@@ -2997,22 +3742,51 @@ export class AgentCoordinator {
 
   private onDriverEvent(agentId: string, driverEvent: DriverEvent): void {
     if (!this.acceptingDriverEvents) return;
-    if (!driverEvent.nativeEventId) {
-      this.applyDriverEvent(agentId, driverEvent);
+    const agent = this.get(agentId);
+    const workerEvent = this.normalizeWorkerEvent(agent, driverEvent);
+    const nativeEventId = driverEvent.nativeEventId
+      ?? (DURABLE_DRIVER_EVENT_KINDS.has(driverEvent.kind)
+        ? workerEvent.dedupeKey
+        : undefined);
+    if (!nativeEventId) {
+      this.applyDriverEvent(agentId, driverEvent, workerEvent);
       return;
     }
     this.store.transaction(() => {
       const claimed = this.store.claimNativeDriverEvent({
         agentId,
         eventKind: driverEvent.kind,
-        nativeEventId: driverEvent.nativeEventId as string,
+        nativeEventId,
         claimedAt: driverEvent.occurredAt,
       });
-      if (claimed) this.applyDriverEvent(agentId, driverEvent);
+      if (claimed) this.applyDriverEvent(agentId, { ...driverEvent, nativeEventId }, workerEvent);
     });
   }
 
-  private applyDriverEvent(agentId: string, driverEvent: DriverEvent): void {
+  private normalizeWorkerEvent(agent: AgentRecord, driverEvent: DriverEvent): WorkerEventEnvelope {
+    const rawOrder = this.store.getMetadata<JsonValue>(`work-order:${agent.id}`);
+    const order = rawOrder ? AgentWorkOrderSchema.safeParse(rawOrder) : null;
+    const objectiveId = order?.success ? metadataString(order.data.metadata, "objectiveId") : null;
+    const attemptId = agent.objectiveAttemptId
+      ?? (order?.success ? metadataString(order.data.metadata, "objectiveAttemptId", "attemptId") : null);
+    const leaseId = this.processLeaseIds.get(agent.id) ?? null;
+    return normalizeDriverEvent({
+      kind: driverEvent.kind,
+      occurredAt: driverEvent.occurredAt,
+      payload: driverEvent.payload,
+      ...(driverEvent.nativeEventId ? { nativeEventId: driverEvent.nativeEventId } : {}),
+    }, {
+      objectiveId,
+      runId: agent.runId,
+      ...(attemptId ? { attemptId } : {}),
+      agentId: agent.id,
+      nativeSessionId: agent.nativeSessionId,
+      leaseId,
+      runtimeTurnId: this.currentRuntimeTurnId(agent.id),
+    });
+  }
+
+  private applyDriverEvent(agentId: string, driverEvent: DriverEvent, workerEvent?: WorkerEventEnvelope): void {
     const agent = this.get(agentId);
     this.persistDriverToolState(agentId, driverEvent);
     const terminalEvidence = ["output.completed", "run.completed", "run.failed", "run.cancelled"].includes(driverEvent.kind);
@@ -3071,12 +3845,31 @@ export class AgentCoordinator {
       void this.retireSession(agentId);
       this.resolveTerminal(agentId);
     } else if (driverEvent.kind === "usage.recorded") {
-      this.recordUsage(agent, driverEvent.payload);
+      this.recordUsage(agent, driverEvent.payload, driverEvent.nativeEventId);
     }
+    const objectiveAttemptId = objectiveAttemptIdFromPayload(driverEvent.payload) ?? agent.objectiveAttemptId;
     const rawEvent = this.store.appendEvent({
       type: `driver.${driverEvent.kind}`, workflowId: agent.workflowId, runId: agent.runId, agentId,
-      occurredAt: driverEvent.occurredAt, payload: driverEvent.payload,
-      provenance: { source: "driver", driver: agent.harness ?? undefined, ...(driverEvent.nativeEventId ? { nativeEventId: driverEvent.nativeEventId } : {}) },
+      // The native payload is still available to the state transition above,
+      // but only the protocol's bounded/redacted projection may be durable or
+      // observable after this point.
+      occurredAt: driverEvent.occurredAt, payload: (workerEvent?.payload ?? driverEvent.payload) as JsonValue,
+      provenance: {
+        source: "driver",
+        driver: agent.harness ?? undefined,
+        ...(driverEvent.nativeEventId ? { nativeEventId: driverEvent.nativeEventId } : {}),
+        ...(objectiveAttemptId ? { objectiveAttemptId } : {}),
+        ...(nativeTurnIdFromPayload(driverEvent.payload) ? { nativeTurnId: nativeTurnIdFromPayload(driverEvent.payload) as string } : {}),
+        ...(workerEvent ? {
+          eventId: workerEvent.eventId,
+          eventClass: workerEvent.eventClass,
+          dedupeKey: workerEvent.dedupeKey,
+          replayKey: workerEvent.replayKey,
+          ...(workerEvent.leaseId ? { leaseId: workerEvent.leaseId } : {}),
+          workerCursor: workerEvent.cursor,
+          rawProvenance: workerEvent.rawProvenance,
+        } : {}),
+      },
     });
     const leaseId = this.processLeaseIds.get(agentId);
     if (leaseId) {
@@ -3244,7 +4037,7 @@ export class AgentCoordinator {
     return validator(output) ? null : `Output schema validation failed: ${this.ajv.errorsText(validator.errors)}`;
   }
 
-  private recordUsage(agent: AgentRecord, payload: JsonValue): void {
+  private recordUsage(agent: AgentRecord, payload: JsonValue, nativeEventId?: string): void {
     const data = payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload as Record<string, JsonValue> : {};
     const rawUsage = data.usage ?? data.tokens;
     const usage = rawUsage !== null && typeof rawUsage === "object" && !Array.isArray(rawUsage) ? rawUsage as Record<string, JsonValue> : {};
@@ -3259,8 +4052,19 @@ export class AgentCoordinator {
       ? (inputTokens * pricing.inputPerMillion + outputTokens * pricing.outputPerMillion) / 1_000_000
       : null;
     const costAmount = reportedCost ?? estimatedCost;
+    const rawOrder = this.store.getMetadata<JsonValue>(`work-order:${agent.id}`);
+    const workOrder = rawOrder && typeof rawOrder === "object" && !Array.isArray(rawOrder)
+      ? AgentWorkOrderSchema.safeParse(rawOrder).data
+      : undefined;
+    const objectiveAttemptId = objectiveAttemptIdFromPayload(payload)
+      ?? (workOrder ? metadataString(workOrder.metadata, "objectiveAttemptId", "attemptId") : null)
+      ?? agent.objectiveAttemptId;
+    const nativeTurnId = nativeTurnIdFromPayload(payload) ?? nativeEventId ?? null;
     const event: UsageEvent = {
       id: ulid(), workflowId: agent.workflowId, runId: agent.runId, agentId: agent.id,
+      objectiveAttemptId,
+      nativeTurnId,
+      nativeEventId: nativeEventId ?? null,
       model: agent.model, harness: agent.harness,
       inputTokens,
       outputTokens,
@@ -3303,3 +4107,5 @@ export function newRunId(): string {
 export function newWorkflowId(): string {
   return randomUUID();
 }
+
+export * from "./session-diagnostics.js";

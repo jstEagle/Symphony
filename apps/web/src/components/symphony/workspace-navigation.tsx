@@ -2,21 +2,26 @@
 
 import {
   ChatCircleText,
-  Gauge,
+  FlowArrow,
   Graph,
+  SquaresFour,
   ListMagnifyingGlass,
   Pulse,
+  TreeStructure,
 } from "@phosphor-icons/react";
 import type { ReactNode } from "react";
 import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
+import { WORKSPACE_TABS, type WorkspaceTab } from "@/lib/symphony/workspace-tabs";
 import { cn } from "@/lib/utils";
 
-export const WORKSPACE_TABS = ["Chat", "Overview", "Trace", "Graph", "Activity"] as const;
-export type WorkspaceTab = (typeof WORKSPACE_TABS)[number];
+export { WORKSPACE_TABS } from "@/lib/symphony/workspace-tabs";
+export type { WorkspaceTab } from "@/lib/symphony/workspace-tabs";
 
 const TAB_ICONS: Record<WorkspaceTab, ReactNode> = {
   Chat: <ChatCircleText />,
-  Overview: <Gauge />,
+  Runline: <FlowArrow />,
+  ControlRoom: <SquaresFour />,
+  Studio: <TreeStructure />,
   Trace: <ListMagnifyingGlass />,
   Graph: <Graph />,
   Activity: <Pulse />,
@@ -33,7 +38,7 @@ export function WorkspaceNavigation({
     <div
       className="flex h-8 shrink-0 items-center gap-0.5 rounded-lg bg-muted/25 p-0.5"
       role="tablist"
-      aria-label="Conversation views"
+      aria-label="Workspace views"
     >
       {WORKSPACE_TABS.map((tab) => (
         <TooltipIconButton

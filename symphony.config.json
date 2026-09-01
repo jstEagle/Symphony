@@ -176,7 +176,8 @@
   "workflows": {
     "directory": ".symphony/workflows",
     "maxLoopIterations": 100,
-    "triggersEnabled": true
+    "triggersEnabled": true,
+    "approvalExpiryScanMs": 1000
   },
   "plugins": {
     "roots": [

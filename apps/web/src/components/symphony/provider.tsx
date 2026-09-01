@@ -80,8 +80,9 @@ import {
 import { symphonyConfig } from "@/symphony.config";
 import {
   mergeConversationMessageBatch,
-  normalizeConversationMessage,
+  mergeConversationMessages,
 } from "@/lib/symphony/messages";
+import { objectiveEventQueryPlan } from "@/lib/symphony/objective-events";
 import {
   THREAD_CREATE_OUTBOX_STORAGE_KEY,
   createPendingThreadCreate,
@@ -112,7 +113,7 @@ import {
 
 type ExtraGroup = { id: string; title: string };
 
-export function SymphonyProvider({ children }: { children: ReactNode }) {
+export function SymphonyProvider({ children, windowId = "main:server" }: { children: ReactNode; windowId?: string }) {
   const queryClient = useQueryClient();
   const [mode, setMode] = useState<RuntimeMode>(symphonyConfig.dataMode === "preview" ? "preview" : "runtime");
   const [connection, setConnection] = useState<ConnectionState>(
@@ -121,7 +122,7 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
   const [pinnedIds, setPinnedIds] = useState<string[]>(() => readPinnedIds());
   const [readInbox, setReadInbox] = useState<string[]>(() => readInboxIds());
   const [extraGroups, setExtraGroups] = useState<ExtraGroup[]>(() => readGroups());
-  const [activeId, setActiveId] = useState<string | null>(() => readActiveConversationId());
+  const [activeId, setActiveId] = useState<string | null>(() => readActiveConversationId(windowId));
   const [previewDir, setPreviewDir] = useState(previewDirectory);
   const [events, setEvents] = useState<EventEnvelope[]>([]);
   const [liveMessages, setLiveMessages] = useState<ConversationMessage[]>([]);
@@ -219,8 +220,20 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     if (!runtimeEpoch) return;
+    // A new daemon epoch invalidates every durable objective projection. The
+    // daemon is authoritative; the next query reconstructs from its snapshot
+    // instead of carrying objective state across restarts.
+    void queryClient.invalidateQueries({ queryKey: ["symphony", "objectives"] });
+    void queryClient.invalidateQueries({ queryKey: ["symphony", "objective"] });
+    void queryClient.invalidateQueries({ queryKey: ["symphony", "objective-snapshot"] });
+  }, [queryClient, runtimeEpoch]);
+
+  useEffect(() => {
+    if (!runtimeEpoch) return;
     const pendingMessages = new Map<string, ConversationMessage>();
     const pendingEvents = new Map<string, EventEnvelope>();
+    const pendingObjectiveRunIds = new Set<string>();
+    let pendingObjectivePrefix = false;
     let messageFrame: number | null = null;
     let eventFrame: number | null = null;
     let bootstrapRefresh: number | null = null;
@@ -257,7 +270,34 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
         bootstrapRefresh = null;
         void queryClient.invalidateQueries({ queryKey: ["symphony", "bootstrap"] });
         void queryClient.invalidateQueries({ queryKey: ["symphony", "run-events"] });
+
+        const runIds = [...pendingObjectiveRunIds];
+        const invalidatePrefix = pendingObjectivePrefix;
+        pendingObjectiveRunIds.clear();
+        pendingObjectivePrefix = false;
+        if (runIds.length === 0 && !invalidatePrefix) return;
+
+        // Keep the list fresh because it selects the active objective, then
+        // refresh exact details when the event carried a run identity. A
+        // future/opaque objective event falls back to the bounded prefix.
+        void queryClient.invalidateQueries({ queryKey: ["symphony", "objectives"] });
+        if (invalidatePrefix) {
+          void queryClient.invalidateQueries({ queryKey: ["symphony", "objective"] });
+          void queryClient.invalidateQueries({ queryKey: ["symphony", "objective-snapshot"] });
+        }
+        for (const runId of runIds) {
+          void queryClient.invalidateQueries({ queryKey: ["symphony", "objective", runId] });
+        }
+        if (runIds.length > 0) void queryClient.invalidateQueries({ queryKey: ["symphony", "objective-snapshot"] });
       }, 180);
+    };
+
+    const queueObjectiveRefresh = (event: EventEnvelope) => {
+      const plan = objectiveEventQueryPlan([event]);
+      if (!plan.objective) return;
+      for (const runId of plan.runIds) pendingObjectiveRunIds.add(runId);
+      pendingObjectivePrefix ||= plan.invalidateObjectivePrefix;
+      queueBootstrapRefresh();
     };
 
     const unsubscribe = subscribeToRuntime(
@@ -269,6 +309,10 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
           return;
         }
         queueEvent(event);
+        queueObjectiveRefresh(event);
+        if (event.type.startsWith("agent.message.")) {
+          void queryClient.invalidateQueries({ queryKey: ["symphony", "agent-messages"] });
+        }
         if (event.type === "driver.authenticated" || event.type === "driver.authentication.failed") {
           void queryClient.invalidateQueries({ queryKey: ["symphony", "catalog"] });
         }
@@ -277,6 +321,8 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
       () => {
         pendingMessages.clear();
         pendingEvents.clear();
+        pendingObjectiveRunIds.clear();
+        pendingObjectivePrefix = false;
         if (messageFrame !== null) window.cancelAnimationFrame(messageFrame);
         messageFrame = null;
         if (eventFrame !== null) window.cancelAnimationFrame(eventFrame);
@@ -287,6 +333,10 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
         setLiveMessages([]);
         queryClient.removeQueries({ queryKey: ["symphony"] });
         void queryClient.invalidateQueries({ queryKey: ["symphony"] });
+        void queryClient.invalidateQueries({ queryKey: ["symphony", "objectives"] });
+        void queryClient.invalidateQueries({ queryKey: ["symphony", "objective"] });
+        void queryClient.invalidateQueries({ queryKey: ["symphony", "objective-snapshot"] });
+        void queryClient.invalidateQueries({ queryKey: ["symphony", "agent-messages"] });
       },
       setConnection,
     );
@@ -294,6 +344,7 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
       unsubscribe();
       pendingMessages.clear();
       pendingEvents.clear();
+      pendingObjectiveRunIds.clear();
       if (messageFrame !== null) window.cancelAnimationFrame(messageFrame);
       if (eventFrame !== null) window.cancelAnimationFrame(eventFrame);
       if (bootstrapRefresh !== null) window.clearTimeout(bootstrapRefresh);
@@ -424,8 +475,8 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
     if (activeId && known.has(activeId)) return;
     if (!directory.activeConversationId || directory.activeConversationId === activeId) return;
     setActiveId(directory.activeConversationId);
-    writeActiveConversationId(directory.activeConversationId);
-  }, [directory, activeId, envelope]);
+    writeActiveConversationId(directory.activeConversationId, windowId);
+  }, [directory, activeId, envelope, windowId]);
 
   useEffect(() => {
     if (!envelope || envelope.mode !== "runtime" || !activeConversation) {
@@ -449,10 +500,10 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
 
   const selectConversation = useCallback((id: string) => {
     setActiveId(id);
-    writeActiveConversationId(id);
+    writeActiveConversationId(id, windowId);
     setPreviewDir((current) => ({ ...current, activeConversationId: id }));
     setSelectedAgentId(null);
-  }, []);
+  }, [windowId]);
 
   const persistPinned = useCallback((ids: string[]) => {
     setPinnedIds(ids);
@@ -613,7 +664,7 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
           };
         });
         setActiveId(id);
-        writeActiveConversationId(id);
+        writeActiveConversationId(id, windowId);
         return;
       }
       try {
@@ -641,7 +692,7 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
         setActionError(null);
         setPendingThreads((current) => [thread, ...current.filter((item) => item.id !== thread.id)]);
         setActiveId(thread.id);
-        writeActiveConversationId(thread.id);
+        writeActiveConversationId(thread.id, windowId);
         persistPinned(pinnedIds);
         await queryClient.invalidateQueries({ queryKey: ["symphony", "bootstrap"] });
       } catch (error) {
@@ -649,7 +700,7 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
         throw error;
       }
     },
-    [envelope, mode, persistPinned, pinnedIds, queryClient],
+    [envelope, mode, persistPinned, pinnedIds, queryClient, windowId],
   );
 
   const createProject = useCallback(async (input: { workspacePath: string; title?: string }) => {
@@ -1021,21 +1072,20 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
 
   const activeMessages = useMemo(() => {
     if (!envelope || !activeConversation) return [];
-    return mergeMessages(
+    return mergeConversationMessages([
       envelope.messages.filter((message) => message.threadId === activeConversation.id),
       threadMessages?.threadId === activeConversation.id ? threadMessages.messages : [],
-      [
-        ...liveMessages.filter((message) => message.threadId === activeConversation.id),
-        ...pendingChatSends
-          .filter((pending) => pending.threadId === activeConversation.id)
-          .map(pendingChatSendToConversationMessage),
-      ],
-    );
+      liveMessages.filter((message) => message.threadId === activeConversation.id),
+      pendingChatSends
+        .filter((pending) => pending.threadId === activeConversation.id)
+        .map(pendingChatSendToConversationMessage),
+    ]);
   }, [activeConversation, envelope, liveMessages, pendingChatSends, threadMessages]);
 
   const value = useMemo<SymphonyContextValue | null>(() => {
     if (!envelope) return null;
     return {
+      windowId,
       ready: true,
       error: actionError ?? (bootstrapQuery.error instanceof Error ? bootstrapQuery.error.message : null),
       clearError: () => setActionError(null),
@@ -1116,6 +1166,7 @@ export function SymphonyProvider({ children }: { children: ReactNode }) {
     steer,
     togglePinned,
     usageOpen,
+    windowId,
   ]);
 
   if (!value) {
@@ -1152,18 +1203,6 @@ function mergeEvents(snapshot: EventEnvelope[], streamed: EventEnvelope[]): Even
   const byId = new Map<string, EventEnvelope>();
   for (const event of [...snapshot, ...streamed]) byId.set(event.id, event);
   return [...byId.values()].sort((a, b) => a.cursor - b.cursor);
-}
-
-function mergeMessages(
-  snapshot: BootstrapEnvelope["messages"],
-  completeThread: BootstrapEnvelope["messages"],
-  streamed: BootstrapEnvelope["messages"] = [],
-): BootstrapEnvelope["messages"] {
-  const byId = new Map<string, BootstrapEnvelope["messages"][number]>();
-  for (const message of [...completeThread, ...snapshot, ...streamed]) {
-    byId.set(message.id, normalizeConversationMessage(message));
-  }
-  return [...byId.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 function eventRequiresBootstrapRefresh(type: string): boolean {

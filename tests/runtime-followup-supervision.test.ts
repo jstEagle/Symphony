@@ -27,7 +27,6 @@ afterEach(() => {
 
 class FollowUpDriver implements WorkerDriver {
   readonly id = "codex" as const;
-  readonly capabilities = capabilities();
   readonly starts: string[] = [];
   readonly messages: Array<{ agentId: string; content: string }> = [];
   readonly cancels: string[] = [];
@@ -41,7 +40,14 @@ class FollowUpDriver implements WorkerDriver {
   replayCompletedTurnOnResume = new Set<string>();
   private readonly consumers = new Map<string, (event: DriverEvent) => void>();
 
-  constructor(private readonly resumedState: (agentId: string) => DriverSession["state"] = () => "idle") {}
+  constructor(
+    private readonly resumedState: (agentId: string) => DriverSession["state"] = () => "idle",
+    supportsSteering = true,
+  ) {
+    this.capabilities = capabilities({ steer: supportsSteering });
+  }
+
+  readonly capabilities: ReturnType<typeof capabilities>;
 
   async doctor(): Promise<DriverDoctorResult> {
     return { driver: this.id, available: true, authenticated: true, version: "fixture", capabilities: this.capabilities, detail: "fixture" };
@@ -201,6 +207,27 @@ describe("bounded durable follow-up turns", () => {
     });
 
     driver.complete(agent.id);
+  });
+
+  it("queues an in-flight follow-up when the native driver cannot steer", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-follow-up-no-steer-"));
+    temporary.push(root);
+    writeDefaultConfig(root);
+    const driver = new FollowUpDriver(() => "idle", false);
+    const { coordinator } = fixture(root, driver);
+    const agent = await coordinator.create(workOrder(root, "no-steer"));
+    await vi.waitFor(() => expect(coordinator.get(agent.id).status).toBe("running"));
+
+    const receipt = await coordinator.message(agent.id, "Queue behind the active native turn.");
+    expect(receipt).toEqual({ receiptId: expect.any(String), queued: true });
+    expect(driver.messages).toHaveLength(0);
+    expect(coordinator.get(agent.id).status).toBe("running");
+
+    driver.complete(agent.id);
+    await vi.waitFor(() => expect(driver.messages).toEqual([{
+      agentId: agent.id,
+      content: "Queue behind the active native turn.",
+    }]));
   });
 
   it("keeps the authoritative native turn supervised when steering delivery is ambiguous", async () => {

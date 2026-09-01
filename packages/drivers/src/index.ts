@@ -14,10 +14,14 @@ export * from "./common.js";
 export * from "./cursor.js";
 export * from "./opencode.js";
 export * from "./hosted-process.js";
+// Runtime reconciliation uses the same authenticated transport as hosted
+// drivers to retire a controller-lost orphan without replaying native work.
+export { WorkerHostConnection } from "@symphony/worker-host";
 export * from "./pi.js";
 export * from "./process.js";
 export * from "./process-identity.js";
 export * from "./prompt.js";
+export * from "./coordination-contract.js";
 export * from "./registry.js";
 
 export function createDriverRegistry(loaded: LoadedConfig, secrets: SecretStore): DriverRegistry {

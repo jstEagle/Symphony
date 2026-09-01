@@ -529,6 +529,7 @@ export function previewEnvelope(): BootstrapEnvelope {
         updatedAt: "2026-08-30T01:18:02.000Z",
       },
     ],
+    workflows: [],
     agents: [],
     runs: [],
     costs: previewSnapshot.cost,

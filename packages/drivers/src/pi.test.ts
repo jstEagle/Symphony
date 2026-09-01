@@ -314,4 +314,24 @@ describe("Pi driver hosted durability", () => {
       }
     }, { timeout: 3_000, interval: 25 }).toBe(false);
   }, 12_000);
+
+  it("keeps identical host frames distinct and dedupes a replay of one frame", () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-pi-driver-identity-"));
+    temporary.push(root);
+    const instance = driver(root);
+    const emitted: DriverEvent[] = [];
+    const consume = (event: DriverEvent) => emitted.push(event);
+    const onMessage = (instance as unknown as { onMessage(message: Record<string, unknown>, consume: (event: DriverEvent) => void): void }).onMessage.bind(instance);
+    const frame = { type: "tool_execution_update", toolCallId: "tool-1", status: "running" };
+    onMessage({ ...frame, __symphonyHostEventId: "host:lease:4:1" }, consume);
+    onMessage({ ...frame, __symphonyHostEventId: "host:lease:4:1" }, consume);
+    onMessage({ ...frame, __symphonyHostEventId: "host:lease:4:2" }, consume);
+
+    const projected = new Set<string>();
+    for (const event of emitted) {
+      if (event.nativeEventId) projected.add(`${event.kind}:${event.nativeEventId}`);
+    }
+    expect(emitted).toHaveLength(3);
+    expect(projected).toHaveLength(2);
+  });
 });

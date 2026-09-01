@@ -33,31 +33,21 @@ export function toThreadMessages(messages: ConversationMessage[]): ThreadMessage
 }
 
 /**
- * Native harnesses may expose several assistant items during one user turn,
- * and a daemon generation can reconnect halfway through that same turn. The
- * chat surface must still present one logical assistant response until the
- * next user message arrives.
+ * Normalize a transcript without inventing turn boundaries. Assistant-ui has
+ * its own message/part grouping semantics, and adjacent assistant messages
+ * are not necessarily one response: a native harness can legitimately emit
+ * multiple assistant items, or a user can send another turn while the first
+ * is still settling. The old implementation concatenated every adjacent
+ * assistant item, which made a replayed response appear twice inside one
+ * message and made turn boundaries impossible to recover.
+ *
+ * Only stable identities are used to coalesce records here:
+ * - the durable message id, or
+ * - a native part/tool id when a provider recreated the message envelope.
+ * Identity-free text is intentionally never deduped.
  */
 export function coalesceConversationTurns(messages: ConversationMessage[]): ConversationMessage[] {
-  const turns: ConversationMessage[] = [];
-  for (const source of messages) {
-    if (isInternalRecoveryNotice(source)) continue;
-    const message = normalizeConversationMessage(source);
-    const previous = turns.at(-1);
-    const role = renderRole(message.role);
-    if (previous && previous.threadId === message.threadId && renderRole(previous.role) === "assistant" && role === "assistant") {
-      turns[turns.length - 1] = normalizeConversationMessage({
-        ...previous,
-        role: previous.role === "tool" ? "assistant" : previous.role,
-        parts: [...previous.parts, ...message.parts],
-        streaming: message.streaming,
-        updatedAt: message.updatedAt ?? message.createdAt,
-      });
-      continue;
-    }
-    turns.push(message);
-  }
-  return turns;
+  return mergeConversationMessages([messages]).filter((message) => !isInternalRecoveryNotice(message));
 }
 
 /**
@@ -82,16 +72,55 @@ export function mergeConversationMessageBatch(
   batch: ConversationMessage[],
 ): ConversationMessage[] {
   if (batch.length === 0) return current;
-  const pending = new Map(batch.map((message) => [message.id, normalizeConversationMessage(message)]));
-  const next = current.map((message) => {
-    const replacement = pending.get(message.id);
-    if (!replacement) return message;
-    pending.delete(message.id);
-    return replacement;
+  return mergeConversationMessages([current, batch]);
+}
+
+/**
+ * Merge snapshots from the bootstrap response, a complete-thread fetch, and
+ * the SSE stream. The daemon normally gives every message one durable id;
+ * native providers can still recreate an envelope during reconnect, so a
+ * stable native part/tool id is a second, conservative identity fence.
+ *
+ * This deliberately does not compare text, timestamps alone, or adjacent
+ * roles. Repeated prompts and repeated assistant prose are valid conversation
+ * content. A candidate replaces a matching record only when it is a newer
+ * stream snapshot (or when timestamps tie and it came from a later source).
+ */
+export function mergeConversationMessages(
+  sources: readonly (readonly ConversationMessage[])[],
+): ConversationMessage[] {
+  if (sources.length === 0) return [];
+  const merged: ConversationMessage[] = [];
+  const indexById = new Map<string, number>();
+
+  for (const source of sources) {
+    for (const candidateSource of source) {
+      const candidate = normalizeConversationMessage(candidateSource);
+      const exactIndex = indexById.get(candidate.id);
+      if (exactIndex !== undefined) {
+        const existing = merged[exactIndex];
+        if (existing && shouldReplaceMessage(existing, candidate)) merged[exactIndex] = candidate;
+        continue;
+      }
+
+      const stableIndex = merged.findIndex((existing) => hasSameStablePartIdentity(existing, candidate));
+      if (stableIndex >= 0) {
+        const existing = merged[stableIndex];
+        if (existing && shouldReplaceMessage(existing, candidate)) merged[stableIndex] = candidate;
+        indexById.set(candidate.id, stableIndex);
+        continue;
+      }
+
+      indexById.set(candidate.id, merged.length);
+      merged.push(candidate);
+    }
+  }
+
+  return merged.sort((left, right) => {
+    // Modern runtimes guarantee a stable Array#sort. Leaving ties at zero
+    // preserves event/source order for messages emitted at the same instant.
+    return left.createdAt.localeCompare(right.createdAt);
   });
-  if (pending.size === 0) return next;
-  next.push(...pending.values());
-  return next.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 /**
@@ -169,11 +198,39 @@ function comparablePart(part: JsonValue): string {
 
 function stablePartIdentity(part: JsonValue): string | null {
   if (!part || typeof part !== "object" || Array.isArray(part)) return null;
+  if (part.type === "attachment") return null;
   for (const key of ["nativeMessageId", "toolCallId", "id"] as const) {
     const value = part[key];
     if (typeof value === "string" && value.trim()) return `${key}:${value}`;
   }
   return null;
+}
+
+function stablePartIdentities(message: ConversationMessage): Set<string> {
+  return new Set(message.parts.map(stablePartIdentity).filter((identity): identity is string => identity !== null));
+}
+
+function hasSameStablePartIdentity(left: ConversationMessage, right: ConversationMessage): boolean {
+  if (left.threadId !== right.threadId || renderRole(left.role) !== renderRole(right.role)) return false;
+  const leftIds = stablePartIdentities(left);
+  const rightIds = stablePartIdentities(right);
+  if (leftIds.size === 0 || rightIds.size === 0) return false;
+  for (const identity of leftIds) if (rightIds.has(identity)) return true;
+  return false;
+}
+
+function shouldReplaceMessage(existing: ConversationMessage, candidate: ConversationMessage): boolean {
+  // A terminal snapshot is authoritative over an in-flight snapshot even if
+  // a provider reused the same timestamp while reconnecting.
+  if (existing.streaming !== candidate.streaming) return candidate.streaming !== true;
+  const existingTime = Date.parse(existing.updatedAt ?? existing.createdAt);
+  const candidateTime = Date.parse(candidate.updatedAt ?? candidate.createdAt);
+  if (Number.isFinite(existingTime) && Number.isFinite(candidateTime) && existingTime !== candidateTime) {
+    return candidateTime > existingTime;
+  }
+  // Sources are ordered from older to newer by the caller. Ties therefore
+  // resolve to the later source, which is important for same-timestamp deltas.
+  return true;
 }
 
 function isAttachmentPart(part: JsonValue): boolean {

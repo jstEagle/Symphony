@@ -13,6 +13,7 @@ export default defineConfig({
       "@symphony/runtime": source("./packages/runtime/src/index.ts"),
       "@symphony/storage": source("./packages/storage/src/index.ts"),
       "@symphony/workflow": source("./packages/workflow/src/index.ts"),
+      "@": source("./apps/web/src"),
     },
   },
   test: {
@@ -21,7 +22,7 @@ export default defineConfig({
     env: {
       SYMPHONY_DAEMON_SECRET: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
     },
-    include: ["tests/**/*.test.ts", "packages/**/*.test.ts"],
+    include: ["tests/**/*.test.ts", "packages/**/*.test.ts", "apps/web/**/*.test.ts"],
     testTimeout: 15_000,
     hookTimeout: 15_000,
     coverage: {

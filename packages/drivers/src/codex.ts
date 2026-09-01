@@ -3,16 +3,17 @@ import {
   type DriverDoctorResult,
   type DriverEvent,
   type DriverLifecycleOptions,
+  type DriverMessageRequest,
   type DriverSession,
   type DriverStartRequest,
   type ModelDescriptor,
   type JsonValue,
   type WorkerDriver,
 } from "@symphony/protocol";
-import { buildAgentPrompt, buildSymphonyOperatingContract, hasStructuredOutputSchema, isConductor } from "./prompt.js";
+import { buildAgentPrompt, buildSymphonyOperatingContract, coordinationPromptOptions, hasStructuredOutputSchema, isConductor } from "./prompt.js";
 import { HostedJsonLineProcess } from "./hosted-process.js";
 import { JsonLineProcess, asObject, asString, type JsonLineRpcTransport } from "./process.js";
-import { capabilities, deepString, emit, makeSession, receipt, record, stringifyError, type Emit } from "./common.js";
+import { capabilities, deepString, emit, makeSession, messageRequest, receipt, record, stringifyError, withMessageIdentity, type Emit } from "./common.js";
 
 type ActiveCodex = {
   rpc: JsonLineRpcTransport;
@@ -32,6 +33,7 @@ type ActiveCodex = {
   initialTurn: InitialTurnDispatch | null;
   initialTurnAcceptance: InitialTurnAcceptance | null;
   recoveringInitialTurn: boolean;
+  pendingMessage: DriverMessageRequest | null;
 };
 
 type InitialTurnDispatch = {
@@ -176,6 +178,7 @@ export class CodexDriver implements WorkerDriver {
         initialTurn: null,
         initialTurnAcceptance: null,
         recoveringInitialTurn: false,
+        pendingMessage: null,
       };
       this.active.set(threadId, active);
       const initialTurn: InitialTurnDispatch = {
@@ -186,7 +189,7 @@ export class CodexDriver implements WorkerDriver {
       };
       active.initialTurn = initialTurn;
       this.checkpointInitialTurn(active);
-      const turnId = await this.startTurn(active, request, buildAgentPrompt(request.workOrder), initialTurn);
+      const turnId = await this.startTurn(active, request, buildAgentPrompt(request.workOrder, coordinationPromptOptions(request)), initialTurn);
       options?.signal.throwIfAborted();
       emit(onEvent, "session.started", { threadId, turnId });
       return makeSession(this.id, threadId, { agentId: request.agentId }, turnId);
@@ -253,6 +256,7 @@ export class CodexDriver implements WorkerDriver {
           initialTurn: retainedInitialTurn,
           initialTurnAcceptance: null,
           recoveringInitialTurn: retainedInitialTurn?.state === "dispatching" && !turnId,
+          pendingMessage: retainedMessageDispatch(retainedState),
         };
         this.restoreRetainedCancellation(active, retainedState);
         this.active.set(session.nativeSessionId, active);
@@ -260,7 +264,7 @@ export class CodexDriver implements WorkerDriver {
           ? this.startTurn(
               active,
               request,
-              buildAgentPrompt(request.workOrder),
+              buildAgentPrompt(request.workOrder, coordinationPromptOptions(request)),
               retainedInitialTurn,
               true,
             )
@@ -288,7 +292,7 @@ export class CodexDriver implements WorkerDriver {
         return {
           ...session,
           nativeRunId: recoveredTurnId,
-          state: active.turnId ? "running" : active.lastSettledTurnId ? "completed" : "idle",
+          state: active.pendingMessage ? "unknown" : active.turnId ? "running" : active.lastSettledTurnId ? "completed" : "idle",
           metadata: { ...session.metadata, transportReusable: rpc.isReusable() },
         };
       }
@@ -331,7 +335,8 @@ export class CodexDriver implements WorkerDriver {
         lastSettledTurnId: null,
         initialTurn: null,
         initialTurnAcceptance: null,
-        recoveringInitialTurn: false,
+          recoveringInitialTurn: false,
+          pendingMessage: null,
       };
       this.active.set(session.nativeSessionId, active);
       rpc.updateProcessLease({
@@ -385,18 +390,32 @@ export class CodexDriver implements WorkerDriver {
     }
   }
 
-  async sendMessage(session: DriverSession, message: string): Promise<{ receiptId: string; queued: boolean }> {
+  async sendMessage(session: DriverSession, message: string, request?: DriverMessageRequest): Promise<{ receiptId: string; queued: boolean }> {
     const active = this.require(session);
+    const durable = messageRequest(message, request);
+    if (active.pendingMessage) {
+      if (active.pendingMessage.requestId !== durable.requestId || active.pendingMessage.contentHash !== durable.contentHash) {
+        throw new Error("Codex native message is already pending with a different durable identity.");
+      }
+      return { receiptId: durable.requestId, queued: false };
+    }
+    active.pendingMessage = durable;
+    this.checkpoint(active);
     if (active.turnId) {
       await active.rpc.request("turn/steer", {
         threadId: active.threadId,
         expectedTurnId: active.turnId,
         input: [{ type: "text", text: message, text_elements: [] }],
+        // Codex app-server currently treats this as opaque request metadata;
+        // retaining it in the request also gives a hosted process a stable
+        // replay key when the response crosses a daemon crash window.
+        _meta: { symphonyRequestId: durable.requestId, symphonyContentHash: durable.contentHash },
       });
-      return receipt(false);
+      this.checkpoint(active);
+      return { receiptId: durable.requestId, queued: false };
     }
-    await this.startTurn(active, undefined, message);
-    return receipt(false);
+    await this.startTurn(active, undefined, message, undefined, false, durable);
+    return { receiptId: durable.requestId, queued: false };
   }
 
   async cancel(session: DriverSession): Promise<void> {
@@ -497,10 +516,7 @@ export class CodexDriver implements WorkerDriver {
       cwd: request.workOrder.workspace.path,
       approvalPolicy: "never",
       sandbox: full ? "danger-full-access" : "read-only",
-      developerInstructions: buildSymphonyOperatingContract(request.workOrder, {
-        agentId: request.agentId,
-        canCreate: request.coordination.canCreate,
-      }),
+      developerInstructions: buildSymphonyOperatingContract(request.workOrder, coordinationPromptOptions(request)),
       config: {
         mcp_servers: {
           symphony: {
@@ -524,6 +540,7 @@ export class CodexDriver implements WorkerDriver {
     text: string,
     initialTurn?: InitialTurnDispatch,
     resumed = false,
+    messageRequestValue?: DriverMessageRequest,
   ): Promise<string> {
     this.clearIdleCompletion(active);
     active.finalOutputTurnId = null;
@@ -574,7 +591,12 @@ export class CodexDriver implements WorkerDriver {
         active.recoveringInitialTurn = false;
       }
     }
-    const response = asObject(await active.rpc.request("turn/start", params));
+    const response = asObject(await (messageRequestValue
+      ? active.rpc.requestWithId(messageRequestValue.requestId, "turn/start", {
+          ...params,
+          _meta: { symphonyRequestId: messageRequestValue.requestId, symphonyContentHash: messageRequestValue.contentHash },
+        })
+      : active.rpc.request("turn/start", params)));
     const turnId = deepString(response, ["turn", "id"], ["turnId"]);
     if (!turnId) throw new Error(`Codex did not return a turn id: ${JSON.stringify(response)}`);
     active.turnId = turnId;
@@ -584,7 +606,8 @@ export class CodexDriver implements WorkerDriver {
       activeTurnId: turnId,
       adapterState: this.adapterState(active),
     });
-    emit(active.emit, "run.started", { threadId: active.threadId, turnId });
+    emit(active.emit, "run.started", withMessageIdentity({ threadId: active.threadId, turnId }, messageRequestValue ?? null));
+    if (messageRequestValue) this.checkpoint(active);
     return turnId;
   }
 
@@ -601,7 +624,12 @@ export class CodexDriver implements WorkerDriver {
       kind: DriverEvent["kind"],
       payload: unknown,
       nativeEventId?: string,
-    ) => emit(consumer, kind, payload, nativeEventId ?? (hostedFrameId ? `${hostedFrameId}:${kind}` : undefined));
+    ) => emit(
+      consumer,
+      kind,
+      withMessageIdentity(payload, active?.pendingMessage ?? null),
+      nativeEventId ?? (hostedFrameId ? `${hostedFrameId}:${kind}` : undefined),
+    );
     if (method.includes("tokenUsage/updated")) {
       const threadId = deepString(params, ["threadId"], ["thread", "id"]);
       const usage = record(record(params.tokenUsage).last ?? params.usage);
@@ -810,11 +838,12 @@ export class CodexDriver implements WorkerDriver {
     turnId: string | undefined,
     processTreeTerminated: boolean,
   ): void {
+    const pendingMessage = active.pendingMessage;
     this.markTurnSettled(active, turnId ?? active.turnId);
-    emit(active.emit, "run.cancelled", {
+    emit(active.emit, "run.cancelled", withMessageIdentity({
       ...params,
       toolCleanup: processTreeTerminated ? "process-tree-terminated" : "quiescent",
-    }, turnId);
+    }, pendingMessage), turnId);
     active.cancellation?.resolve();
     active.cancellation = null;
     this.retireUnusableSession(active);
@@ -896,6 +925,7 @@ export class CodexDriver implements WorkerDriver {
     if (active.finalOutputTurnId === turnId) active.finalOutputTurnId = null;
     if (active.idleTurnId === turnId) active.idleTurnId = null;
     active.lastSettledTurnId = turnId;
+    active.pendingMessage = null;
     active.rpc.updateProcessLease({ activeTurnId: null, adapterState: this.adapterState(active) });
   }
 
@@ -940,6 +970,7 @@ export class CodexDriver implements WorkerDriver {
         : null,
       idleCompletionAttempt: active.idleCompletion?.attempt ?? null,
       ...(active.initialTurn ? { initialTurn: active.initialTurn } : {}),
+      pendingMessage: active.pendingMessage as unknown as JsonValue,
     };
   }
 
@@ -1013,6 +1044,12 @@ export class CodexDriver implements WorkerDriver {
     if (!active) throw new Error(`Codex session is not active: ${session.nativeSessionId}`);
     return active;
   }
+}
+
+function retainedMessageDispatch(state: Record<string, unknown>): DriverMessageRequest | null {
+  const value = record(state.pendingMessage);
+  if (typeof value.attemptId !== "string" || typeof value.requestId !== "string" || typeof value.contentHash !== "string") return null;
+  return { attemptId: value.attemptId, requestId: value.requestId, contentHash: value.contentHash };
 }
 
 function codexToolEvent(params: Record<string, unknown>): {

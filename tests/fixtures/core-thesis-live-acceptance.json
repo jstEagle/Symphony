@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "suite": "core-thesis-live-acceptance",
+  "driver": "deterministic in-process codex fixture",
+  "externalModels": false,
+  "aggregateProjection": {
+    "status": "verified",
+    "route": "GET /v1/objectives/:objectiveId/snapshot",
+    "aliases": ["workspace", "aggregate"],
+    "claims": [
+      "single SQLite eventCursor fences the aggregate read model",
+      "objective, run, revision, and attempt identity survive restart",
+      "the projection is objective-scoped and does not depend on conversation selection"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "continuity-cas-loop-evidence",
+      "claims": [
+        "client projection disconnect does not cancel daemon-owned work",
+        "daemon restart resumes the same durable frontier without a second start",
+        "an authorized conductor CAS-revises a running strategy exactly once",
+        "a maxIterations=2 loop executes twice and then stops",
+        "events, attempts, usage, and an artifact are durable"
+      ]
+    },
+    {
+      "id": "truthful-native-delivery",
+      "claims": [
+        "unknown/cancelled native delivery remains executing and records attention",
+        "known native failure settles as failed and never reports success"
+      ]
+    }
+  ]
+}

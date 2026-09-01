@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import {
   closeSync,
   createReadStream,
@@ -14,7 +15,7 @@ import {
 } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
-import { basename, dirname, extname, isAbsolute, join, normalize, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { ulid } from "ulid";
 import { z } from "zod";
 import {
@@ -30,27 +31,148 @@ import {
   CommandSchema,
   CommandReceiptSchema,
   ConversationMessageSchema,
+  AgentWorkOrderSchema,
   DriverAuthenticationResultSchema,
   isTerminalAgentStatus,
   JsonValueSchema,
+  ObjectiveSideEffectClassSchema,
+  ObjectivePolicyRequestSchema,
+  ObjectiveSpecSchema,
+  ObjectiveTaskSchema,
+  AgentMessageArtifactRefSchema,
+  AgentMessageEvidenceRefSchema,
+  ObjectiveRunStateSchema,
+  ObjectiveRunRecordSchema,
+  ObjectiveControlMutationRequestSchema,
+  ObjectiveControlMutationSchema,
+  ObjectiveControlPlanSchema,
+  previewObjectiveControlMutation,
+  ObjectiveControlSignalDeliveryInputSchema,
+  ObjectiveArtifactPublishInputSchema,
+  ObjectiveArtifactReviewInputSchema,
+  ObjectiveArtifactReviewRecordSchema,
+  ObjectiveArtifactRecordSchema,
+  ObjectiveAttentionRecordSchema,
+  ObjectiveAttentionRequestSchema,
+  ObjectiveAttentionResolveRequestSchema,
+  ObjectiveAttentionListQuerySchema,
+  ObjectiveAggregateSnapshotSchema,
+  CapabilityResultFeedbackRecordSchema,
+  ObjectiveRunOccurrenceInputSchema,
+  ObjectiveAggregateRecordSchema,
+  ObjectiveRevisionRecordSchema,
+  ObjectiveRunOccurrenceRecordSchema,
+  ObjectiveCheckpointResumeCommandSchema,
+  ObjectiveCheckpointRetryCommandSchema,
+  ObjectiveCheckpointForkCommandSchema,
+  ObjectivePortableCheckpointRecordSchema,
+  ObjectiveHandoffEnvelopeSchema,
+  ObjectiveHandoffCreateInputSchema,
+  ObjectiveHandoffAcceptanceInputSchema,
+  ObjectiveHandoffAcceptanceRecordSchema,
+  objectiveHandoffHash,
+  objectiveHandoffAcceptanceHash,
+  objectiveHandoffReferenceHash,
+  validateObjectiveHandoffTarget,
+  isObjectivePolicyHashValid,
+  stableJsonStringify,
+  objectiveArtifactContentHash,
+  objectiveArtifactContentSize,
+  OBJECTIVE_ARTIFACT_MAX_INLINE_BYTES,
+  projectWorkerEventPayload,
   nowIso,
   type BootstrapProjection,
   type AgentRecord,
+  type AgentMessageDecision,
+  type AgentMessageInput,
+  type AgentMessageReceiptInput,
+  type AgentMessageRecord,
   type Command,
   type CommandReceipt,
   type ConversationMessage,
   type EventEnvelope,
   type JsonValue,
+  type ObjectiveActor,
+  type ObjectiveApprovalRecord,
+  type ObjectiveControlMutation,
+  type ObjectiveControlNode,
+  type ObjectiveControlSignalDeliveryInput,
+  type ObjectiveControlPlan,
+  type ObjectivePolicyRequest,
+  type ObjectiveRunRecord,
+  type ObjectiveAggregateRecord,
+  type ObjectiveRevisionRecord,
+  type ObjectiveRunOccurrenceRecord,
+  type ObjectiveRunOccurrenceInput,
+  type ObjectiveCheckpointResumeCommand,
+  type ObjectiveCheckpointRetryCommand,
+  type ObjectiveCheckpointForkCommand,
+  type ObjectiveCheckpointRecord,
+  type ObjectiveHandoffEnvelope,
+  type ObjectiveHandoffAcceptanceRecord,
+  type ObjectiveHandoffCreateInput,
+  type ObjectiveHandoffAcceptanceInput,
+  type ObjectiveOccurrenceOutcomeState,
+  type ObjectiveTask,
+  type ObjectiveArtifactActor,
+  type ObjectiveArtifactRecord,
+  type ObjectiveAttentionRecord,
+  type ObjectiveAttentionRequest,
+  type ObjectiveAttentionResolveRequest,
   type ProjectRecord,
   type ResolvedHarness,
   type UsageEvent,
   type WorkflowMission,
+  type WorkspaceSpec,
+  WorkspaceSpecSchema,
 } from "@symphony/protocol";
-import { AgentCoordinator, ModelRouter, PassiveObserver, UiUtilityService } from "@symphony/runtime";
-import { createStore, type AgentListCursor, type ChatThreadRecord, type SymphonyStore } from "@symphony/storage";
-import { TriggerManager, WorkflowCompiler, WorkflowEngine, WorkflowLoader, loadWorkflowDirectory } from "@symphony/workflow";
+import {
+  AgentCoordinator,
+  ModelRouter,
+  PassiveObserver,
+  UiUtilityService,
+  buildSessionDiagnosticBundle,
+  classifySessionDiagnosticRuntime,
+  sessionDiagnosticJson,
+} from "@symphony/runtime";
+import {
+  AgentMessageStore,
+  createStore,
+  ObjectiveAttentionRegistry,
+  type AgentListCursor,
+  type ChatThreadRecord,
+  type SymphonyStore,
+  type WorkflowRunOrigin,
+} from "@symphony/storage";
+import {
+  ObjectiveRuntime,
+  ObjectiveRuntimeError,
+  ObjectiveStoreRepository,
+  ObjectiveSupervisionRunner,
+  ObjectiveApprovalExpiryProcessor,
+  projectObjectiveAggregateSnapshot,
+  TriggerManager,
+  WorkflowCompiler,
+  WorkflowEngine,
+  WorkflowLoader,
+  childWorkspaceGrant as containedChildWorkspaceGrant,
+  canonicalWorkspacePath as containedCanonicalWorkspacePath,
+  compileObjectiveControlPlan,
+  WorkspaceContainmentError,
+  objectiveHandoffExecutionPlan,
+  loadWorkflowDirectory,
+  type ObjectiveApprovalRequestInput,
+  type ObjectiveCheckpointInput,
+  type ObjectiveCreateInput,
+  type ObjectivePlanCommitInput,
+  type ObjectiveRuntimeAuthority,
+  type WorkflowIr,
+} from "@symphony/workflow";
 import { HarnessMaintenance } from "./harness-maintenance.js";
 import { resolveDaemonCredential, type DaemonCredential } from "./daemon-credential.js";
+import { AgentMessageApiAdapter, AgentMessageApiAuthorizationError } from "./agent-message-api.js";
+import { CapabilityApiAdapter } from "./capability-api.js";
+import { CapabilityResultFeedbackApiAdapter } from "./capability-result-feedback-api.js";
 
 export type StartDaemonOptions = {
   rootDirectory?: string;
@@ -96,6 +218,90 @@ const ChatThreadCreateInputSchema = z.object({
 });
 
 type ChatThreadCreateInput = z.infer<typeof ChatThreadCreateInputSchema>;
+
+/**
+ * The daemon-side command callback is deliberately narrower than the wire
+ * response. Storage owns the immutable command outcome; operation-specific
+ * status fields remain inside `result` for API compatibility.
+ */
+type ObjectiveCommandExecution =
+  | { status: "committed"; result: JsonValue }
+  | { status: "rejected"; result: JsonValue; reason: string };
+
+/**
+ * Objective mutation bodies intentionally omit requestKey and actor fields.
+ * The daemon binds both to the authenticated request so an agent cannot
+ * smuggle a different delivery identity or authority envelope through JSON.
+ */
+const ObjectiveCreateInputSchema = z.object({
+  runId: z.string().min(1).optional(),
+  objectiveId: z.string().min(1).optional(),
+  workflowId: z.string().min(1).optional(),
+  workflowRevision: z.number().int().positive(),
+  workflowHash: z.string().min(8),
+  conductorAgentId: z.string().min(1).nullable().optional(),
+  // Local users can explicitly pin the objective to a project workspace.
+  // Authenticated agents cannot use this field to widen their inherited grant.
+  workspace: WorkspaceSpecSchema.optional(),
+  policy: ObjectivePolicyRequestSchema.optional(),
+  spec: ObjectiveSpecSchema,
+  tasks: z.array(ObjectiveTaskSchema).max(128).optional(),
+  context: z.record(z.string(), JsonValueSchema).optional(),
+  controlPlan: ObjectiveControlPlanSchema.nullable().optional(),
+  /** Optional causal occurrence metadata; the daemon owns all identities. */
+  occurrence: ObjectiveRunOccurrenceInputSchema.optional(),
+}).strict();
+
+const ObjectivePlanInputSchema = z.object({
+  expectedPlanRevision: z.number().int().nonnegative(),
+  tasks: z.array(ObjectiveTaskSchema).min(1).max(128),
+  reason: z.string().min(1).max(2_000).optional(),
+  policyHash: z.string().min(8).max(256).optional(),
+}).strict();
+
+const ObjectiveTaskUpdateInputSchema = z.object({
+  taskId: z.string().min(1),
+  state: z.enum(["queued", "waiting-approval", "running", "completed", "failed"]),
+  attemptId: z.string().min(1).nullable().optional(),
+  agentId: z.string().min(1).nullable().optional(),
+  output: JsonValueSchema.nullable().optional(),
+  error: z.string().nullable().optional(),
+  startedAt: z.string().nullable().optional(),
+  finishedAt: z.string().nullable().optional(),
+}).strict();
+
+const ObjectiveCheckpointInputSchema = z.object({
+  eventCursor: z.number().int().nonnegative(),
+  policyHash: z.string().min(8).max(256).optional(),
+  context: z.record(z.string(), JsonValueSchema).optional(),
+  taskUpdates: z.array(ObjectiveTaskUpdateInputSchema).max(128).optional(),
+  reason: z.string().min(1).max(2_000),
+}).strict();
+
+const ObjectiveApprovalInputSchema = z.object({
+  kind: z.enum(["plan", "task", "completion"]),
+  taskId: z.string().min(1).nullable().optional(),
+  question: z.string().min(1).max(2_000),
+  scope: z.record(z.string(), JsonValueSchema).optional(),
+  operationId: z.string().min(1),
+  requestHash: z.string().min(8).max(256),
+  policyHash: z.string().min(8).max(256),
+  sideEffectClass: ObjectiveSideEffectClassSchema,
+  canonicalTarget: z.string().min(1).max(2_000),
+  capability: z.string().min(1).optional(),
+  expiresAt: z.string().nullable().optional(),
+}).strict();
+
+const ObjectiveApprovalResolutionInputSchema = z.object({
+  status: z.enum(["approved", "rejected", "expired", "cancelled"]),
+  decision: JsonValueSchema.nullable().optional(),
+}).strict();
+
+const ObjectiveAttentionInputSchema = ObjectiveAttentionRequestSchema;
+const ObjectiveAttentionResolutionInputSchema = ObjectiveAttentionResolveRequestSchema;
+
+const ObjectiveArtifactPublishRequestSchema = ObjectiveArtifactPublishInputSchema;
+const ObjectiveArtifactReviewRequestSchema = ObjectiveArtifactReviewInputSchema;
 
 const ChatThreadCreateReceiptSchema = z.object({
   version: z.literal(1),
@@ -167,6 +373,43 @@ const ThemeFileSchema = z.object({
   colors: z.record(z.string().regex(/^[a-z0-9-]+$/u), z.string().min(1).max(500)),
 });
 
+const WorkflowTriggerPolicySchema = z.object({
+  version: z.literal(1),
+  workflowId: z.string().min(1),
+  revision: z.number().int().positive(),
+  hash: z.string().min(8),
+  mode: z.enum(["active", "pending"]),
+  source: z.enum(["user", "agent"]),
+  updatedAt: z.string().min(1),
+});
+
+type WorkflowTriggerPolicy = z.infer<typeof WorkflowTriggerPolicySchema>;
+
+const workflowTriggerPolicyKey = (workflowId: string): string => `workflow-trigger-policy:${workflowId}`;
+
+/**
+ * A standalone objective is not allowed to invent an arbitrary workflow
+ * identity. The browser uses this exact deterministic identity when the user
+ * deliberately selects "Standalone objective"; keep the rule at the daemon
+ * boundary as the source of truth for non-browser callers too.
+ */
+function standaloneObjectiveWorkflowIdentity(objectiveId: string): {
+  workflowId: string;
+  workflowRevision: 1;
+  workflowHash: string;
+} {
+  const slug = objectiveId
+    .toLocaleLowerCase()
+    .replace(/[^a-z0-9]+/gu, "-")
+    .replace(/^-|-$/gu, "")
+    .slice(0, 80) || "objective";
+  return {
+    workflowId: `manual-${slug}`,
+    workflowRevision: 1,
+    workflowHash: `manual-workflow-${slug}`,
+  };
+}
+
 const UI_EVENT_TYPES = [
   "agent.queued",
   "agent.routed",
@@ -213,7 +456,7 @@ const UI_EVENT_TYPES = [
   "router.usage.recorded",
   "ui.utility.usage.recorded",
 ] as const;
-const UI_EVENT_PREFIXES = ["workflow.", "plugin."] as const;
+const UI_EVENT_PREFIXES = ["workflow.", "plugin.", "objective."] as const;
 const DEFAULT_CHAT_MISSION = "Help the user accomplish the evolving objective in this conversation.";
 const LEGACY_CHAT_MISSION = "Help the user accomplish the evolving objective in this conversation by delegating focused work to the best native agents and synthesizing verified results.";
 
@@ -1060,10 +1303,9 @@ export class ChatService {
   }
 
   private applyProjectionEvent(event: EventEnvelope): void {
-    if (!event.agentId) return;
-    const thread = this.store.listThreads({ includeArchived: true }).find((item) => item.conductorAgentId === event.agentId);
+    const thread = this.projectionThreadForEvent(event);
     if (!thread) return;
-    const agent = this.store.getAgent(event.agentId);
+    const agent = this.store.getAgent(event.agentId as string);
     const terminalBoundary = agent && isTerminalAgentStatus(agent.status)
       ? this.store.recentEvents({
         agentId: agent.id,
@@ -1153,6 +1395,45 @@ export class ChatService {
     if (event.type !== "driver.output.completed") return;
     if (agent?.status === "failed") return;
     this.finalizeStream(event, thread, projectedOutputText(event.payload, agent?.output ?? null));
+  }
+
+  /**
+   * Resolve a native source event to its chat before the conductor pointer is
+   * persisted. Agent creation starts the native run and its first events can
+   * arrive before settleCreatedTurn() links the agent on the chat row. The
+   * chat workflow/run identity is durable on every event, so use it as the
+   * recovery path while retaining the conductor pointer as the fast path.
+   *
+   * Only root conductor agents may use this fallback. Child agents share the
+   * chat workflow/run IDs for graph visibility, but their native output must
+   * not be projected as another assistant turn in the conductor conversation.
+   */
+  private projectionThreadForEvent(event: EventEnvelope): ChatThreadRecord | null {
+    if (!event.agentId) return null;
+    const linked = this.store.listThreads({ includeArchived: true }).find((item) => item.conductorAgentId === event.agentId);
+    if (linked) return linked;
+
+    const workflowThreadId = event.workflowId?.startsWith("chat:")
+      ? event.workflowId.slice("chat:".length)
+      : null;
+    const runThreadId = event.runId?.startsWith("chat-run:")
+      ? event.runId.slice("chat-run:".length)
+      : null;
+    if (workflowThreadId && runThreadId && workflowThreadId !== runThreadId) return null;
+    const threadId = workflowThreadId ?? runThreadId;
+    if (!threadId) return null;
+    const thread = this.store.getThread(threadId);
+    const agent = this.store.getAgent(event.agentId);
+    if (!thread || !agent || agent.parentAgentId !== null) return null;
+    if (agent.workflowId !== `chat:${thread.id}` || agent.runId !== `chat-run:${thread.id}`) return null;
+
+    // An unlinked root is the normal create-conductor race. If this thread is
+    // already linked to another conductor (for example during a harness
+    // switch), require the per-turn work order to identify this root too.
+    if (!thread.conductorAgentId) return thread;
+    const workOrder = jsonRecord(this.store.getMetadata<JsonValue>(`work-order:${agent.id}`));
+    const metadata = jsonRecord(workOrder.metadata);
+    return firstString(metadata.threadId) === thread.id ? thread : null;
   }
 
   private updateStream(
@@ -1260,17 +1541,33 @@ export class SymphonyDaemon {
   readonly observer: PassiveObserver;
   readonly uiUtilities: UiUtilityService;
   readonly agents: AgentCoordinator;
+  readonly objectiveRepository: ObjectiveStoreRepository;
+  readonly objectiveRuntime: ObjectiveRuntime;
+  /** Durable cross-objective decision inbox; UI and MCP only project it. */
+  readonly objectiveAttention: ObjectiveAttentionRegistry;
+  readonly objectiveSupervisor: ObjectiveSupervisionRunner;
+  readonly objectiveApprovalExpiry: ObjectiveApprovalExpiryProcessor;
   readonly workflows: WorkflowEngine;
   readonly triggers: TriggerManager;
   readonly plugins: PluginHost;
   readonly projects: ProjectService;
   readonly chats: ChatService;
   readonly harnessMaintenance: HarnessMaintenance;
+  /** Daemon-owned typed capability registry and inter-agent message bus. */
+  readonly capabilities: CapabilityApiAdapter;
+  /** Daemon-owned immutable capability-result feedback authority. */
+  readonly capabilityResultFeedback: CapabilityResultFeedbackApiAdapter;
+  /** Short alias for daemon/SDK callers that use the feedback vocabulary. */
+  readonly feedback: CapabilityResultFeedbackApiAdapter;
+  readonly agentMessages: AgentMessageApiAdapter;
   readonly startedAt = nowIso();
   private server: Server | null = null;
   private ready = false;
   private controlPlaneReady = false;
   private catalogTimer: NodeJS.Timeout | null = null;
+  private approvalExpiryTimer: NodeJS.Timeout | null = null;
+  private approvalExpiryUnsubscribe: (() => void) | null = null;
+  private approvalExpiryInFlight: Promise<void> | null = null;
   private readonly eventResponses = new Set<ServerResponse>();
   private lease: DaemonLease | null = null;
   private closePromise: Promise<void> | null = null;
@@ -1286,9 +1583,19 @@ export class SymphonyDaemon {
       this.lease = acquireDaemonLease(this.loaded.dataDirectory, this.loaded.configPath);
     }
     let openedStore: SymphonyStore | null = null;
+    let openedAgentMessages: AgentMessageStore | null = null;
+    let openedCapabilities: CapabilityApiAdapter | null = null;
+    let openedCapabilityResultFeedback: CapabilityResultFeedbackApiAdapter | null = null;
     try {
       openedStore = createStore(this.loaded.dataDirectory);
       this.store = openedStore;
+      openedAgentMessages = new AgentMessageStore(join(this.loaded.dataDirectory, "agent-messages.sqlite"));
+      this.agentMessages = new AgentMessageApiAdapter(openedAgentMessages, this.agentMessageAuthority(), true);
+      openedCapabilities = new CapabilityApiAdapter(join(this.loaded.dataDirectory, "capabilities.sqlite"));
+      this.capabilities = openedCapabilities;
+      openedCapabilityResultFeedback = new CapabilityResultFeedbackApiAdapter(join(this.loaded.dataDirectory, "capability-result-feedback.sqlite"));
+      this.capabilityResultFeedback = openedCapabilityResultFeedback;
+      this.feedback = openedCapabilityResultFeedback;
       this.secrets = options.secretStore ?? new SecretStore();
       this.daemonCredential = resolveDaemonCredential(this.store, this.secrets, {
         ...(options.credentialPlatform ? { platform: options.credentialPlatform } : {}),
@@ -1310,6 +1617,43 @@ export class SymphonyDaemon {
         undefined,
         this.daemonCredential,
       );
+      this.objectiveRepository = new ObjectiveStoreRepository(this.store);
+      this.objectiveAttention = new ObjectiveAttentionRegistry(this.store);
+      this.objectiveRuntime = new ObjectiveRuntime(this.objectiveRepository, {
+        // Resolve this on each admission so a config/settings update cannot
+        // widen a new run beyond the current global safety ceilings.
+        policyCeiling: () => this.objectiveGlobalPolicyCeiling(),
+      });
+      this.objectiveSupervisor = new ObjectiveSupervisionRunner(
+        this.objectiveRuntime,
+        this.objectiveRepository,
+        this.agents,
+        this.store,
+        {
+          authority: { actor: { type: "system", id: "objective-supervisor" }, permissionCeiling: "full-access" },
+          attentionRegistry: this.objectiveAttention,
+          feedbackRepository: openedCapabilityResultFeedback.repository,
+          workspaceGrantForRun: (run) => this.objectiveWorkspaceGrant(run.runId),
+        },
+      );
+      this.objectiveApprovalExpiry = new ObjectiveApprovalExpiryProcessor(
+        this.objectiveRuntime,
+        this.objectiveRepository,
+        this.store,
+        {
+          onExpired: ({ approval, next, requestKey }) => {
+          this.appendObjectiveEvent("objective.approval.expired", next, { type: "system", id: "objective-approval-expiry" }, {
+              objectiveId: next.objectiveId,
+              approvalId: approval.id,
+              requestKey,
+              status: "expired",
+              state: next.state,
+              expiresAt: approval.expiresAt,
+            });
+            this.resolveAttentionForApproval(next, approval, "expired", { reason: "approval-timeout", expiredAt: approval.expiresAt }, { type: "system", id: "objective-approval-expiry" }, requestKey);
+          },
+        },
+      );
       this.workflows = new WorkflowEngine(this.loaded, this.store, this.agents);
       // Daemon-owned schedules stay paused until durable native agents,
       // workflows, and any claimed cron occurrences have been reconciled.
@@ -1318,6 +1662,9 @@ export class SymphonyDaemon {
       this.projects = new ProjectService(this.loaded, this.store);
       this.chats = new ChatService(this.loaded, this.store, this.agents, this.uiUtilities);
     } catch (error) {
+      openedCapabilityResultFeedback?.close();
+      openedCapabilities?.close();
+      openedAgentMessages?.close();
       openedStore?.close();
       if (this.lease) releaseDaemonLease(this.lease);
       this.lease = null;
@@ -1345,7 +1692,7 @@ export class SymphonyDaemon {
         const previous = this.store.getWorkflow(provisional.definition.id);
         const ir = previous ? await new WorkflowLoader().load(path, previous.revision) : provisional;
         if (!previous || previous.hash !== ir.hash) this.workflows.register(ir);
-        if (this.loaded.config.workflows.triggersEnabled) this.triggers.register(ir);
+        if (this.loaded.config.workflows.triggersEnabled) this.registerWorkflowTriggers(ir);
       }
     }
     await this.router.refresh();
@@ -1354,12 +1701,15 @@ export class SymphonyDaemon {
       this.loaded.config.router.catalogRefreshMinutes * 60_000,
     );
     this.catalogTimer.unref();
-    await loadWorkflowDirectory(
+    const loadedWorkflows = await loadWorkflowDirectory(
       this.loaded,
       this.store,
       this.workflows,
-      this.loaded.config.workflows.triggersEnabled ? this.triggers : undefined,
+      undefined,
     );
+    if (this.loaded.config.workflows.triggersEnabled) {
+      for (const ir of loadedWorkflows) this.registerWorkflowTriggers(ir);
+    }
     if (this.loaded.config.workflows.triggersEnabled) {
       // API-registered workflows live only in SQLite, so they have no plugin
       // or filesystem loader to recreate their in-memory cron jobs after a
@@ -1370,7 +1720,7 @@ export class SymphonyDaemon {
         try {
           const ir = new WorkflowCompiler().compile(record.definition, record.revision);
           if (ir.hash !== record.hash) throw new Error(`Stored workflow hash mismatch for ${record.id} revision ${record.revision}.`);
-          this.triggers.register(ir);
+          this.registerWorkflowTriggers(ir);
         } catch (error) {
           this.store.appendEvent({
             type: "workflow.trigger.recovery-failed",
@@ -1395,7 +1745,28 @@ export class SymphonyDaemon {
     // while its session is being reattached. `/health` remains `recovering`
     // until every bounded startup reconciliation has completed.
     this.controlPlaneReady = true;
+    // Approval expiry is daemon-owned and starts before native/objective
+    // recovery. A browser that is closed must not keep an expired objective
+    // blocked, and a restarted daemon must reconcile old requests promptly.
+    this.approvalExpiryUnsubscribe = this.store.onEvent((event) => {
+      if (event.type === "objective.approval.requested") this.runApprovalExpiryPass();
+    });
+    this.runApprovalExpiryPass();
+    this.reconcileObjectiveAttentionExpiry();
+    this.approvalExpiryTimer = setInterval(
+      () => {
+        this.runApprovalExpiryPass();
+        this.reconcileObjectiveAttentionExpiry();
+      },
+      this.loaded.config.workflows.approvalExpiryScanMs,
+    );
+    this.approvalExpiryTimer.unref();
     await this.agents.recover();
+    this.objectiveSupervisor.start();
+    // Objective recovery is bounded and per-run isolated. It is deliberately
+    // observed in the background so one malformed retained objective cannot
+    // hold the daemon's readiness boundary hostage.
+    void this.objectiveSupervisor.recover();
     // Only recovery can decide whether a native turn is still live. Preserve
     // its existing streaming message when it is; settle the message only when
     // the authoritative conductor is now idle or terminal.
@@ -1423,10 +1794,17 @@ export class SymphonyDaemon {
       this.controlPlaneReady = false;
       if (this.catalogTimer) clearInterval(this.catalogTimer);
       this.catalogTimer = null;
+      if (this.approvalExpiryTimer) clearInterval(this.approvalExpiryTimer);
+      this.approvalExpiryTimer = null;
+      this.approvalExpiryUnsubscribe?.();
+      this.approvalExpiryUnsubscribe = null;
+      await this.approvalExpiryInFlight;
+      this.approvalExpiryInFlight = null;
       this.chats.close();
       for (const response of this.eventResponses) response.end();
       this.eventResponses.clear();
       this.triggers.stop();
+      await this.objectiveSupervisor.stop();
       await this.plugins.stop();
       // Closing native transports is an infrastructure action, not evidence
       // that durable work failed. Freeze normalized agent projection before
@@ -1445,10 +1823,34 @@ export class SymphonyDaemon {
         this.server = null;
       }
     } finally {
+      this.agentMessages.close();
+      this.capabilityResultFeedback.close();
+      this.capabilities.close();
       this.store.close();
       if (this.lease) releaseDaemonLease(this.lease);
       this.lease = null;
     }
+  }
+
+  private runApprovalExpiryPass(): void {
+    if (this.approvalExpiryInFlight) return;
+    this.approvalExpiryInFlight = Promise.resolve()
+      .then(() => this.objectiveApprovalExpiry.expireRequested())
+      .then(() => undefined)
+      .catch((error) => {
+        this.store.appendEvent({
+          type: "objective.approval.expiry-reconcile-failed",
+          workflowId: null,
+          runId: null,
+          agentId: null,
+          occurredAt: nowIso(),
+          payload: { error: error instanceof Error ? error.message : String(error) },
+          provenance: { source: "daemon" },
+        });
+      })
+      .finally(() => {
+        this.approvalExpiryInFlight = null;
+      });
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse): Promise<void> {
@@ -1472,7 +1874,35 @@ export class SymphonyDaemon {
       if (url.pathname === "/v1/theme" && request.method === "GET") return this.json(response, 200, this.theme());
       if (url.pathname === "/v1/theme/icon.svg" && request.method === "GET") return this.themeIcon(response);
       if (url.pathname === "/v1/bootstrap" && request.method === "GET") return this.json(response, 200, this.bootstrap());
-      if (url.pathname === "/v1/events" && request.method === "GET") return this.events(request, response, url);
+      if (url.pathname === "/v1/capability-result-feedback" || url.pathname.startsWith("/v1/capability-result-feedback/")) {
+        return await this.handleCapabilityResultFeedbackRoute(request, response, url);
+      }
+      if (url.pathname.startsWith("/v1/capabilities")) {
+        const capabilityMutation = request.method === "POST" && !url.pathname.endsWith("/prepare");
+        const actor = this.capabilityRequestActor(request, capabilityMutation);
+        const payload = request.method === "GET" ? undefined : await body(request);
+        const capabilityRequest = {
+          method: request.method ?? "GET",
+          path: request.url ?? url.pathname,
+          query: Object.fromEntries(url.searchParams.entries()),
+          ...(payload === undefined ? {} : { body: capabilityMutation ? this.bindCapabilityRequest(payload, actor, request) : payload }),
+        };
+        const result = await this.capabilities.handle(capabilityRequest);
+        return this.json(response, result.status, result.body);
+      }
+      if (url.pathname === "/v1/agent-messages" || url.pathname.startsWith("/v1/agent-messages/")) {
+        return await this.handleAgentMessageRoute(request, response, url);
+      }
+      if (url.pathname === "/v1/diagnostics" && request.method === "GET") {
+        const agentId = z.string().min(1).parse(url.searchParams.get("agentId") ?? "");
+        return await this.handleSessionDiagnostics(request, response, agentId, false);
+      }
+      if (url.pathname === "/v1/events" && request.method === "GET") {
+        const scopedRunId = url.searchParams.get("runId");
+        const objectiveRun = scopedRunId ? this.store.getObjectiveRun(scopedRunId) : null;
+        if (objectiveRun) this.requireObjectiveAccess(request, objectiveRun, "read an objective event stream");
+        return this.events(request, response, url);
+      }
       if (url.pathname === "/v1/drivers" && request.method === "GET") return this.json(response, 200, await this.harnessMaintenance.reports(url.searchParams.get("refresh") === "true"));
       const driverUpdate = url.pathname.match(/^\/v1\/drivers\/([^/]+)\/update$/u);
       if (driverUpdate && request.method === "POST") {
@@ -1544,7 +1974,7 @@ export class SymphonyDaemon {
         return this.json(response, 200, this.agents.list({ ...(runId ? { runId } : {}), activeOnly: url.searchParams.get("active") === "true" }));
       }
       if (url.pathname === "/v1/agents" && request.method === "POST") return this.json(response, 202, await this.createAgent(request, await body(request)));
-      if (url.pathname === "/v1/workflows" && request.method === "GET") return this.json(response, 200, this.store.listWorkflows());
+      if (url.pathname === "/v1/workflows" && request.method === "GET") return this.json(response, 200, this.workflowReadProjection());
       if (url.pathname === "/v1/workflows" && request.method === "POST") {
         this.requireFullAccessAgent(request, "register a workflow revision");
         const receipt = await this.command(CommandSchema.parse({
@@ -1556,6 +1986,287 @@ export class SymphonyDaemon {
         return this.json(response, 201, receipt.result);
       }
       if (url.pathname === "/v1/runs" && request.method === "GET") return this.json(response, 200, this.store.listRuns());
+      if (url.pathname === "/v1/objectives" && request.method === "GET") {
+        return this.json(response, 200, this.objectiveList(request, url));
+      }
+      if (url.pathname === "/v1/objective-aggregates" && request.method === "GET") {
+        const caller = this.objectiveCaller(request);
+        const limit = z.coerce.number().int().min(1).max(2_000).default(200).parse(url.searchParams.get("limit") ?? 200);
+        const aggregates = this.store.listObjectiveAggregates({ limit: 2_000 }).filter((aggregate) => {
+          if (!caller) return true;
+          const runs = this.store.listObjectiveRuns({ objectiveId: aggregate.objectiveId, limit: 2_000 });
+          return runs.some((run) => this.objectiveVisibleToRequest(request, run));
+        }).slice(0, limit);
+        return this.json(response, 200, { aggregates, limit });
+      }
+      if (url.pathname === "/v1/objectives" && request.method === "POST") {
+        return this.json(response, 201, this.createObjective(request, await body(request)));
+      }
+      // One atomic objective-workspace projection. The explicit suffix keeps
+      // the legacy /objectives/:runId detail route compatible while allowing
+      // the objective id to span many runs and conversations.
+      const objectiveFeedback = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/feedback$/u);
+      if (objectiveFeedback && request.method === "GET") {
+        const objectiveId = decodeURIComponent(objectiveFeedback[1] as string);
+        const runs = this.store.listObjectiveRuns({ objectiveId, limit: 2_000 });
+        if (runs.length === 0) throw new HttpError(404, `Objective not found: ${objectiveId}`);
+        if (!runs.some((run) => this.objectiveVisibleToRequest(request, run))) {
+          throw new HttpError(403, "An authenticated agent may read only objectives in its root lineage.");
+        }
+        return this.json(response, 200, this.capabilityResultFeedback.objectiveSnapshot(objectiveId));
+      }
+      const objectiveSnapshot = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/(?:snapshot|workspace|aggregate)$/u);
+      if (objectiveSnapshot && request.method === "GET") {
+        return this.json(response, 200, this.objectiveAggregateSnapshot(request, decodeURIComponent(objectiveSnapshot[1] as string)));
+      }
+      if ((url.pathname === "/v1/attentions" || url.pathname === "/v1/attention") && request.method === "GET") {
+        return this.json(response, 200, this.objectiveAttentionList(request, url));
+      }
+      // Tree-shaped objective control plans have a separate identity and CAS
+      // head from the legacy flat objective plan. Keep both route spellings
+      // for daemon/SDK clients while the strategy name remains the MCP/UI
+      // vocabulary.
+      const objectiveControlEvents = url.pathname.match(/^\/v1\/(?:objectives|runs)\/([^/]+)\/(?:strategy|control-plan|control)\/events$/u);
+      if (objectiveControlEvents && request.method === "GET") {
+        const runId = decodeURIComponent(objectiveControlEvents[1] as string);
+        const run = this.store.getObjectiveRun(runId);
+        if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+        this.requireObjectiveAccess(request, run, "read an objective control-plan event stream");
+        return this.events(request, response, url, runId, ["objective.control-plan.changed", "objective.control.acknowledged", "objective.control.evaluation.completed", "objective.control.signal.delivered", "objective.attention.requested", "objective.attention.resolved", "objective.attention.expired", "objective.attention.escalated"]);
+      }
+      // Keep `/v1/runs/:runId/events` owned by the legacy workflow-run JSON
+      // history route below. Objective clients use the explicit objective or
+      // control-plan event aliases, so this route can never shadow that API.
+      const objectiveEvents = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/events$/u);
+      if (objectiveEvents && request.method === "GET") {
+        const runId = decodeURIComponent(objectiveEvents[1] as string);
+        const run = this.store.getObjectiveRun(runId);
+        if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+        this.requireObjectiveAccess(request, run, "read an objective event stream");
+        return this.events(request, response, url, runId, [
+          "objective.control-plan.changed",
+          "objective.control.acknowledged",
+          "objective.control.evaluation.completed",
+          "objective.control.signal.delivered",
+          "objective.attention.requested",
+          "objective.attention.resolved",
+          "objective.attention.expired",
+          "objective.attention.escalated",
+          "objective.artifact.published",
+          "objective.artifact.verified",
+          "objective.artifact.rejected",
+          "objective.artifact.superseded",
+        ]);
+      }
+      const objectiveControl = url.pathname.match(/^\/v1\/(?:objectives|runs)\/([^/]+)\/(?:strategy|control-plan|control)$/u);
+      if (objectiveControl && request.method === "GET") {
+        return this.json(response, 200, this.objectiveControlProjection(
+          request,
+          decodeURIComponent(objectiveControl[1] as string),
+        ));
+      }
+      const objectiveControlPreview = url.pathname.match(/^\/v1\/(?:objectives|runs)\/([^/]+)\/(?:strategy|control-plan|control)\/preview$/u);
+      if (objectiveControlPreview && request.method === "POST") {
+        return this.json(response, 200, this.previewObjectiveControl(
+          request,
+          decodeURIComponent(objectiveControlPreview[1] as string),
+          await body(request),
+        ));
+      }
+      if (objectiveControl && request.method === "POST") {
+        const result = this.reviseObjectiveControl(
+          request,
+          decodeURIComponent(objectiveControl[1] as string),
+          await body(request),
+        );
+        const conflict = typeof result === "object"
+          && result !== null
+          && !Array.isArray(result)
+          && "status" in result
+          && result.status === "conflict";
+        return this.json(response, conflict ? 409 : 200, result);
+      }
+      const objectiveSignal = url.pathname.match(/^\/v1\/(?:objectives|runs)\/([^/]+)\/signals(?:\/([^/]+))?$/u);
+      if (objectiveSignal && request.method === "POST") {
+        const runId = decodeURIComponent(objectiveSignal[1] as string);
+        const signalKey = objectiveSignal[2] === undefined ? undefined : decodeURIComponent(objectiveSignal[2]);
+        let signalPayload = await body(request);
+        if (signalKey !== undefined) {
+          if (typeof signalPayload !== "object" || signalPayload === null || Array.isArray(signalPayload)) {
+            throw new HttpError(400, "Signal delivery payload must be an object when signal key is in the route.");
+          }
+          const supplied = signalPayload as Record<string, unknown>;
+          if (supplied.signalKey !== undefined && supplied.signalKey !== signalKey) {
+            throw new HttpError(400, "Signal key in the route does not match the request body.");
+          }
+          signalPayload = { ...supplied, signalKey };
+        }
+        return this.json(response, 200, this.deliverObjectiveSignal(request, runId, signalPayload));
+      }
+      const objective = url.pathname.match(/^\/v1\/objectives\/([^/]+)$/u);
+      if (objective && request.method === "GET") {
+        return this.json(response, 200, this.objectiveDetail(request, decodeURIComponent(objective[1] as string), url));
+      }
+      const objectiveAttention = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/attentions$/u);
+      if (objectiveAttention && request.method === "GET") {
+        const runId = decodeURIComponent(objectiveAttention[1] as string);
+        const scoped = new URL(url);
+        scoped.searchParams.set("runId", runId);
+        return this.json(response, 200, this.objectiveAttentionList(request, scoped));
+      }
+      if (objectiveAttention && request.method === "POST") {
+        return this.json(response, 201, this.requestObjectiveAttention(
+          request,
+          decodeURIComponent(objectiveAttention[1] as string),
+          await body(request),
+        ));
+      }
+      const objectiveAttentionEvents = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/attentions\/events$/u);
+      if (objectiveAttentionEvents && request.method === "GET") {
+        const runId = decodeURIComponent(objectiveAttentionEvents[1] as string);
+        const run = this.store.getObjectiveRun(runId);
+        if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+        this.requireObjectiveAccess(request, run, "read objective attention events");
+        return this.events(request, response, url, runId, ["objective.attention.requested", "objective.attention.resolved", "objective.attention.expired", "objective.attention.escalated"]);
+      }
+      const objectiveAttentionDetail = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/attentions\/([^/]+)$/u);
+      if (objectiveAttentionDetail && request.method === "GET") {
+        return this.json(response, 200, this.objectiveAttentionDetail(
+          request,
+          decodeURIComponent(objectiveAttentionDetail[1] as string),
+          decodeURIComponent(objectiveAttentionDetail[2] as string),
+        ));
+      }
+      const objectiveAttentionResolution = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/attentions\/([^/]+)\/resolve$/u);
+      if (objectiveAttentionResolution && request.method === "POST") {
+        return this.json(response, 200, this.resolveObjectiveAttention(
+          request,
+          decodeURIComponent(objectiveAttentionResolution[1] as string),
+          decodeURIComponent(objectiveAttentionResolution[2] as string),
+          await body(request),
+        ));
+      }
+      const objectiveArtifactReview = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/artifacts\/([^/]+)\/review$/u);
+      if (objectiveArtifactReview && request.method === "POST") {
+        return this.json(response, 200, this.reviewObjectiveArtifact(
+          request,
+          decodeURIComponent(objectiveArtifactReview[1] as string),
+          decodeURIComponent(objectiveArtifactReview[2] as string),
+          await body(request),
+        ));
+      }
+      const objectiveArtifactDetail = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/artifacts\/([^/]+)$/u);
+      if (objectiveArtifactDetail && request.method === "GET") {
+        return this.json(response, 200, this.objectiveArtifactDetail(
+          request,
+          decodeURIComponent(objectiveArtifactDetail[1] as string),
+          decodeURIComponent(objectiveArtifactDetail[2] as string),
+        ));
+      }
+      const objectiveArtifacts = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/artifacts$/u);
+      if (objectiveArtifacts && request.method === "GET") {
+        return this.json(response, 200, this.objectiveArtifactList(
+          request,
+          decodeURIComponent(objectiveArtifacts[1] as string),
+          url,
+        ));
+      }
+      if (objectiveArtifacts && request.method === "POST") {
+        return this.json(response, 201, this.publishObjectiveArtifact(
+          request,
+          decodeURIComponent(objectiveArtifacts[1] as string),
+          await body(request),
+        ));
+      }
+      const objectivePlan = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/plans$/u);
+      if (objectivePlan && request.method === "POST") {
+        return this.json(response, 200, this.commitObjectivePlan(
+          request,
+          decodeURIComponent(objectivePlan[1] as string),
+          await body(request),
+        ));
+      }
+      const objectiveCheckpoint = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/checkpoints$/u);
+      if (objectiveCheckpoint && request.method === "GET") {
+        const runId = decodeURIComponent(objectiveCheckpoint[1] as string);
+        const run = this.store.getObjectiveRun(runId);
+        if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+        this.requireObjectiveAccess(request, run, "read objective checkpoints");
+        return this.json(response, 200, {
+          runId,
+          objectiveId: run.objectiveId,
+          latestCheckpointId: run.latestCheckpointId,
+          checkpoints: this.store.listObjectiveCheckpoints(runId),
+        });
+      }
+      if (objectiveCheckpoint && request.method === "POST") {
+        return this.json(response, 200, this.commitObjectiveCheckpoint(
+          request,
+          decodeURIComponent(objectiveCheckpoint[1] as string),
+          await body(request),
+        ));
+      }
+      const objectiveCheckpointCommand = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/checkpoints\/([^/]+)\/(resume|retry|fork)$/u);
+      if (objectiveCheckpointCommand && request.method === "POST") {
+        const runId = decodeURIComponent(objectiveCheckpointCommand[1] as string);
+        const checkpointId = decodeURIComponent(objectiveCheckpointCommand[2] as string);
+        const operation = objectiveCheckpointCommand[3] as "resume" | "retry" | "fork";
+        const commandPayload = await body(request);
+        if (operation === "resume") return this.json(response, 200, this.resumeObjectiveCheckpoint(request, runId, checkpointId, commandPayload));
+        if (operation === "retry") return this.json(response, 202, this.retryObjectiveCheckpoint(request, runId, checkpointId, commandPayload));
+        return this.json(response, 201, this.forkObjectiveCheckpoint(request, runId, checkpointId, commandPayload));
+      }
+      const objectiveCheckpointDetail = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/checkpoints\/([^/]+)$/u);
+      if (objectiveCheckpointDetail && request.method === "GET") {
+        return this.json(response, 200, this.objectiveCheckpointDetail(
+          request,
+          decodeURIComponent(objectiveCheckpointDetail[1] as string),
+          decodeURIComponent(objectiveCheckpointDetail[2] as string),
+        ));
+      }
+      const objectiveHandoffs = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/handoffs$/u);
+      if (objectiveHandoffs && request.method === "GET") {
+        const runId = decodeURIComponent(objectiveHandoffs[1] as string);
+        const run = this.store.getObjectiveRun(runId);
+        if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+        this.requireObjectiveAccess(request, run, "read objective handoffs");
+        return this.json(response, 200, {
+          runId,
+          objectiveId: run.objectiveId,
+          handoffs: this.store.listObjectiveHandoffs(runId).map((envelope) => ({
+            envelope,
+            acceptance: this.store.getObjectiveHandoffAcceptance(envelope.id),
+          })),
+        });
+      }
+      if (objectiveHandoffs && request.method === "POST") {
+        return this.json(response, 201, this.offerObjectiveHandoff(request, decodeURIComponent(objectiveHandoffs[1] as string), await body(request)));
+      }
+      const objectiveHandoffDetail = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/handoffs\/([^/]+)$/u);
+      if (objectiveHandoffDetail && request.method === "GET") {
+        return this.json(response, 200, this.objectiveHandoffDetail(request, decodeURIComponent(objectiveHandoffDetail[1] as string), decodeURIComponent(objectiveHandoffDetail[2] as string)));
+      }
+      const objectiveHandoffAccept = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/handoffs\/([^/]+)\/accept$/u);
+      if (objectiveHandoffAccept && request.method === "POST") {
+        return this.json(response, 200, this.acceptObjectiveHandoff(request, decodeURIComponent(objectiveHandoffAccept[1] as string), decodeURIComponent(objectiveHandoffAccept[2] as string), await body(request)));
+      }
+      const objectiveApproval = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/approvals$/u);
+      if (objectiveApproval && request.method === "POST") {
+        return this.json(response, 200, this.requestObjectiveApproval(
+          request,
+          decodeURIComponent(objectiveApproval[1] as string),
+          await body(request),
+        ));
+      }
+      const objectiveApprovalResolution = url.pathname.match(/^\/v1\/objectives\/([^/]+)\/approvals\/([^/]+)\/resolve$/u);
+      if (objectiveApprovalResolution && request.method === "POST") {
+        return this.json(response, 200, this.resolveObjectiveApproval(
+          request,
+          decodeURIComponent(objectiveApprovalResolution[1] as string),
+          decodeURIComponent(objectiveApprovalResolution[2] as string),
+          await body(request),
+        ));
+      }
       if (url.pathname === "/v1/commands" && request.method === "POST") {
         // Native agents use the scoped, token-authenticated resource routes.
         // Never let a caller-supplied command actor bypass parent, permission,
@@ -1603,14 +2314,344 @@ export class SymphonyDaemon {
         if (!response.writableEnded) response.destroy(error instanceof Error ? error : undefined);
         return;
       }
-      const status = error instanceof HttpError ? error.status : 500;
-      this.json(response, status, { error: error instanceof Error ? error.message : String(error) });
+      const status = error instanceof HttpError
+        ? error.status
+        : error instanceof AgentMessageApiAuthorizationError ? 403
+          : error instanceof z.ZodError ? 400
+          : objectiveRuntimeHttpStatus(error) ?? 500;
+      try {
+        this.json(response, status, { error: error instanceof Error ? error.message : String(error) });
+      } catch {
+        // Keep the request boundary fail-closed even if an error response
+        // itself cannot be written. The server must not surface an unhandled
+        // promise rejection or leave a half-open HTTP request behind.
+        if (!response.headersSent && !response.writableEnded && !response.destroyed) {
+          response.statusCode = 500;
+          response.end(JSON.stringify({ error: "The daemon could not serialize the error response." }));
+        } else if (!response.destroyed) {
+          response.destroy();
+        }
+      }
     }
   }
 
+  private capabilityRequestActor(request: IncomingMessage, mutation: boolean): ObjectiveActor {
+    const actor = this.authenticatedRequestActor(request, mutation ? "mutate the capability library" : "read the capability library", mutation);
+    return actor;
+  }
+
+  private async handleCapabilityResultFeedbackRoute(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    const segments = url.pathname.split("/").filter(Boolean).slice(2).map((segment) => decodeURIComponent(segment));
+    const method = (request.method ?? "GET").toUpperCase();
+    const actor = this.authenticatedRequestActor(request, method === "POST" ? "submit capability-result feedback" : "read capability-result feedback", false);
+
+    if (method === "POST" && segments.length === 0) {
+      const requestKey = this.requireIdempotencyKey(request);
+      const input = z.record(z.string(), JsonValueSchema).parse(await body(request));
+      const suppliedAgentId = input.agentId === undefined || input.agentId === null
+        ? null
+        : z.string().min(1).max(256).parse(input.agentId);
+      // An authenticated caller may only submit a record for its own durable
+      // agent identity. Local-user submissions cannot forge an agent result.
+      if (actor.type === "agent" && suppliedAgentId !== actor.id) {
+        throw new HttpError(403, "Capability feedback agentId must match the authenticated agent.");
+      }
+      if (actor.type === "user" && suppliedAgentId !== null) {
+        throw new HttpError(403, "A local user cannot submit feedback for an agent identity.");
+      }
+      const record = { ...input, agentId: suppliedAgentId, idempotencyKey: requestKey };
+      const parsed = CapabilityResultFeedbackRecordSchema.parse(record);
+      const run = this.store.getObjectiveRun(parsed.runId);
+      if (!run) throw new HttpError(404, `Objective run not found: ${parsed.runId}`);
+      if (run.objectiveId !== parsed.objectiveId) throw new HttpError(409, "Capability feedback objective identity does not match its run.");
+      const result = this.capabilityResultFeedback.submitFeedback(parsed);
+      return this.json(response, result.status, result.body);
+    }
+
+    if (method === "GET") {
+      const runId = url.searchParams.get("runId");
+      const objectiveId = url.searchParams.get("objectiveId");
+      if (runId) {
+        const run = this.store.getObjectiveRun(runId);
+        if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+        this.requireObjectiveAccess(request, run, "read capability-result feedback");
+      } else if (objectiveId) {
+        const runs = this.store.listObjectiveRuns({ objectiveId, limit: 2_000 });
+        if (runs.length === 0) throw new HttpError(404, `Objective not found: ${objectiveId}`);
+        if (!runs.some((run) => this.objectiveVisibleToRequest(request, run))) {
+          throw new HttpError(403, "An authenticated agent may read only objectives in its root lineage.");
+        }
+      }
+      if (segments.length === 0) {
+        const result = await this.capabilityResultFeedback.handle({
+          method,
+          path: request.url ?? url.pathname,
+          query: Object.fromEntries(url.searchParams.entries()),
+        });
+        return this.json(response, result.status, result.body);
+      }
+      if (segments.length === 2 && ["feedback", "evaluation", "evaluations", "decision", "decisions"].includes(segments[0] as string)) {
+        const result = await this.capabilityResultFeedback.handle({ method, path: request.url ?? url.pathname });
+        if (result.status === 200 && result.body && typeof result.body === "object") {
+          const record = result.body as { runId?: unknown };
+          if (typeof record.runId === "string") {
+            const run = this.store.getObjectiveRun(record.runId);
+            if (!run) throw new HttpError(404, `Objective run not found: ${record.runId}`);
+            this.requireObjectiveAccess(request, run, "read capability-result feedback");
+          }
+        }
+        return this.json(response, result.status, result.body);
+      }
+    }
+    throw new HttpError(404, "Capability-result feedback route not found");
+  }
+
+  private authenticatedRequestActor(request: IncomingMessage, action: string, fullAccess: boolean): ObjectiveActor {
+    const callerId = request.headers["x-symphony-agent-id"];
+    if (callerId === undefined) {
+      if (request.headers["x-symphony-agent-token"] !== undefined) throw new HttpError(401, "Invalid agent coordination token");
+      return { type: "user", id: "local-user" };
+    }
+    if (typeof callerId !== "string") throw new HttpError(401, "Invalid agent coordination token");
+    const token = request.headers["x-symphony-agent-token"];
+    if (typeof token !== "string" || !this.agents.authenticate(callerId, token)) {
+      throw new HttpError(401, "Invalid agent coordination token");
+    }
+    if (fullAccess && this.agents.get(callerId).permissions !== "full-access") {
+      throw new HttpError(403, `A read-only Symphony agent cannot ${action}.`);
+    }
+    return { type: "agent", id: callerId };
+  }
+
+  private bindCapabilityRequest(payload: unknown, actor: ObjectiveActor, request: IncomingMessage): unknown {
+    const input = z.record(z.string(), JsonValueSchema).parse(payload);
+    return { ...input, actor, requestKey: this.requireIdempotencyKey(request) };
+  }
+
+  private stripRequestIdentity(input: Record<string, JsonValue>): Record<string, JsonValue> {
+    const output = { ...input };
+    delete output.actor;
+    delete output.actorId;
+    delete output.requestKey;
+    return output;
+  }
+
+  private async handleAgentMessageRoute(request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> {
+    const actor = this.authenticatedRequestActor(request, "use the agent message bus", false);
+    const actorId = actor.id;
+    const segments = url.pathname.split("/").filter(Boolean).slice(2).map((segment) => decodeURIComponent(segment));
+    if (segments.length === 0 && request.method === "POST") {
+      const payload = z.record(z.string(), JsonValueSchema).parse(await body(request));
+      const result = this.agentMessages.append({ ...this.stripRequestIdentity(payload), requestKey: this.requireIdempotencyKey(request) } as AgentMessageInput, actorId);
+      return this.json(response, result.status === "committed" ? 201 : result.status === "replayed" ? 200 : 409, result);
+    }
+    if (segments.length === 0 && request.method === "GET") {
+      const afterValue = url.searchParams.get("after") ?? url.searchParams.get("afterCursor");
+      const beforeValue = url.searchParams.get("before") ?? url.searchParams.get("beforeCursor");
+      const afterCursor = afterValue === null ? undefined : z.coerce.number().int().nonnegative().parse(afterValue);
+      const limit = z.coerce.number().int().min(1).max(10_000).default(500).parse(url.searchParams.get("limit") ?? 500);
+      const options = {
+        ...(afterCursor === undefined ? {} : { afterCursor }),
+        ...(beforeValue !== null ? { beforeCursor: z.coerce.number().int().nonnegative().parse(beforeValue) } : {}),
+        ...(url.searchParams.has("senderId") ? { senderId: z.string().min(1).parse(url.searchParams.get("senderId")) } : {}),
+        ...(url.searchParams.has("recipientId") ? { recipientId: z.string().min(1).parse(url.searchParams.get("recipientId")) } : {}),
+        ...(url.searchParams.has("objectiveId") ? { objectiveId: z.string().min(1).parse(url.searchParams.get("objectiveId")) } : {}),
+        ...(url.searchParams.has("runId") ? { runId: z.string().min(1).parse(url.searchParams.get("runId")) } : {}),
+        ...(url.searchParams.has("kind") ? { kind: z.enum(["finding", "question", "status", "handoff", "control-request"]).parse(url.searchParams.get("kind")) } : {}),
+        limit,
+      };
+      const messages = this.agentMessages.list(actorId, options);
+      return this.json(response, 200, { messages, cursor: messages.at(-1)?.cursor ?? afterCursor ?? 0, hasMore: messages.length >= limit });
+    }
+    if (segments.length === 1 && segments[0] === "projection" && request.method === "GET") {
+      return this.json(response, 200, this.agentMessageProjection(actorId));
+    }
+    if (segments.length === 1 && segments[0] === "cursor" && request.method === "GET") {
+      return this.json(response, 200, this.agentMessages.cursorSnapshot());
+    }
+    if (segments.length === 1 && segments[0] === "replay" && request.method === "GET") {
+      const afterCursor = z.coerce.number().int().nonnegative().default(0).parse(url.searchParams.get("after") ?? url.searchParams.get("afterCursor") ?? 0);
+      const limit = z.coerce.number().int().min(1).max(10_000).default(500).parse(url.searchParams.get("limit") ?? 500);
+      return this.json(response, 200, this.agentMessages.replay(afterCursor, actorId, { limit }));
+    }
+    if (segments.length < 1) throw new HttpError(404, "Agent message route not found");
+    const messageId = segments[0] as string;
+    if (segments.length === 1 && request.method === "GET") {
+      const message = this.agentMessages.get(messageId, actorId);
+      if (!message) throw new HttpError(404, `Agent message not found: ${messageId}`);
+      return this.json(response, 200, message);
+    }
+    if (segments.length === 2 && segments[1] === "receipts") {
+      if (request.method === "GET") {
+        const message = this.agentMessages.get(messageId, actorId);
+        if (!message) throw new HttpError(404, `Agent message not found: ${messageId}`);
+        return this.json(response, 200, message);
+      }
+      if (request.method !== "POST") throw new HttpError(404, "Agent message route not found");
+      const input = z.record(z.string(), JsonValueSchema).parse(await body(request));
+      const receiptRequestKey = this.requireIdempotencyKey(request);
+      const message = this.agentMessages.getMessage(messageId, actorId);
+      if (!message) throw new HttpError(404, `Agent message not found: ${messageId}`);
+      try {
+        const result = this.agentMessages.receipt({
+          ...this.stripRequestIdentity(input),
+          messageId,
+          recipientId: message.recipientId,
+          actorId,
+          requestKey: receiptRequestKey,
+          recordedAt: nowIso(),
+        } as AgentMessageReceiptInput, actorId);
+        return this.json(response, result.status === "conflict" ? 409 : 200, result);
+      } catch (error) {
+        if (error instanceof AgentMessageApiAuthorizationError) throw new HttpError(403, error.message);
+        throw error;
+      }
+    }
+    if (segments.length === 2 && segments[1] === "reply" && request.method === "POST") {
+      return this.json(response, 200, await this.replyAgentMessage(request, messageId, actorId, await body(request)));
+    }
+    if (segments.length !== 2 || request.method !== "POST") throw new HttpError(404, "Agent message route not found");
+    const operation = segments[1];
+    const requestKey = this.requireIdempotencyKey(request);
+    const input = z.record(z.string(), JsonValueSchema).parse(await body(request));
+    const reason = input.reason === undefined ? undefined : z.string().max(2_000).parse(input.reason);
+    const deliveryState = input.state === undefined ? undefined : z.enum(["delivered", "failed"]).parse(input.state);
+    const recordedAt = nowIso();
+    const base = { requestKey, actorId, recordedAt, ...(reason === undefined ? {} : { reason }) };
+    let result;
+    try {
+      if (operation === "deliver") result = this.agentMessages.deliver(messageId, { ...base, ...(deliveryState === undefined ? {} : { state: deliveryState }) });
+      else if (operation === "failed") result = this.agentMessages.failed(messageId, base);
+      else if (operation === "unknown") result = this.agentMessages.unknown(messageId, { ...base, reason: reason ?? "Delivery outcome could not be established." });
+      else if (operation === "read") result = this.agentMessages.read(messageId, base);
+      else if (operation === "handled") result = this.agentMessages.handled(messageId, { ...base, decision: z.enum(["acknowledged", "accepted", "rejected", "deferred", "cancelled"]).parse(input.decision) });
+      else if (operation === "cancel") result = this.agentMessages.cancel(messageId, base);
+      else if (operation === "expire") result = this.agentMessages.expire(messageId, base);
+      else throw new HttpError(404, "Agent message route not found");
+    } catch (error) {
+      if (error instanceof AgentMessageApiAuthorizationError) throw new HttpError(403, error.message);
+      if (error instanceof Error && error.message.startsWith("Agent message not found:")) throw new HttpError(404, error.message);
+      throw error;
+    }
+    return this.json(response, result.status === "conflict" ? 409 : 200, result);
+  }
+
+  private agentMessageProjection(actorId: string): JsonValue {
+    const records = this.agentMessages.list(actorId, { limit: 10_000 });
+    const snapshots = records.map((message) => this.agentMessages.get(message.id, actorId)).filter((snapshot): snapshot is NonNullable<typeof snapshot> => snapshot !== null);
+    const outbox = snapshots.filter((snapshot) => snapshot.message.senderId === actorId);
+    const inbox = snapshots.filter((snapshot) => snapshot.message.senderId !== actorId);
+    const cursors = this.agentMessages.cursorSnapshot();
+    return {
+      actorId: actorId === "local-user" ? null : actorId,
+      messageCursor: cursors.messageCursor,
+      receiptCursor: cursors.receiptCursor,
+      inbox,
+      outbox,
+    } as unknown as JsonValue;
+  }
+
+  private async replyAgentMessage(request: IncomingMessage, messageId: string, actorId: string, payload: unknown): Promise<JsonValue> {
+    const original = this.agentMessages.getMessage(messageId, actorId);
+    if (!original) throw new HttpError(404, `Agent message not found: ${messageId}`);
+    const input = z.object({
+      recipientId: z.string().min(1).max(512).optional(),
+      summary: z.string().min(1).max(20_000),
+      payload: JsonValueSchema.optional(),
+      artifactRefs: z.array(AgentMessageArtifactRefSchema).max(2_000).default([]),
+      evidenceRefs: z.array(AgentMessageEvidenceRefSchema).max(2_000).default([]),
+      expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
+    }).strict().parse(this.stripRequestIdentity(z.record(z.string(), JsonValueSchema).parse(payload)));
+    const counterpart = actorId === original.senderId ? original.recipientId : original.senderId;
+    if (input.recipientId !== undefined && input.recipientId !== counterpart) {
+      throw new HttpError(403, "A reply recipient must be the original message counterpart.");
+    }
+    const reply = {
+      version: 1 as const,
+      requestKey: this.requireIdempotencyKey(request),
+      kind: original.kind,
+      senderId: actorId,
+      recipientId: counterpart,
+      parentId: original.parentId,
+      parentAgentId: original.parentAgentId,
+      objectiveId: original.objectiveId,
+      runId: original.runId,
+      attemptId: original.attemptId,
+      correlationId: original.correlationId ?? original.id,
+      replyToId: original.id,
+      payload: input.payload ?? {},
+      summary: input.summary,
+      artifactRefs: input.artifactRefs,
+      evidenceRefs: input.evidenceRefs,
+      createdAt: nowIso(),
+      expiresAt: input.expiresAt ?? null,
+    } satisfies AgentMessageInput;
+    const result = this.agentMessages.append(reply, actorId);
+    if (result.status === "conflict") return result as unknown as JsonValue;
+    if (!result.message) throw new HttpError(409, "Reply was accepted without a durable message record.");
+    const snapshot = this.agentMessages.get(result.message.id, actorId);
+    if (!snapshot) throw new HttpError(409, "Reply was committed but its durable projection is unavailable.");
+    return snapshot as unknown as JsonValue;
+  }
+
+  private async handleSessionDiagnostics(request: IncomingMessage, response: ServerResponse, agentId: string, exportText: boolean): Promise<void> {
+    this.requireAgentTargetAccess(request, agentId, "read session diagnostics");
+    if (!this.store.getAgent(agentId)) throw new HttpError(404, `Agent not found: ${agentId}`);
+    const agent = this.agents.get(agentId);
+    const highWater = this.store.latestCursor();
+    const events = agentEventsThroughCursor(this.store, agentId, highWater);
+    const objectiveRun = this.store.getObjectiveRun(agent.runId);
+    const driver = agent.harness && this.drivers.has(agent.harness) ? await this.harnessMaintenance.report(agent.harness).catch(() => null) : null;
+    const lease = this.store.listWorkerProcessLeases({ agentId: agent.id }).at(-1) ?? null;
+    const runtime = classifySessionDiagnosticRuntime({
+      status: agent.status,
+      hasReusableSession: this.agents.hasSession(agent.id),
+      nativeSessionId: agent.nativeSessionId,
+      leaseState: lease?.state ?? null,
+      leaseNativeSessionId: lease?.nativeSessionId ?? null,
+      leaseError: lease?.error ?? null,
+    });
+    const failures = events.filter((event) => ["agent.failed", "agent.interrupted", "driver.run.failed"].includes(event.type));
+    const bundle = buildSessionDiagnosticBundle({
+      identity: {
+        objectiveId: objectiveRun?.objectiveId ?? null,
+        runId: agent.runId,
+        agentId: agent.id,
+        attemptId: agent.objectiveAttemptId ?? null,
+        nativeSessionId: agent.nativeSessionId,
+        nativeRunId: agent.nativeRunId,
+      },
+      termination: runtime.termination,
+      eventCursorRanges: events.length ? [{ from: events[0]?.cursor ?? 0, to: events.at(-1)?.cursor ?? 0 }] : [],
+      harness: {
+        harness: agent.harness ?? agent.requestedHarness,
+        model: agent.model ?? agent.requestedModel,
+        available: driver?.available ?? false,
+        auth: driver ? (driver.authenticated ? "ready" : "missing") : "unknown",
+        ...(driver?.detail ? { detail: driver.detail } : {}),
+      },
+      exits: failures.map((event) => ({ process: "native", state: "exited", code: null, signal: null, stderr: jsonRecord(event.payload).error ?? jsonRecord(event.payload).message ?? agent.error ?? "", at: event.occurredAt })),
+      liveness: { state: runtime.liveness, recovery: runtime.recovery, reason: agent.error ?? lease?.error ?? runtime.reason },
+      verificationCommands: [],
+      provenance: { source: "daemon", generatedAt: nowIso(), generatorVersion: "0.1.0", parentHash: null },
+    }, { source: "daemon", generatorVersion: "0.1.0" });
+    if (exportText) {
+      response.setHeader("content-type", "application/json; charset=utf-8");
+      response.setHeader("content-disposition", `attachment; filename="symphony-session-${agentId.replace(/[^A-Za-z0-9_.-]/gu, "_")}.json"`);
+      response.statusCode = 200;
+      response.end(sessionDiagnosticJson(bundle));
+      return;
+    }
+    return this.json(response, 200, bundle);
+  }
+
   private async resource(request: IncomingMessage, response: ServerResponse, resource: string, id: string, action: string, url: URL): Promise<void> {
-    if (resource === "agents" && !action && request.method === "GET") return this.json(response, 200, this.agents.get(id));
+    if (resource === "agents" && !action && request.method === "GET") {
+      this.requireAgentTargetAccess(request, id, "read an agent's status");
+      return this.json(response, 200, this.agents.get(id));
+    }
     if (resource === "agents" && action === "messages" && request.method === "GET") {
+      this.requireAgentTargetAccess(request, id, "read another agent's transcript");
       const agent = this.agents.get(id);
       const events = agentEventsThroughCursor(this.store, id, this.store.latestCursor());
       return this.json(response, 200, {
@@ -1619,6 +2660,7 @@ export class SymphonyDaemon {
       });
     }
     if (resource === "agents" && action === "logs" && request.method === "GET") {
+      this.requireAgentTargetAccess(request, id, "read an agent's logs");
       const agent = this.agents.get(id);
       const after = z.coerce.number().int().min(0).default(0).parse(url.searchParams.get("after") ?? 0);
       const limit = z.coerce.number().int().min(1).max(2_000).default(500).parse(url.searchParams.get("limit") ?? 500);
@@ -1641,16 +2683,22 @@ export class SymphonyDaemon {
         entries: sessionLogEntries(events),
       });
     }
+    if (resource === "agents" && (action === "diagnostics" || action === "diagnostics/export") && request.method === "GET") {
+      return this.handleSessionDiagnostics(request, response, id, action.endsWith("/export"));
+    }
     if (resource === "agents" && action === "messages" && request.method === "POST") {
       const input = z.object({ content: z.string().min(1) }).parse(await body(request));
+      this.requireAgentTargetAccess(request, id, "message an agent");
       return this.json(response, 202, await this.messageAgent(request, id, input.content));
     }
     if (resource === "agents" && action === "observe" && request.method === "GET") {
+      this.requireAgentTargetAccess(request, id, "observe an agent");
       const level = z.enum(["tldr", "paragraph", "full"]).parse(url.searchParams.get("level") ?? "tldr");
       return this.json(response, 200, await this.agents.observe(id, level));
     }
     if (resource === "agents" && action === "cancel" && request.method === "POST") {
       this.requireFullAccessAgent(request, "cancel an agent");
+      this.requireAgentTargetAccess(request, id, "cancel an agent");
       await this.command(CommandSchema.parse({
         idempotencyKey: this.requireIdempotencyKey(request),
         type: "agent.cancel",
@@ -1670,6 +2718,7 @@ export class SymphonyDaemon {
       return this.json(response, 201, receipt.result);
     }
     if (resource === "runs" && action === "events" && request.method === "GET") {
+      this.requireAgentRunAccess(request, id, "read workflow run events");
       const after = z.coerce.number().int().min(0).default(0).parse(url.searchParams.get("after") ?? 0);
       const limit = z.coerce.number().int().min(1).max(2_000).default(1_000).parse(url.searchParams.get("limit") ?? 1_000);
       const page = this.store.eventsAfter(after, {
@@ -1698,6 +2747,7 @@ export class SymphonyDaemon {
     }
     if (resource === "runs" && action === "cancel" && request.method === "POST") {
       this.requireFullAccessAgent(request, "cancel a workflow run");
+      this.requireAgentRunAccess(request, id, "cancel a workflow run");
       const receipt = await this.command(CommandSchema.parse({
         idempotencyKey: this.requireIdempotencyKey(request),
         type: "workflow.cancel",
@@ -1713,6 +2763,2929 @@ export class SymphonyDaemon {
       return this.json(response, 202, await this.chats.message(id, input));
     }
     throw new HttpError(404, "Resource route not found");
+  }
+
+  /**
+   * Objectives are durable conductor projections. Mutations enter the
+   * ObjectiveRuntime with an authority envelope derived at this boundary, and
+   * the semantic event is committed in the same SQLite transaction as the
+   * runtime receipt and projection.
+   */
+  private objectiveControlProjection(request: IncomingMessage, runId: string): JsonValue {
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, "read an objective control plan");
+    const head = this.store.getObjectiveControlHead(runId);
+    const revision = head ? this.store.getObjectiveControlPlanRevision(runId, head.activeRevision) : null;
+    const snapshot = head ? this.store.getObjectiveControlSnapshot(runId, head.latestSnapshotSequence) : null;
+    if (head && (!revision || !snapshot)) {
+      throw new HttpError(409, "Objective control-plan head references missing durable state.");
+    }
+    const mutations = this.store.listObjectiveControlMutations(runId);
+    return {
+      runId,
+      objectiveId: run.objectiveId,
+      planId: head?.planId ?? null,
+      head,
+      revision,
+      snapshot,
+      mutations,
+      // Explicit aliases keep the wire projection readable to both daemon
+      // clients (head/revision/snapshot) and strategy surfaces (control*).
+      controlHead: head,
+      controlRevision: revision,
+      controlSnapshot: snapshot,
+      history: mutations,
+    } as unknown as JsonValue;
+  }
+
+  /**
+   * Bind one consequential objective mutation to its immutable request
+   * identity. The callback runs inside the storage ledger transaction, so
+   * objective projection changes, semantic events, and the generic receipt
+   * commit together. Existing operation-specific receipts remain useful for
+   * compatibility and nested idempotency, but the generic ledger is the
+   * daemon command boundary.
+   */
+  private objectiveCommandLedger(
+    request: IncomingMessage,
+    runId: string,
+    operation: string,
+    payload: unknown,
+    execute: (context: {
+      requestKey: string;
+      run: ObjectiveRunRecord;
+      caller: AgentRecord | null;
+      actor: ObjectiveActor;
+    }) => ObjectiveCommandExecution,
+    afterCommitted?: (context: {
+      requestKey: string;
+      run: ObjectiveRunRecord;
+      caller: AgentRecord | null;
+      actor: ObjectiveActor;
+      }, result: JsonValue) => void,
+    conflictMessage = "Objective command request identity conflict.",
+  ): JsonValue {
+    const requestKey = this.requireIdempotencyKey(request);
+    const caller = this.objectiveCaller(request);
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    const actor: ObjectiveActor = caller
+      ? { type: "agent", id: caller.id }
+      : { type: "user", id: "local-user" };
+    const fingerprint = createHash("sha256").update(stableJsonStringify({
+      operation,
+      runId,
+      objectiveId: run.objectiveId,
+      actor,
+      payload,
+    })).digest("hex");
+    const context = { requestKey, run, caller, actor };
+    const ledger = this.store.executeObjectiveCommand({
+      requestKey,
+      operation,
+      fingerprint,
+      actor,
+      objectiveId: run.objectiveId,
+      runId,
+    }, () => {
+      try {
+        return execute(context);
+      } catch (error) {
+        // Validation and authority failures are deterministic rejections, not
+        // uncertain effects. Persist enough transport metadata to reproduce
+        // the same HTTP error on an exact retry; unexpected failures still
+        // use the storage ledger's fail-closed unknown outcome.
+        const status = error instanceof HttpError ? error.status : objectiveRuntimeHttpStatus(error);
+        if (status !== null && status >= 400 && status < 500) {
+          return {
+            status: "rejected" as const,
+            result: {
+              __symphonyObjectiveCommandRejection: true,
+              httpStatus: status,
+              error: error instanceof Error ? error.message : String(error),
+            } as unknown as JsonValue,
+            reason: error instanceof Error ? error.message : String(error),
+          };
+        }
+        throw error;
+      }
+    });
+    if (ledger.status === "conflict") {
+      throw new HttpError(409, conflictMessage);
+    }
+    if (ledger.status === "unknown") {
+      throw new HttpError(409, ledger.reason ?? "Objective command outcome is unknown; reconciliation is required.");
+    }
+    if (ledger.status === "rejected") {
+      const rejected = jsonRecord(ledger.result);
+      if (rejected.__symphonyObjectiveCommandRejection === true) {
+        const status = typeof rejected.httpStatus === "number" && Number.isInteger(rejected.httpStatus)
+          ? rejected.httpStatus
+          : 409;
+        throw new HttpError(status, typeof rejected.error === "string" ? rejected.error : ledger.reason ?? "Objective command was rejected.");
+      }
+      return ledger.result;
+    }
+    if (ledger.status === "committed") afterCommitted?.(context, ledger.result);
+    if (ledger.status === "replayed") {
+      // Keep the original operation result fields byte-for-byte while making
+      // the generic replay visible to existing API clients.
+      return {
+        ...jsonRecord(ledger.result),
+        status: "replayed",
+        replayed: true,
+      } as unknown as JsonValue;
+    }
+    return ledger.result;
+  }
+
+  /**
+   * Bind a typed wire mutation to the authenticated caller and delegate the
+   * reduction/commit to storage. Resulting plans and snapshots never cross
+   * this boundary from the network.
+  */
+  private reviseObjectiveControl(request: IncomingMessage, runId: string, payload: unknown): JsonValue {
+    let cancellationAttemptIds: string[] = [];
+    return this.objectiveCommandLedger(request, runId, "objective.control.revise", payload, ({ requestKey, run, caller }) => {
+      // Parse authentication and lineage before mutation details so a caller
+      // cannot use malformed payloads to probe unrelated objective runs.
+      const { authority } = this.objectiveMutationContext(request, runId, "revise");
+      this.requireFullAccessAgent(request, "revise an objective control plan");
+      const head = this.store.getObjectiveControlHead(runId);
+      if (!head) throw new HttpError(409, "Objective control plan has not been admitted for this run.");
+      let parsed: z.infer<typeof ObjectiveControlMutationRequestSchema>;
+      try {
+        parsed = ObjectiveControlMutationRequestSchema.parse(payload);
+      } catch {
+        throw new HttpError(400, "Invalid typed objective control-plan mutation request.");
+      }
+      let mutation: ObjectiveControlMutation;
+      try {
+        mutation = ObjectiveControlMutationSchema.parse({
+          ...parsed,
+          version: 1,
+          mutationId: `objective-control-mutation:${createHash("sha256").update(`${runId}\u0000${requestKey}`).digest("hex")}`,
+          planId: head.planId,
+          objectiveId: run.objectiveId,
+          runId,
+          requestKey,
+          actor: caller ? { type: "agent", id: caller.id } : { type: "user", id: "local-user" },
+        });
+      } catch {
+        throw new HttpError(400, "Invalid typed objective control-plan mutation request.");
+      }
+      this.assertObjectiveControlMutationAuthority(run, mutation, authority);
+      const priorMutation = this.store.getObjectiveControlMutationByRequestKey(runId, requestKey);
+      const currentRevision = this.store.getObjectiveControlPlanRevision(runId, head.activeRevision);
+      const currentSnapshot = this.store.getObjectiveControlSnapshot(runId, head.latestSnapshotSequence);
+      // A replay must not be revalidated against the now-advanced head: the
+      // original receipt is the deterministic authority for that request key.
+      const impactPreview = !priorMutation && currentRevision && currentSnapshot
+        ? previewObjectiveControlMutation(currentRevision.plan, currentSnapshot, mutation, run.policy ? {
+            policy: {
+              effectivePermission: run.policy.effectivePermission,
+              allowedCapabilities: run.policy.allowedCapabilities,
+              workspace: run.policy.workspace,
+              sideEffectClassCeiling: run.policy.sideEffectClassCeiling,
+              budget: run.policy.budget,
+            },
+          } : {})
+        : null;
+      try {
+        const committedState = this.objectiveRuntime.mutateControlPlan(runId, mutation, authority);
+        const committedMutation = this.store.getObjectiveControlMutationByRequestKey(runId, requestKey);
+        if (!committedMutation) {
+          throw new HttpError(500, "Objective control mutation committed without a durable receipt.");
+        }
+        if (mutation.type === "remove-subtree" && impactPreview) {
+          cancellationAttemptIds = [...impactPreview.impact.activeAttemptsCancelled];
+        }
+        return {
+          status: "committed" as const,
+          result: {
+            status: "committed",
+            head: committedState.head,
+            revision: committedState.revision,
+            snapshot: committedState.snapshot,
+            mutation: committedMutation,
+          } as unknown as JsonValue,
+        };
+      } catch (error) {
+        if (!(error instanceof ObjectiveRuntimeError) || error.code !== "revision-conflict") throw error;
+        const currentHead = this.store.getObjectiveControlHead(runId);
+        return {
+          status: "rejected" as const,
+          result: {
+            status: "conflict",
+            conflict: true,
+            reason: error.message,
+            head: currentHead,
+            currentRevision: currentHead?.activeRevision ?? null,
+            expectedRevision: mutation.expectedRevision,
+          } as unknown as JsonValue,
+          reason: error.message,
+        };
+      }
+    }, () => {
+      // Native cancellation is a post-commit side effect. The durable
+      // mutation receipt/snapshot is authoritative before a driver is asked
+      // to stop an active attempt.
+      for (const attemptId of cancellationAttemptIds) {
+        const agent = this.store.getAgentByLogicalAgentId(attemptId);
+        if (agent) void this.agents.cancel(agent.id).catch(() => undefined);
+      }
+    });
+  }
+
+  /**
+   * Produce the exact candidate-plan diff that an apply would use. Preview is
+   * authenticated and actor-bound, but deliberately does not advance the CAS
+   * head or create a scheduler-visible revision.
+   */
+  private previewObjectiveControl(request: IncomingMessage, runId: string, payload: unknown): JsonValue {
+    const requestKey = this.requireIdempotencyKey(request);
+    const { run, authority, caller } = this.objectiveMutationContext(request, runId, "preview an objective control plan revision");
+    this.requireFullAccessAgent(request, "preview an objective control plan revision");
+    const head = this.store.getObjectiveControlHead(runId);
+    if (!head) throw new HttpError(409, "Objective control plan has not been admitted for this run.");
+    const revision = this.store.getObjectiveControlPlanRevision(runId, head.activeRevision);
+    const snapshot = this.store.getObjectiveControlSnapshot(runId, head.latestSnapshotSequence);
+    if (!revision || !snapshot) throw new HttpError(409, "Objective control-plan head references missing durable state.");
+    let parsed: z.infer<typeof ObjectiveControlMutationRequestSchema>;
+    try {
+      parsed = ObjectiveControlMutationRequestSchema.parse(payload);
+    } catch {
+      throw new HttpError(400, "Invalid typed objective control-plan mutation preview request.");
+    }
+    if (parsed.expectedRevision !== head.activeRevision) {
+      throw new HttpError(409, `Objective control-plan preview is stale: expected revision ${parsed.expectedRevision}, current revision ${head.activeRevision}.`);
+    }
+    const actor = caller ? { type: "agent" as const, id: caller.id } : { type: "user" as const, id: "local-user" };
+    const mutation = ObjectiveControlMutationSchema.parse({
+      ...parsed,
+      version: 1,
+      mutationId: `objective-control-preview:${createHash("sha256").update(`${runId}\u0000${requestKey}`).digest("hex")}`,
+      planId: head.planId,
+      objectiveId: run.objectiveId,
+      runId,
+      requestKey,
+      actor,
+    });
+    this.assertObjectiveControlMutationAuthority(run, mutation, authority);
+    const policy = run.policy ? {
+      effectivePermission: run.policy.effectivePermission,
+      allowedCapabilities: run.policy.allowedCapabilities,
+      workspace: run.policy.workspace,
+      sideEffectClassCeiling: run.policy.sideEffectClassCeiling,
+      budget: run.policy.budget,
+    } : undefined;
+    try {
+      return previewObjectiveControlMutation(revision.plan, snapshot, mutation, policy ? { policy } : {}) as unknown as JsonValue;
+    } catch (error) {
+      throw new HttpError(400, error instanceof Error ? error.message : "Invalid objective control-plan mutation preview.");
+    }
+  }
+
+  /**
+   * Deliver one external event to the exact durable signal subscription. The
+   * caller may be the local objective authority or the bound conductor; every
+   * attached agent outside that conductor identity is rejected before payload
+  * parsing can reveal the run's suspension state.
+  */
+  private deliverObjectiveSignal(request: IncomingMessage, runId: string, payload: unknown): JsonValue {
+    return this.objectiveCommandLedger(request, runId, "objective.signal.deliver", payload, ({ requestKey, run, caller }) => {
+      this.requireObjectiveAccess(request, run, "deliver an objective signal");
+      if (caller && (run.conductorAgentId === null || caller.id !== run.conductorAgentId)) {
+        throw new HttpError(403, "Only the bound objective conductor may deliver an external signal.");
+      }
+      let input: ObjectiveControlSignalDeliveryInput;
+      try {
+        input = ObjectiveControlSignalDeliveryInputSchema.parse(payload);
+      } catch {
+        throw new HttpError(400, "Invalid typed objective signal delivery.");
+      }
+      const authority = this.objectiveAuthority(caller, this.effectiveWorkspaceGrant(this.objectiveWorkspaceGrant(runId), caller));
+      const delivered = this.objectiveRuntime.deliverControlSignal(runId, input, authority);
+      return { status: "committed", result: { ...delivered, requestKey } as unknown as JsonValue };
+    }, (_context, result) => {
+      if (jsonRecord(result).status === "delivered") {
+        // A delivery is already durably reduced before this wakeup. The
+        // runner is nudged directly by the daemon event; the UI never polls
+        // the suspension.
+        void this.objectiveSupervisor.step(runId).catch(() => undefined);
+      }
+    });
+  }
+
+  private assertObjectiveControlMutationAuthority(
+    run: ObjectiveRunRecord,
+    mutation: ObjectiveControlMutation,
+    authority: ObjectiveRuntimeAuthority,
+  ): void {
+    const visit = (node: ObjectiveControlNode): void => {
+      if (node.type === "agent") {
+        const permissionCeiling = run.policy?.effectivePermission ?? authority.permissionCeiling;
+        if (node.permissions === "full-access" && permissionCeiling !== "full-access") {
+          throw new HttpError(403, `Control node ${node.id} requests full-access above the objective authority ceiling.`);
+        }
+        const allowed = new Set(run.policy?.allowedCapabilities ?? authority.allowedCapabilities ?? []);
+        for (const capability of node.capabilities ?? []) {
+          if (!allowed.has(capability)) {
+            throw new HttpError(403, `Control node ${node.id} requests unavailable capability ${capability}.`);
+          }
+        }
+        if (node.workspace) {
+          const grants = [run.policy?.workspace ?? null, authority.workspace ?? null].filter(
+            (grant): grant is WorkspaceSpec => grant !== null,
+          );
+          if (grants.length === 0) {
+            throw new HttpError(403, `Control node ${node.id} requests a workspace without an objective grant.`);
+          }
+          // Realpath-aware containment prevents a mutation from widening a
+          // native agent's durable workspace grant through a symlink.
+          for (const grant of grants) this.childWorkspaceGrant(grant, node.workspace);
+        }
+      }
+      if (node.type === "sequence" || node.type === "parallel" || node.type === "while") node.steps.forEach(visit);
+      else if (node.type === "if") {
+        node.then.forEach(visit);
+        node.else?.forEach(visit);
+      }
+    };
+    if (mutation.type === "insert-node" || mutation.type === "replace-node" || mutation.type === "insert-branch" || mutation.type === "replace-branch" || mutation.type === "insert-evaluate" || mutation.type === "insert-evaluator" || mutation.type === "insert-timer" || mutation.type === "insert-signal" || mutation.type === "insert-checkpoint" || mutation.type === "insert-artifact") visit(mutation.node);
+  }
+
+  private objectiveList(request: IncomingMessage, url: URL): { objectives: ObjectiveRunRecord[]; limit: number } {
+    const limit = z.coerce.number().int().min(1).max(200).default(50).parse(url.searchParams.get("limit") ?? 50);
+    const states = url.searchParams.getAll("state")
+      .flatMap((value) => value.split(","))
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const parsedStates = states.length ? ObjectiveRunStateSchema.array().parse(states) : undefined;
+    const requestedRunId = url.searchParams.get("runId")?.trim() || null;
+    const workflowId = url.searchParams.get("workflowId")?.trim() || null;
+    // Validate a native caller even when the filtered result is empty. A
+    // malformed capability must not look like a legitimate empty projection.
+    this.objectiveCaller(request);
+    const objectiveQuery = parsedStates ? { state: parsedStates, limit: 2_000 } : { limit: 2_000 };
+    const candidates = requestedRunId
+      ? (this.store.getObjectiveRun(requestedRunId) ? [this.store.getObjectiveRun(requestedRunId) as ObjectiveRunRecord] : [])
+      : this.store.listObjectiveRuns(objectiveQuery);
+    const objectives = candidates
+      .filter((run) => !workflowId || run.workflowId === workflowId)
+      .filter((run) => this.objectiveVisibleToRequest(request, run))
+      .slice(0, limit);
+    return { objectives, limit };
+  }
+
+  private objectiveDetail(request: IncomingMessage, runId: string, url: URL): JsonValue {
+    const run = this.store.getObjectiveRun(runId);
+    // New objective callers may address the aggregate directly. Preserve the
+    // legacy run-detail response whenever the path names a run, and only fall
+    // back to the aggregate snapshot when no run has that identity.
+    if (!run && this.store.getObjectiveAggregate(runId)) return this.objectiveAggregateSnapshot(request, runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, "read an objective run");
+
+    const limit = z.coerce.number().int().min(1).max(2_000).default(500).parse(url.searchParams.get("limit") ?? 500);
+    const afterValue = url.searchParams.get("after");
+    const after = afterValue === null
+      ? null
+      : z.coerce.number().int().min(0).parse(afterValue);
+    const page = after === null
+      ? this.store.recentEvents({ runId, limit: limit + 1 })
+      : this.store.eventsAfter(after, { runId, limit: limit + 1 });
+    const events = page.slice(0, limit);
+    // Budget accounting is available only when this run has an authoritative
+    // policy-backed ledger. Keep legacy (or partially migrated) runs explicit
+    // about unavailable accounting instead of manufacturing empty usage.
+    const budgetLedger = this.store.getObjectiveBudgetLedger(runId);
+    const accountingLimit = 500;
+    return {
+      run,
+      planRevisions: this.store.listObjectivePlanRevisions(runId),
+      checkpoints: this.store.listObjectiveCheckpoints(runId),
+      approvals: this.store.listObjectiveApprovals({ runId, limit: 2_000 }),
+      attentions: this.store.listObjectiveAttentions({ runId, limit: 2_000 }),
+      artifacts: this.store.listObjectiveArtifacts({ runId, limit: accountingLimit }),
+      budgetLedger,
+      reservations: budgetLedger
+        ? this.store.listObjectiveBudgetReservations({ runId, limit: accountingLimit })
+        : null,
+      debits: budgetLedger
+        ? this.store.listObjectiveBudgetDebits({ runId, limit: accountingLimit })
+        : null,
+      events,
+      eventCursor: events.at(-1)?.cursor ?? after ?? 0,
+      hasMore: page.length > limit,
+    } as unknown as JsonValue;
+  }
+
+  private reconcileObjectiveAttentionExpiry(): void {
+    this.store.durableTransaction(() => {
+      const expired = this.objectiveAttention.expire(nowIso());
+      for (const attention of expired) {
+        const run = this.store.getObjectiveRun(attention.runId);
+        if (!run || !attention.resolution) continue;
+        this.appendObjectiveAttentionEvent("objective.attention.expired", run, attention, attention.resolution.resolvedBy);
+      }
+    });
+  }
+
+  private objectiveAttentionList(request: IncomingMessage, url: URL): JsonValue {
+    // Expiry is reconciled at the authoritative read boundary as well as at
+    // daemon startup. A disconnected browser therefore cannot leave stale
+    // open records in the global inbox.
+    this.reconcileObjectiveAttentionExpiry();
+    const statusValues = url.searchParams.getAll("status")
+      .flatMap((value) => value.split(","))
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const query = ObjectiveAttentionListQuerySchema.parse({
+      ...(url.searchParams.get("objectiveId") ? { objectiveId: url.searchParams.get("objectiveId") } : {}),
+      ...(url.searchParams.get("runId") ? { runId: url.searchParams.get("runId") } : {}),
+      ...(url.searchParams.get("nodeId") ? { nodeId: url.searchParams.get("nodeId") } : {}),
+      ...(url.searchParams.get("attemptId") ? { attemptId: url.searchParams.get("attemptId") } : {}),
+      ...(statusValues.length ? { status: statusValues } : {}),
+      ...(url.searchParams.get("assigneeId") ? { assigneeId: url.searchParams.get("assigneeId") } : {}),
+      limit: z.coerce.number().int().min(1).max(2_000).default(200).parse(url.searchParams.get("limit") ?? 200),
+    });
+    // Validate the capability even for an empty result. A malformed token
+    // must never masquerade as an empty global inbox.
+    this.objectiveCaller(request);
+    if (query.runId) {
+      const run = this.store.getObjectiveRun(query.runId);
+      if (!run) throw new HttpError(404, `Objective run not found: ${query.runId}`);
+      this.requireObjectiveAccess(request, run, "read objective attention");
+    }
+    const records = this.store.listObjectiveAttentions(query as Parameters<SymphonyStore["listObjectiveAttentions"]>[0]);
+    const visible = records.filter((attention) => {
+      const run = this.store.getObjectiveRun(attention.runId);
+      return Boolean(run && this.objectiveVisibleToRequest(request, run));
+    });
+    return { attentions: visible.slice(0, query.limit), limit: query.limit } as unknown as JsonValue;
+  }
+
+  private objectiveAttentionDetail(request: IncomingMessage, runId: string, attentionId: string): JsonValue {
+    this.reconcileObjectiveAttentionExpiry();
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, "read objective attention");
+    const attention = this.store.getObjectiveAttention(attentionId, runId);
+    if (!attention) throw new HttpError(404, `Objective attention not found: ${attentionId}`);
+    return attention as unknown as JsonValue;
+  }
+
+  private objectiveAttentionActor(request: IncomingMessage, run: ObjectiveRunRecord, action: string): ObjectiveActor {
+    const caller = this.objectiveCaller(request);
+    if (!caller) return { type: "user", id: "local-user" };
+    this.requireObjectiveAccess(request, run, action);
+    return { type: "agent", id: caller.id };
+  }
+
+  private objectiveAttentionAuthority(request: IncomingMessage, run: ObjectiveRunRecord, action: string): ObjectiveActor {
+    const actor = this.objectiveAttentionActor(request, run, action);
+    if (actor.type === "agent" && run.conductorAgentId !== actor.id) {
+      throw new HttpError(403, `Only the objective conductor may ${action} an attention item.`);
+    }
+    return actor;
+  }
+
+  private requestObjectiveAttention(request: IncomingMessage, runId: string, payload: unknown): JsonValue {
+    const requestKey = this.requireIdempotencyKey(request);
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    const actor = this.objectiveAttentionActor(request, run, "request");
+    let input: ObjectiveAttentionRequest;
+    try {
+      input = ObjectiveAttentionInputSchema.parse(payload);
+    } catch {
+      throw new HttpError(400, "Invalid objective attention request.");
+    }
+    const existingId = `attention:${createHash("sha256").update(`${runId}\u0000${requestKey}`).digest("hex")}`;
+    const previous = this.store.getObjectiveAttention(existingId, runId);
+    const attention = this.store.durableTransaction(() => {
+      const created = this.objectiveAttention.create({
+        objectiveId: run.objectiveId,
+        runId,
+        requestKey,
+        requestedBy: actor,
+        now: nowIso(),
+        id: existingId,
+      }, input);
+      if (!previous) this.appendObjectiveAttentionEvent("objective.attention.requested", run, created, actor);
+      return created;
+    });
+    return { attention, status: previous ? "replayed" : "committed", replayed: previous !== null } as unknown as JsonValue;
+  }
+
+  private resolveObjectiveAttention(request: IncomingMessage, runId: string, attentionId: string, payload: unknown): JsonValue {
+    return this.objectiveCommandLedger(request, runId, "objective.attention.resolve", {
+      attentionId,
+      payload,
+    }, ({ requestKey, run, actor }) => {
+      const authorityActor = this.objectiveAttentionAuthority(request, run, "resolve");
+      let input: ObjectiveAttentionResolveRequest;
+      try {
+        input = ObjectiveAttentionResolutionInputSchema.parse(payload);
+      } catch {
+        throw new HttpError(400, "Invalid objective attention resolution.");
+      }
+      const current = this.store.getObjectiveAttention(attentionId, runId);
+      if (!current) throw new HttpError(404, `Objective attention not found: ${attentionId}`);
+      const approval = this.attentionApprovalForRecord(run, current);
+      const replayed = current.resolution?.requestKey === requestKey
+        || (approval !== null && current.resolution?.requestKey === attentionApprovalResolutionKey(requestKey, attentionId));
+      if (current.status !== "open" && !replayed) {
+        throw new HttpError(409, `Objective attention ${attentionId} is already ${current.status}.`);
+      }
+      if (approval) {
+        if (replayed && current.resolution && (
+          current.resolution.status !== input.status
+          || stableJson(current.resolution.decision) !== stableJson(input.decision ?? null)
+        )) {
+          throw new HttpError(409, "Objective attention resolution idempotency conflict.");
+        }
+        // Approval attention is still the same human control boundary as the
+        // first-class approval route. A conductor agent may inspect it, but may
+        // not use the inbox to bypass the existing local-user approval rule.
+        if (authorityActor.type === "agent") throw new HttpError(403, "Only a local user may resolve approval attention.");
+        if (!replayed && approval.status === "requested") {
+          const approvalStatus = attentionApprovalStatus(input);
+          if (!approvalStatus) {
+            throw new HttpError(409, "No automated resolution exists for this attention item without an approved/rejected decision; use the objective approval command.");
+          }
+          const authority = this.objectiveAuthority(null);
+          this.objectiveRuntime.resolveApproval(runId, approval.id, {
+            status: approvalStatus,
+            decision: input.decision ?? null,
+            requestKey,
+          }, authority);
+        }
+        const latestApproval = this.store.getObjectiveApproval(runId, approval.id) ?? approval;
+        if (!replayed && latestApproval.status === "requested") {
+          throw new HttpError(409, "Objective approval resolution did not settle the bound approval.");
+        }
+        const resolved = this.resolveAttentionForApproval(run, approval, latestApproval.status, input.decision ?? null, actor, requestKey);
+        const attention = resolved.find((item) => item.id === attentionId) ?? this.store.getObjectiveAttention(attentionId, runId);
+        if (!attention) throw new HttpError(500, "Objective approval resolved without an attention receipt.");
+        return { status: "committed", result: { attention, status: "committed", replayed: false } as unknown as JsonValue };
+      }
+      // Generic recovery/native/budget/control attention has no safe generic
+      // resume command. Refuse to manufacture a UI-only resolution; callers
+      // must use the corresponding existing objective command or repair
+      // evidence.
+      throw new HttpError(409, "No automated resolution exists for this attention item; use the corresponding objective command or reconcile its durable evidence.");
+    }, undefined, "Objective attention resolution idempotency conflict.");
+  }
+
+  private attentionApprovalForRecord(run: ObjectiveRunRecord, attention: ObjectiveAttentionRecord): ObjectiveApprovalRecord | null {
+    return this.store.listObjectiveApprovals({ runId: run.runId, limit: 2_000 })
+      .find((approval) => approval.operationId === attention.operationId) ?? null;
+  }
+
+  private resolveAttentionForApproval(
+    run: ObjectiveRunRecord,
+    approval: ObjectiveApprovalRecord,
+    status: ObjectiveApprovalRecord["status"],
+    decision: JsonValue,
+    actor: ObjectiveActor,
+    sourceRequestKey: string,
+  ): ObjectiveAttentionRecord[] {
+    const attentions = this.store.listObjectiveAttentions({ runId: run.runId, status: ["open"], limit: 2_000 })
+      .filter((attention) => attention.operationId === approval.operationId);
+    const attentionStatus: ObjectiveAttentionResolveRequest["status"] = status === "expired"
+      ? "expired"
+      : status === "cancelled"
+        ? "cancelled"
+        : "resolved";
+    return attentions.map((attention) => {
+      const requestKey = attentionApprovalResolutionKey(sourceRequestKey, attention.id);
+      const resolved = this.objectiveAttention.resolve(run.runId, attention.id, {
+        request: {
+          status: attentionStatus,
+          decision,
+          evidenceRefs: [{ kind: "other", id: `approval:${approval.id}`, description: "Bound objective approval receipt." }],
+        },
+        resolvedBy: actor,
+        now: nowIso(),
+        requestKey,
+      });
+      this.appendObjectiveAttentionEvent("objective.attention.resolved", run, resolved, actor);
+      return resolved;
+    });
+  }
+
+  private appendObjectiveAttentionEvent(
+    type: "objective.attention.requested" | "objective.attention.resolved" | "objective.attention.expired" | "objective.attention.escalated",
+    run: ObjectiveRunRecord,
+    attention: ObjectiveAttentionRecord,
+    actor: ObjectiveActor,
+  ): void {
+    this.appendObjectiveEvent(type, run, actor, {
+      objectiveId: attention.objectiveId,
+      attentionId: attention.id,
+      nodeId: attention.nodeId,
+      attemptId: attention.attemptId,
+      status: attention.status,
+      risk: attention.risk,
+      urgency: attention.urgency,
+      confidence: attention.confidence,
+      blockedResource: attention.blockedResource as unknown as JsonValue,
+      proposedAction: attention.proposedAction,
+      authorityBoundary: attention.authorityBoundary,
+      evidenceRefs: attention.evidenceRefs as unknown as JsonValue,
+      requestKey: attention.requestKey,
+      resolution: attention.resolution as unknown as JsonValue,
+    });
+  }
+
+  private objectiveArtifactList(request: IncomingMessage, runId: string, url: URL): JsonValue {
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, "read objective artifacts");
+    const limit = z.coerce.number().int().min(1).max(2_000).default(500).parse(url.searchParams.get("limit") ?? 500);
+    return {
+      objectiveId: run.objectiveId,
+      runId,
+      artifacts: this.store.listObjectiveArtifacts({ runId, limit }),
+    } as unknown as JsonValue;
+  }
+
+  private objectiveArtifactDetail(request: IncomingMessage, runId: string, artifactId: string): JsonValue {
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, "read objective artifacts");
+    const artifact = this.store.getObjectiveArtifact(artifactId);
+    if (!artifact || artifact.runId !== runId) throw new HttpError(404, `Objective artifact not found: ${artifactId}`);
+    return {
+      artifact,
+      reviews: this.store.listObjectiveArtifactReviews(artifactId),
+    } as unknown as JsonValue;
+  }
+
+  private objectiveArtifactAuthority(
+    request: IncomingMessage,
+    run: ObjectiveRunRecord,
+    action: string,
+  ): { actor: ObjectiveArtifactActor; caller: AgentRecord | null } {
+    const caller = this.objectiveCaller(request);
+    this.requireObjectiveAccess(request, run, action);
+    if (caller) {
+      // Agent workspace grants are capabilities. An agent cannot publish an
+      // artifact from a different workspace merely by naming the objective.
+      const workspace = run.policy?.workspace;
+      if (workspace && !this.workspacePathWithin(caller.workspacePath, workspace.path)) {
+        throw new HttpError(403, "Artifact action is outside the authenticated agent's objective workspace grant.");
+      }
+    }
+    return { actor: caller ? { type: "agent", id: caller.id } : { type: "user", id: "local-user" }, caller };
+  }
+
+  private publishObjectiveArtifact(request: IncomingMessage, runId: string, payload: unknown): JsonValue {
+    const requestKey = this.requireIdempotencyKey(request);
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    const { actor, caller } = this.objectiveArtifactAuthority(request, run, "publish objective artifacts");
+    let parsed: z.infer<typeof ObjectiveArtifactPublishRequestSchema>;
+    try {
+      parsed = ObjectiveArtifactPublishRequestSchema.parse(payload);
+    } catch {
+      throw new HttpError(400, "Invalid objective artifact publication request.");
+    }
+    if (parsed.objectiveId !== undefined && parsed.objectiveId !== run.objectiveId) throw new HttpError(403, "Artifact objective identity does not match the run.");
+    // Reconcile an exact retry before policy/capacity checks. A prior durable
+    // receipt is authoritative even if another artifact has since consumed
+    // the remaining storage envelope; a changed body under the same key is
+    // still rejected as an idempotency conflict.
+    const retryFingerprint = createHash("sha256").update(stableJsonStringify({
+      runId,
+      objectiveId: run.objectiveId,
+      planRevision: parsed.planRevision,
+      kind: parsed.kind,
+      name: parsed.name,
+      mediaType: parsed.mediaType,
+      content: parsed.content,
+      evidence: parsed.evidence,
+      taskId: parsed.taskId ?? null,
+      attemptId: parsed.attemptId ?? null,
+      controlNodeId: parsed.controlNodeId ?? null,
+      lineage: parsed.lineage,
+      supersedes: parsed.supersedes,
+      policyHash: parsed.policyHash ?? run.policyHash ?? null,
+    })).digest("hex");
+    const priorReceipt = this.store.getObjectiveArtifactReceipt(requestKey);
+    if (priorReceipt) {
+      if (priorReceipt.operation !== "publish" || priorReceipt.runId !== runId || priorReceipt.objectiveId !== run.objectiveId || priorReceipt.fingerprint !== retryFingerprint) {
+        throw new HttpError(409, "Objective artifact publication idempotency conflict.");
+      }
+      const priorArtifact = this.store.getObjectiveArtifact(priorReceipt.artifactId);
+      if (!priorArtifact) throw new HttpError(500, "Objective artifact publication receipt points to missing artifact.");
+      const priorSuperseded = priorArtifact.supersedes
+        ? this.store.listObjectiveArtifactReviews(priorArtifact.supersedes).filter((entry) => entry.state === "superseded")
+        : [];
+      return { status: "replayed", artifact: priorArtifact, superseded: priorSuperseded, reviews: priorSuperseded } as unknown as JsonValue;
+    }
+    if (!run.policy || !run.policyHash || !isObjectivePolicyHashValid(run.policy) || run.policy.policyHash !== run.policyHash) {
+      throw new HttpError(409, "Objective artifact publication requires a valid immutable objective policy.");
+    }
+    if (run.policy.expiresAt !== null && Date.parse(run.policy.expiresAt) <= Date.now()) throw new HttpError(409, "Objective artifact policy has expired.");
+    if (parsed.policyHash !== undefined && parsed.policyHash !== run.policyHash) throw new HttpError(403, "Artifact policy hash does not match the objective policy.");
+    const canonicalSize = objectiveArtifactContentSize(parsed.content);
+    if (canonicalSize > OBJECTIVE_ARTIFACT_MAX_INLINE_BYTES) throw new HttpError(413, "Inline objective artifact exceeds the daemon safety bound.");
+    if (run.policy.budget.maxOutputBytes !== null && canonicalSize > run.policy.budget.maxOutputBytes) throw new HttpError(403, "Artifact exceeds the objective output-byte policy.");
+    const storedBytes = this.store.listObjectiveArtifacts({ runId, limit: 5_000 }).reduce((sum, artifact) => sum + artifact.sizeBytes, 0);
+    if (run.policy.budget.maxStorageBytes !== null && storedBytes + canonicalSize > run.policy.budget.maxStorageBytes) throw new HttpError(403, "Artifact exceeds the objective storage-byte policy.");
+    if (parsed.evidence.eventCursor > this.store.latestCursor()) throw new HttpError(409, "Artifact evidence cursor is ahead of the durable event high-water mark.");
+    if (parsed.evidence.eventIds.length > 0) {
+      const events = this.store.eventsAfter(0, { runId, limit: 10_000 });
+      const byId = new Map(events.map((event) => [event.id, event]));
+      for (const eventId of parsed.evidence.eventIds) {
+        const event = byId.get(eventId);
+        if (!event) throw new HttpError(403, "Artifact evidence must reference events in the objective run.");
+        if (event.cursor > parsed.evidence.eventCursor) throw new HttpError(409, "Artifact evidence cursor is behind a referenced event.");
+      }
+    }
+    for (const observationId of parsed.evidence.observationIds) {
+      const observation = this.store.getObservationById(observationId);
+      const observationAgent = observation ? this.store.getAgent(observation.agentId) : null;
+      if (!observation || !observationAgent || observationAgent.runId !== runId) throw new HttpError(403, "Artifact evidence must reference observations in the objective run.");
+      if (observation.eventCursor > parsed.evidence.eventCursor) throw new HttpError(409, "Artifact evidence cursor is behind a referenced observation.");
+    }
+
+    const taskId = parsed.taskId ?? null;
+    const task = taskId ? run.tasks.find((candidate) => candidate.task.id === taskId) : null;
+    if (taskId && !task) throw new HttpError(404, `Objective task not found: ${taskId}`);
+    const attemptId = parsed.attemptId ?? task?.attemptId ?? null;
+    if (parsed.attemptId && (!task || task.attemptId !== parsed.attemptId)) throw new HttpError(403, "Artifact attempt is not the durable attempt assigned to the task.");
+    if (task?.agentId) {
+      const assignedProducer = this.store.getAgent(task.agentId);
+      if (!assignedProducer || assignedProducer.runId !== runId || assignedProducer.workflowId !== run.workflowId) throw new HttpError(409, "Artifact producer is not a durable agent in this objective run.");
+      if (run.policy.workspace && !this.workspacePathWithin(assignedProducer.workspacePath, run.policy.workspace.path)) throw new HttpError(403, "Artifact producer is outside the objective workspace grant.");
+    }
+    // A conductor may publish a child task's evidence; preserve the durable
+    // assigned producer rather than attributing the output to the publisher.
+    const producerAgentId = task?.agentId ?? caller?.id ?? null;
+    if (caller && task?.agentId && task.agentId !== caller.id) {
+      const producer = this.store.getAgent(task.agentId);
+      if (!producer || !this.sharesAgentRoot(caller, producer)) throw new HttpError(403, "Artifact producer is outside the authenticated agent lineage.");
+    }
+    if (attemptId && (!task || task.attemptId !== attemptId || !task.agentId)) throw new HttpError(403, "Artifact attempt does not belong to a durable producer in this objective run.");
+    if (parsed.controlNodeId) {
+      const revision = this.store.getLatestObjectiveControlPlanRevision(runId);
+      if (!revision || !this.objectiveControlNodeExists(revision.plan.root, parsed.controlNodeId)) throw new HttpError(404, `Objective control node not found: ${parsed.controlNodeId}`);
+    }
+
+    const artifact: ObjectiveArtifactRecord = ObjectiveArtifactRecordSchema.parse({
+      version: 1,
+      id: `artifact-${createHash("sha256").update(`${runId}\u0000${requestKey}`).digest("hex")}`,
+      objectiveId: run.objectiveId,
+      runId,
+      planRevision: parsed.planRevision,
+      taskId,
+      producerAgentId,
+      attemptId,
+      controlNodeId: parsed.controlNodeId ?? null,
+      kind: parsed.kind,
+      name: parsed.name,
+      mediaType: parsed.mediaType,
+      content: parsed.content,
+      hash: objectiveArtifactContentHash(parsed.content),
+      sizeBytes: canonicalSize,
+      evidence: parsed.evidence,
+      lineage: parsed.lineage,
+      supersedes: parsed.supersedes,
+      reviewState: "pending",
+      reviewReason: null,
+      reviewedBy: null,
+      reviewedAt: null,
+      publishedBy: actor,
+      publishedAt: nowIso(),
+    });
+    const fingerprint = retryFingerprint;
+    return this.store.durableTransaction(() => {
+      const result = this.store.publishObjectiveArtifact(artifact, { requestKey, fingerprint });
+      if (result.status === "committed") {
+        this.appendObjectiveEvent("objective.artifact.published", run, actor, {
+          objectiveId: run.objectiveId,
+          artifactId: result.artifact.id,
+          hash: result.artifact.hash,
+          kind: result.artifact.kind,
+          name: result.artifact.name,
+          mediaType: result.artifact.mediaType,
+          sizeBytes: result.artifact.sizeBytes,
+          planRevision: result.artifact.planRevision,
+          evidence: result.artifact.evidence,
+          supersedes: result.artifact.supersedes,
+        });
+        for (const review of result.superseded) this.appendObjectiveEvent("objective.artifact.superseded", run, review.actor, {
+          objectiveId: run.objectiveId,
+          artifactId: review.artifactId,
+          supersededBy: result.artifact.id,
+          reason: review.reason,
+        });
+      }
+      return { ...result, reviews: result.superseded } as unknown as JsonValue;
+    });
+  }
+
+  private reviewObjectiveArtifact(request: IncomingMessage, runId: string, artifactId: string, payload: unknown): JsonValue {
+    return this.objectiveCommandLedger(request, runId, "objective.artifact.review", {
+      artifactId,
+      payload,
+    }, ({ requestKey, run, actor }) => {
+      const { actor: authorityActor } = this.objectiveArtifactAuthority(request, run, "review objective artifacts");
+      let parsed: z.infer<typeof ObjectiveArtifactReviewRequestSchema>;
+      try {
+        parsed = ObjectiveArtifactReviewRequestSchema.parse({ ...(payload as Record<string, unknown>), artifactId });
+      } catch {
+        throw new HttpError(400, "Invalid objective artifact review request.");
+      }
+      const reviewRetryFingerprint = createHash("sha256").update(stableJsonStringify({ artifactId, state: parsed.state, reason: parsed.reason })).digest("hex");
+      if (!run.policy || !run.policyHash || !isObjectivePolicyHashValid(run.policy) || run.policy.policyHash !== run.policyHash) {
+        throw new HttpError(409, "Objective artifact review requires a valid immutable objective policy.");
+      }
+      if (run.policy.expiresAt !== null && Date.parse(run.policy.expiresAt) <= Date.now()) throw new HttpError(409, "Objective artifact policy has expired.");
+      const artifact = this.store.getObjectiveArtifact(artifactId);
+      if (!artifact || artifact.runId !== runId) throw new HttpError(404, `Objective artifact not found: ${artifactId}`);
+      const review = ObjectiveArtifactReviewRecordSchema.parse({
+        version: 1,
+        id: `artifact-review-${createHash("sha256").update(`${artifactId}\u0000${requestKey}`).digest("hex")}`,
+        artifactId,
+        objectiveId: run.objectiveId,
+        runId,
+        fromState: artifact.reviewState,
+        state: parsed.state,
+        actor: authorityActor,
+        reason: parsed.reason,
+        requestKey,
+        createdAt: nowIso(),
+      });
+      try {
+        const result = this.store.reviewObjectiveArtifact(review, { fingerprint: reviewRetryFingerprint });
+        if (result.status === "committed" && result.review) this.appendObjectiveEvent(`objective.artifact.${result.review.state}`, run, authorityActor, {
+          objectiveId: run.objectiveId,
+          artifactId,
+          state: result.review.state,
+          reason: result.review.reason,
+          reviewId: result.review.id,
+        });
+        return { status: "committed", result: result as unknown as JsonValue };
+      } catch (error) {
+        throw new HttpError(409, error instanceof Error ? error.message : "Objective artifact review could not be committed.");
+      }
+    }, undefined, "Objective artifact review idempotency conflict.");
+  }
+
+  private objectiveControlNodeExists(node: unknown, id: string): boolean {
+    if (!node || typeof node !== "object") return false;
+    const candidate = node as Record<string, unknown>;
+    if (candidate.id === id) return true;
+    for (const key of ["steps", "then", "else"]) {
+      const children = candidate[key];
+      if (Array.isArray(children) && children.some((child) => this.objectiveControlNodeExists(child, id))) return true;
+    }
+    return false;
+  }
+
+  private workspacePathWithin(candidate: string, grant: string): boolean {
+    const candidatePath = resolve(candidate);
+    const grantPath = resolve(grant);
+    const rel = relative(grantPath, candidatePath);
+    return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+  }
+
+  private objectiveCaller(request: IncomingMessage): AgentRecord | null {
+    const callerId = request.headers["x-symphony-agent-id"];
+    if (callerId === undefined) return null;
+    const token = request.headers["x-symphony-agent-token"];
+    if (typeof callerId !== "string" || typeof token !== "string") {
+      throw new HttpError(401, "Invalid agent coordination token");
+    }
+    const caller = this.store.getAgent(callerId);
+    if (!caller || !this.agents.authenticate(callerId, token)) {
+      throw new HttpError(401, "Invalid agent coordination token");
+    }
+    return caller;
+  }
+
+  private objectiveVisibleToRequest(request: IncomingMessage, run: ObjectiveRunRecord): boolean {
+    const caller = this.objectiveCaller(request);
+    if (!caller) return true;
+    const linkedAgentIds = new Set<string>();
+    if (run.conductorAgentId) linkedAgentIds.add(run.conductorAgentId);
+    for (const task of run.tasks) if (task.agentId) linkedAgentIds.add(task.agentId);
+    // Include materialized run agents as a compatibility path while task
+    // projections catch up after a restart or an in-flight assignment.
+    for (const agent of this.store.listAgents({ runId: run.runId, limit: 2_000 })) linkedAgentIds.add(agent.id);
+    return [...linkedAgentIds]
+      .map((agentId) => this.store.getAgent(agentId))
+      .some((agent): agent is AgentRecord => Boolean(agent && this.sharesAgentRoot(caller, agent)));
+  }
+
+  private requireObjectiveAccess(request: IncomingMessage, run: ObjectiveRunRecord, action: string): void {
+    if (!this.objectiveVisibleToRequest(request, run)) {
+      throw new HttpError(403, `An authenticated agent may ${action} only objectives in its root lineage.`);
+    }
+  }
+
+  /**
+   * Resolve workflow identity before ObjectiveRuntime admission. Registered
+   * workflows are content-addressed durable records; an API caller may select
+   * an existing revision but cannot supply a substitute hash. The only
+   * unregistered exception is the explicit manual identity emitted by the
+   * objective entry UI, derived from the objective id and fixed at revision 1.
+   */
+  private resolveObjectiveWorkflowIdentity(
+    parsed: z.infer<typeof ObjectiveCreateInputSchema>,
+    objectiveId: string,
+    caller: AgentRecord | null,
+  ): { workflowId: string; workflowRevision: number; workflowHash: string } {
+    const requestedWorkflowId = caller?.workflowId ?? parsed.workflowId;
+    if (!requestedWorkflowId) throw new HttpError(400, "Objective creation requires a workflow identity.");
+
+    // A stored workflow id is authoritative even when a caller asks for a
+    // revision that does not exist. Do not fall through to the manual rule.
+    const latestStored = this.store.getWorkflow(requestedWorkflowId);
+    if (latestStored) {
+      const stored = this.store.getWorkflow(requestedWorkflowId, parsed.workflowRevision);
+      if (!stored) {
+        throw new HttpError(409, `Workflow ${requestedWorkflowId} revision ${parsed.workflowRevision} is not registered.`);
+      }
+      if (stored.hash !== parsed.workflowHash) {
+        throw new HttpError(409, `Workflow ${requestedWorkflowId} revision ${stored.revision} hash does not match the stored workflow.`);
+      }
+      return { workflowId: stored.id, workflowRevision: stored.revision, workflowHash: stored.hash };
+    }
+
+    // Native callers may be operating against a legacy, unregistered
+    // workflow run. Preserve that compatibility path, but never grant it to
+    // a local user: local admission has one documented standalone identity.
+    if (caller) {
+      const lineage = this.store.getRun(caller.runId);
+      if (lineage?.workflowId === requestedWorkflowId) {
+        const lineageWorkflow = this.store.getWorkflow(requestedWorkflowId, lineage.workflowRevision);
+        if (lineageWorkflow) {
+          if (lineageWorkflow.hash !== parsed.workflowHash || lineageWorkflow.revision !== parsed.workflowRevision) {
+            throw new HttpError(409, `Workflow ${requestedWorkflowId} revision/hash does not match the caller's stored workflow lineage.`);
+          }
+          return { workflowId: lineageWorkflow.id, workflowRevision: lineageWorkflow.revision, workflowHash: lineageWorkflow.hash };
+        }
+      }
+      return {
+        workflowId: requestedWorkflowId,
+        workflowRevision: parsed.workflowRevision,
+        workflowHash: parsed.workflowHash,
+      };
+    }
+
+    const standalone = standaloneObjectiveWorkflowIdentity(objectiveId);
+    if (
+      requestedWorkflowId !== standalone.workflowId
+      || parsed.workflowRevision !== standalone.workflowRevision
+      || parsed.workflowHash !== standalone.workflowHash
+    ) {
+      throw new HttpError(
+        409,
+        `Unregistered objectives must use the explicit standalone workflow identity ${standalone.workflowId}@${standalone.workflowRevision}.`,
+      );
+    }
+    return standalone;
+  }
+
+  /**
+   * Bind a supplied conductor to a coherent, usable agent authority. A local
+   * user has no ambient agent capability, so the pointer itself must prove a
+   * valid root/lineage, workflow relationship, and workspace grant. An
+   * authenticated agent may only nominate itself and must remain in its own
+   * tree. Active statuses are admitted while a conductor is running; terminal
+   * or idle conductors are admitted only when the coordinator still holds a
+   * reusable native session.
+   */
+  private validateObjectiveConductor(
+    requestedConductorAgentId: string | null,
+    caller: AgentRecord | null,
+    workflowId: string,
+    objectiveWorkspace: WorkspaceSpec | null,
+  ): string | null {
+    if (caller && requestedConductorAgentId !== null && requestedConductorAgentId !== caller.id) {
+      throw new HttpError(403, "An authenticated objective caller may only bind itself as conductor.");
+    }
+    const conductorAgentId = caller?.id ?? requestedConductorAgentId;
+    if (!conductorAgentId) return null;
+    const conductor = this.store.getAgent(conductorAgentId);
+    if (!conductor) throw new HttpError(409, `Objective conductor agent not found: ${conductorAgentId}.`);
+    if (caller && !this.sharesAgentRoot(caller, conductor)) {
+      throw new HttpError(403, "Objective conductor must remain inside the authenticated caller's root lineage.");
+    }
+
+    const root = this.agentRoot(conductor);
+    if (!root || root.id !== conductor.id || root.workflowId !== conductor.workflowId || root.runId !== conductor.runId) {
+      throw new HttpError(409, "Objective conductor has an invalid root lineage.");
+    }
+
+    // A conductor normally comes from a chat workflow while the objective is
+    // pinned to a saved/manual workflow. A non-chat conductor must instead be
+    // on that exact workflow; this prevents a foreign workflow root from
+    // being attached merely because an id was supplied.
+    if (conductor.workflowId !== workflowId && !conductor.workflowId.startsWith("chat:")) {
+      throw new HttpError(403, "Objective conductor is not bound to the requested workflow.");
+    }
+
+    const active = ["queued", "routing", "starting", "running", "waiting"].includes(conductor.status);
+    const reusable = ["idle", "completed"].includes(conductor.status) && this.agents.hasSession(conductor.id);
+    if (!active && !reusable) {
+      throw new HttpError(409, "Objective conductor is not live or backed by a reusable native session.");
+    }
+
+    try {
+      const conductorWorkspace = this.agentWorkspaceGrant(conductor);
+      if (objectiveWorkspace && conductorWorkspace) {
+        this.childWorkspaceGrant(conductorWorkspace, objectiveWorkspace);
+      }
+    } catch (error) {
+      if (error instanceof HttpError) {
+        throw new HttpError(403, `Objective conductor workspace is not eligible: ${error.message}`);
+      }
+      throw error;
+    }
+    return conductor.id;
+  }
+
+  /**
+   * Check the immutable author pointer before probing conductor liveness. A
+   * malformed conductor-authored plan must be rejected as an authority
+   * violation even if the nominated conductor has since gone idle; otherwise
+   * a forged author can be misclassified as a transient 409 and the caller can
+   * learn lifecycle state that is irrelevant to its authorization.
+   */
+  private validateRequestedControlPlanAuthor(
+    requestedPlan: ObjectiveControlPlan | null,
+    requestedConductorAgentId: string | null,
+    caller: AgentRecord | null,
+  ): void {
+    if (!requestedPlan || requestedPlan.source.kind !== "conductor-authored") return;
+    if (
+      requestedConductorAgentId === null
+      || requestedPlan.source.authorAgentId !== requestedConductorAgentId
+      || (caller !== null && caller.id !== requestedConductorAgentId)
+    ) {
+      throw new HttpError(403, "Conductor-authored control plans must be bound to the authenticated attached conductor.");
+    }
+  }
+
+  /**
+   * Control-plan admission is a security boundary, not a client-side hint.
+   * Workflow-backed plans must exactly match the daemon's compilation of the
+   * immutable stored workflow revision. Conductor-authored plans instead bind
+   * to the authenticated attached conductor and still inherit node authority
+   * limits before entering ObjectiveRuntime.
+   */
+  private validateObjectiveControlPlanAdmission(
+    requestedPlan: ObjectiveControlPlan | null,
+    workflow: { workflowId: string; workflowRevision: number; workflowHash: string },
+    conductorAgentId: string | null,
+    caller: AgentRecord | null,
+    authority: ObjectiveRuntimeAuthority,
+    policy: ObjectivePolicyRequest | undefined,
+  ): ObjectiveControlPlan | null {
+    if (!requestedPlan) return null;
+    const plan = ObjectiveControlPlanSchema.parse(requestedPlan);
+    if (plan.source.kind === "workflow-revision") {
+      const stored = this.store.getWorkflow(workflow.workflowId, workflow.workflowRevision);
+      if (!stored) {
+        throw new HttpError(409, `Cannot admit a workflow-backed control plan without stored workflow ${workflow.workflowId}@${workflow.workflowRevision}.`);
+      }
+      const compiledWorkflow = new WorkflowCompiler().compile(stored.definition, stored.revision);
+      if (compiledWorkflow.hash !== stored.hash || compiledWorkflow.hash !== workflow.workflowHash) {
+        throw new HttpError(409, `Stored workflow ${workflow.workflowId}@${workflow.workflowRevision} failed its immutable hash check.`);
+      }
+      let canonical: ObjectiveControlPlan;
+      try {
+        canonical = compileObjectiveControlPlan(compiledWorkflow, {
+          defaultMaxLoopIterations: this.loaded.config.workflows.maxLoopIterations,
+        });
+      } catch (error) {
+        throw new HttpError(409, `Stored workflow ${workflow.workflowId}@${workflow.workflowRevision} cannot produce a control plan: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (stableJson(plan) !== stableJson(canonical)) {
+        throw new HttpError(409, "Workflow-backed control plans must equal the daemon-derived immutable workflow plan.");
+      }
+    } else {
+      const conductor = conductorAgentId === null ? null : this.store.getAgent(conductorAgentId);
+      if (
+        conductor === null
+        || plan.source.authorAgentId !== conductorAgentId
+        || (caller !== null && caller.id !== conductorAgentId)
+        || (plan.source.sessionId !== null && plan.source.sessionId !== conductor.nativeSessionId)
+      ) {
+        throw new HttpError(403, "Conductor-authored control plans must be bound to the authenticated attached conductor session.");
+      }
+    }
+
+    // Runtime admission intersects the request with the authenticated
+    // authority and daemon-wide policy. Mirror that intersection before the
+    // plan reaches storage; otherwise a caller could submit a full-access
+    // control tree while the global ceiling is read-only (or while its own
+    // native token is read-only) and rely on the flat-task checks to miss it.
+    const globalPolicy = this.objectiveGlobalPolicyCeiling();
+    const permissionCeiling = [
+      authority.permissionCeiling,
+      authority.policy?.effectivePermission,
+      globalPolicy.effectivePermission,
+      policy?.effectivePermission,
+    ].includes("read-only")
+      ? "read-only"
+      : "full-access";
+    const allowedCapabilities = (authority.allowedCapabilities ?? []).filter(
+      (capability) => policy?.allowedCapabilities === undefined || policy.allowedCapabilities.includes(capability),
+    );
+    const visit = (node: ObjectiveControlNode): void => {
+      if (node.type === "agent") {
+        if (node.permissions === "full-access" && permissionCeiling !== "full-access") {
+          throw new HttpError(403, `Control node ${node.id} requests full-access above the objective authority ceiling.`);
+        }
+        for (const capability of node.capabilities ?? []) {
+          if (!allowedCapabilities.includes(capability)) {
+            throw new HttpError(403, `Control node ${node.id} requests unavailable capability ${capability}.`);
+          }
+        }
+        if (node.workspace) {
+          if (!authority.workspace) throw new HttpError(403, `Control node ${node.id} requests a workspace without an objective grant.`);
+          this.childWorkspaceGrant(authority.workspace, node.workspace);
+        }
+      }
+      if (node.type === "sequence" || node.type === "parallel" || node.type === "while") node.steps.forEach(visit);
+      else if (node.type === "if") {
+        node.then.forEach(visit);
+        node.else?.forEach(visit);
+      }
+    };
+    visit(plan.root);
+    return plan;
+  }
+
+  private createObjective(request: IncomingMessage, payload: unknown): ObjectiveRunRecord {
+    const requestKey = this.requireIdempotencyKey(request);
+    const parsed = ObjectiveCreateInputSchema.parse(payload);
+    const caller = this.objectiveCaller(request);
+    if (parsed.objectiveId !== undefined && parsed.objectiveId !== parsed.spec.id) {
+      throw new HttpError(400, "Objective id must match spec.id.");
+    }
+    // ObjectiveSpec is the canonical intent identity. Always pass the same
+    // value downstream, including when an older caller omitted objectiveId.
+    const objectiveId = parsed.spec.id;
+    const workflow = this.resolveObjectiveWorkflowIdentity(parsed, objectiveId, caller);
+    const workspaceGrant = this.objectiveWorkspaceGrantForCreate(parsed, caller);
+    this.validateRequestedControlPlanAuthor(parsed.controlPlan ?? null, parsed.conductorAgentId ?? null, caller);
+    const conductorAgentId = this.validateObjectiveConductor(
+      parsed.conductorAgentId ?? null,
+      caller,
+      workflow.workflowId,
+      workspaceGrant,
+    );
+    const tasks = this.normalizeObjectiveTasks(parsed.tasks ?? [], workspaceGrant, caller);
+    const authority = this.objectiveAuthority(caller, this.effectiveWorkspaceGrant(workspaceGrant, caller));
+    const controlPlan = this.validateObjectiveControlPlanAdmission(
+      parsed.controlPlan ?? null,
+      workflow,
+      conductorAgentId,
+      caller,
+      authority,
+      parsed.policy,
+    );
+
+    // A caller may retry or choose a stable run ID, but an agent may never
+    // use creation as a way to attach itself to an unrelated objective tree.
+    const existingByKey = this.store.getObjectiveRunByRequestKey(requestKey);
+    if (caller && existingByKey) this.requireObjectiveAccess(request, existingByKey, "create an objective");
+    if (caller && parsed.runId) {
+      const existingByRunId = this.store.getObjectiveRun(parsed.runId);
+      if (existingByRunId) this.requireObjectiveAccess(request, existingByRunId, "create an objective");
+    }
+
+    return this.store.durableTransaction(() => {
+      // Select or append the immutable objective mission revision while the
+      // same SQLite transaction also admits the run and occurrence. A crash
+      // cannot leave an aggregate revision without its run or vice versa.
+      const objectiveRevision = this.objectiveRevisionForCreate(
+        objectiveId,
+        parsed.spec,
+        workspaceGrant,
+        parsed.policy ?? null,
+        authority.actor,
+        requestKey,
+      );
+      const input: ObjectiveCreateInput = {
+        ...(parsed.runId !== undefined ? { runId: parsed.runId } : {}),
+        objectiveId,
+        objectiveRevision,
+        ...(parsed.tasks !== undefined ? { tasks } : {}),
+        ...(parsed.context !== undefined ? { context: parsed.context } : {}),
+        // Workflow identity and the conductor pointer are capability data,
+        // never agent-authored fields. Preserve the caller's current workflow
+        // lineage even when a hostile body supplies another workflow or pointer.
+        workflowId: workflow.workflowId,
+        workflowRevision: workflow.workflowRevision,
+        workflowHash: workflow.workflowHash,
+        conductorAgentId,
+        workspace: workspaceGrant,
+        ...(parsed.policy !== undefined ? { policy: parsed.policy } : {}),
+        ...(controlPlan !== null ? { controlPlan } : {}),
+        spec: parsed.spec,
+        requestKey,
+      };
+      const replayed = this.objectiveRepository.getObjectiveActionReceipt(requestKey);
+      const run = this.objectiveRuntime.create(input, authority);
+      if (workspaceGrant) this.saveObjectiveWorkspaceGrant(run.runId, workspaceGrant, caller);
+      this.saveObjectiveRunOccurrence(run, parsed.occurrence, authority.actor);
+      if (!replayed) {
+        this.appendObjectiveEvent("objective.created", run, authority.actor, {
+          objectiveId: run.objectiveId,
+          requestKey,
+          workflowRevision: run.workflowRevision,
+          workflowHash: run.workflowHash,
+          conductorAgentId: run.conductorAgentId,
+          state: run.state,
+        });
+        const revision = this.store.getObjectiveRevision(run.objectiveId, run.objectiveRevision ?? objectiveRevision);
+        if (revision?.requestKey === requestKey) {
+          this.appendObjectiveEvent("objective.revision.accepted", run, authority.actor, {
+            objectiveId: run.objectiveId,
+            requestKey,
+            revision: revision.revision,
+            revisionId: revision.id,
+          });
+        }
+        this.appendObjectiveApprovalRequestedEvent(null, run, authority.actor);
+      }
+      return run;
+    });
+  }
+
+  /** Select an existing mission revision or append one under the aggregate CAS. */
+  private objectiveRevisionForCreate(
+    objectiveId: string,
+    spec: z.infer<typeof ObjectiveSpecSchema>,
+    workspace: WorkspaceSpec | null,
+    policy: ObjectivePolicyRequest | null,
+    actor: ObjectiveActor,
+    requestKey: string,
+  ): number {
+    const existing = this.store.getObjectiveAggregate(objectiveId);
+    const now = nowIso();
+    if (!existing) {
+      const aggregate = ObjectiveAggregateRecordSchema.parse({
+        version: 1,
+        id: `objective:${objectiveId}`,
+        objectiveId,
+        activeRevision: 1,
+        spec,
+        statement: spec.statement,
+        criteria: spec.criteria,
+        policy,
+        state: "active",
+        latestRunId: null,
+        latestOutcome: null,
+        workspace,
+        createdAt: now,
+        updatedAt: now,
+      });
+      this.store.saveObjectiveAggregate(aggregate);
+      const revision = ObjectiveRevisionRecordSchema.parse({
+        version: 1,
+        id: `objective-revision:${objectiveId}:1`,
+        objectiveId,
+        revision: 1,
+        spec,
+        workspace,
+        createdBy: actor,
+        requestKey,
+        createdAt: now,
+      });
+      this.store.saveObjectiveRevision(revision);
+      return 1;
+    }
+
+    if (stableJsonStringify(existing.workspace) !== stableJsonStringify(workspace)) {
+      throw new HttpError(409, `Objective ${objectiveId} has an immutable workspace grant.`);
+    }
+    const current = this.store.getObjectiveRevision(objectiveId, existing.activeRevision);
+    if (current && stableJsonStringify({ spec, workspace }) === stableJsonStringify({ spec: current.spec, workspace: current.workspace })) {
+      return existing.activeRevision;
+    }
+    const nextRevision = existing.activeRevision + 1;
+    const revision = ObjectiveRevisionRecordSchema.parse({
+      version: 1,
+      id: `objective-revision:${objectiveId}:${nextRevision}`,
+      objectiveId,
+      revision: nextRevision,
+      spec,
+      workspace,
+      createdBy: actor,
+      requestKey,
+      createdAt: now,
+    });
+    try {
+      this.store.saveObjectiveRevision(revision);
+    } catch (error) {
+      throw new HttpError(409, error instanceof Error ? error.message : "Objective revision could not be committed.");
+    }
+    this.store.saveObjectiveAggregate({
+      ...existing,
+      activeRevision: nextRevision,
+      spec,
+      statement: spec.statement,
+      criteria: spec.criteria,
+      policy,
+      state: existing.state === "abandoned" || existing.state === "superseded" ? "active" : existing.state,
+      updatedAt: now,
+    });
+    return nextRevision;
+  }
+
+  /** Materialize the causal run occurrence after run identity is known. */
+  private saveObjectiveRunOccurrence(
+    run: ObjectiveRunRecord,
+    requested: ObjectiveRunOccurrenceInput | undefined,
+    actor: ObjectiveActor,
+  ): void {
+    const input = requested ?? {};
+    const parsed = ObjectiveRunOccurrenceInputSchema.parse(input);
+    const checkRelated = (id: string | null | undefined, label: string): void => {
+      if (!id) return;
+      const related = this.store.getObjectiveRunOccurrenceById(id);
+      if (related && related.objectiveId !== run.objectiveId) throw new HttpError(403, `${label} belongs to another objective.`);
+    };
+    checkRelated(parsed.parentOccurrenceId, "Parent occurrence");
+    checkRelated(parsed.forkedFromOccurrenceId, "Fork source occurrence");
+    checkRelated(parsed.supersedesOccurrenceId, "Superseded occurrence");
+    for (const [value, label] of [[parsed.parentRunId, "Parent run"], [parsed.forkedFromRunId, "Fork source run"], [parsed.supersedesRunId, "Superseded run"]] as const) {
+      if (!value) continue;
+      const related = this.store.getObjectiveRun(value);
+      if (related && related.objectiveId !== run.objectiveId) throw new HttpError(403, `${label} belongs to another objective.`);
+    }
+    const occurrence = ObjectiveRunOccurrenceRecordSchema.parse({
+      version: 1,
+      id: `objective-occurrence:${run.runId}`,
+      objectiveId: run.objectiveId,
+      runId: run.runId,
+      objectiveRevision: run.objectiveRevision ?? this.store.getObjectiveAggregate(run.objectiveId)?.activeRevision ?? 1,
+      kind: parsed.kind,
+      occurrenceKey: parsed.occurrenceKey ?? null,
+      triggerId: parsed.triggerId ?? null,
+      parentOccurrenceId: parsed.parentOccurrenceId ?? null,
+      parentRunId: parsed.parentRunId ?? null,
+      forkedFromOccurrenceId: parsed.forkedFromOccurrenceId ?? null,
+      forkedFromRunId: parsed.forkedFromRunId ?? null,
+      supersedesOccurrenceId: parsed.supersedesOccurrenceId ?? null,
+      supersedesRunId: parsed.supersedesRunId ?? null,
+      input: parsed.input ?? run.context,
+      outcome: objectiveOccurrenceOutcomeFromRunState(run.state),
+      output: run.output,
+      error: run.error,
+      scheduledAt: parsed.scheduledAt ?? null,
+      startedAt: run.startedAt,
+      finishedAt: run.finishedAt,
+      createdAt: run.createdAt,
+      updatedAt: run.updatedAt,
+    });
+    this.store.saveObjectiveRunOccurrence(occurrence);
+    // A supersede edge is also reflected on the prior occurrence. This is a
+    // history projection only; the old ObjectiveRunRecord remains immutable.
+    if (occurrence.supersedesOccurrenceId || occurrence.supersedesRunId) {
+      const prior = occurrence.supersedesOccurrenceId
+        ? this.store.getObjectiveRunOccurrenceById(occurrence.supersedesOccurrenceId)
+        : occurrence.supersedesRunId ? this.store.getObjectiveRunOccurrence(occurrence.supersedesRunId) : null;
+      if (prior && prior.objectiveId === run.objectiveId && prior.outcome !== "superseded") {
+        this.store.markObjectiveRunOccurrenceSuperseded(prior.id, run.updatedAt);
+      }
+    }
+  }
+
+  private objectiveAggregateSnapshot(request: IncomingMessage, objectiveId: string): JsonValue {
+    const runs = this.store.listObjectiveRuns({ objectiveId, limit: 2_000 });
+    const caller = this.objectiveCaller(request);
+    if (caller && !runs.some((run) => this.objectiveVisibleToRequest(request, run))) {
+      throw new HttpError(403, "An authenticated agent may read only objectives in its root lineage.");
+    }
+    const snapshot = this.store.objectiveAggregateSnapshot(objectiveId);
+    if (!snapshot) throw new HttpError(404, `Objective not found: ${objectiveId}`);
+    // The store snapshot is one SQLite-fenced input bundle. Projecting after
+    // the read keeps workflow pure and avoids a storage -> workflow cycle;
+    // every child projection receives the same eventCursor from this bundle.
+    const projected = projectObjectiveAggregateSnapshot(snapshot);
+    const feedback = this.capabilityResultFeedback.objectiveSnapshot(objectiveId);
+    return ObjectiveAggregateSnapshotSchema.parse({
+      ...snapshot,
+      ...projected,
+      capabilityResultFeedback: feedback,
+    }) as unknown as JsonValue;
+  }
+
+  private commitObjectivePlan(request: IncomingMessage, runId: string, payload: unknown): ObjectiveRunRecord {
+    const requestKey = this.requireIdempotencyKey(request);
+    const parsed = ObjectivePlanInputSchema.parse(payload);
+    const { run, caller } = this.objectiveMutationContext(request, runId, "mutate");
+    const existingGrant = this.objectiveWorkspaceGrant(run.runId);
+    const workspaceGrant = existingGrant ?? this.objectiveWorkspaceGrantForPlan(parsed.tasks, caller);
+    const tasks = this.normalizeObjectiveTasks(parsed.tasks, workspaceGrant, caller);
+    const authority = this.objectiveAuthority(caller, this.effectiveWorkspaceGrant(workspaceGrant, caller));
+    return this.store.durableTransaction(() => {
+      const replayed = this.objectiveRepository.getObjectiveActionReceipt(requestKey);
+      const planInput: ObjectivePlanCommitInput = {
+        expectedPlanRevision: parsed.expectedPlanRevision,
+        tasks,
+        ...(parsed.reason !== undefined ? { reason: parsed.reason } : {}),
+        ...(parsed.policyHash !== undefined
+          ? { policyHash: parsed.policyHash }
+          : run.policyHash
+            ? { policyHash: run.policyHash }
+            : {}),
+        requestKey,
+      };
+      const next = this.objectiveRuntime.commitPlan(runId, planInput, authority);
+      if (!existingGrant && workspaceGrant) this.saveObjectiveWorkspaceGrant(run.runId, workspaceGrant, caller);
+      if (!replayed) {
+        this.appendObjectiveEvent("objective.plan.committed", next, authority.actor, {
+          objectiveId: next.objectiveId,
+          requestKey,
+          previousPlanRevision: run.activePlanRevision,
+          planRevision: next.activePlanRevision,
+          taskIds: next.tasks.slice(run.tasks.length).map((record) => record.task.id),
+          state: next.state,
+          reason: parsed.reason ?? null,
+        });
+        this.appendObjectiveApprovalRequestedEvent(run, next, authority.actor);
+      }
+      return next;
+    });
+  }
+
+  private commitObjectiveCheckpoint(request: IncomingMessage, runId: string, payload: unknown): ObjectiveRunRecord {
+    const requestKey = this.requireIdempotencyKey(request);
+    const parsed = ObjectiveCheckpointInputSchema.parse(payload);
+    const { run, authority } = this.objectiveMutationContext(request, runId, "checkpoint");
+    return this.store.durableTransaction(() => {
+      const replayed = this.objectiveRepository.getObjectiveActionReceipt(requestKey);
+      // A cursor is a durable high-water mark, not a caller-supplied claim
+      // about the future. Validate it while the write transaction is held so
+      // a terminal event cannot race this checkpoint after the proof below.
+      if (parsed.eventCursor > this.store.latestCursor()) {
+        throw new ObjectiveRuntimeError(
+          `Objective checkpoint event cursor ${parsed.eventCursor} is ahead of the durable event high-water mark.`,
+          "revision-conflict",
+        );
+      }
+      const terminalEvidence = this.assertPublicObjectiveCheckpointEvidence(
+        this.store.getObjectiveRun(runId) ?? run,
+        parsed.taskUpdates ?? [],
+        parsed.eventCursor,
+      );
+      const evidenceEventIds = Object.values(terminalEvidence).flat();
+      // Objective context is the existing durable place for evidence that is
+      // not tied to a single criterion. Preserve the caller's context while
+      // writing only event IDs returned by the durable evidence query.
+      const checkpointContext = evidenceEventIds.length > 0
+        ? {
+            ...(parsed.context ?? {}),
+            evidence: { eventCursor: parsed.eventCursor, eventIds: evidenceEventIds },
+          }
+        : parsed.context;
+      const checkpointInput: ObjectiveCheckpointInput = {
+        eventCursor: parsed.eventCursor,
+        ...(parsed.policyHash !== undefined
+          ? { policyHash: parsed.policyHash }
+          : run.policyHash
+            ? { policyHash: run.policyHash }
+            : {}),
+        ...(checkpointContext !== undefined ? { context: checkpointContext } : {}),
+        ...(parsed.taskUpdates !== undefined
+          ? {
+              taskUpdates: parsed.taskUpdates.map((update) => ({
+                taskId: update.taskId,
+                state: update.state,
+                ...(update.attemptId !== undefined ? { attemptId: update.attemptId } : {}),
+                ...(update.agentId !== undefined ? { agentId: update.agentId } : {}),
+                ...(update.output !== undefined ? { output: update.output } : {}),
+                ...(update.error !== undefined ? { error: update.error } : {}),
+                ...(update.startedAt !== undefined ? { startedAt: update.startedAt } : {}),
+                ...(update.finishedAt !== undefined ? { finishedAt: update.finishedAt } : {}),
+              })),
+            }
+          : {}),
+        reason: parsed.reason,
+        requestKey,
+        ...this.deriveObjectiveCheckpointEvidence(run, authority, parsed.eventCursor, evidenceEventIds),
+      };
+      const next = this.objectiveRuntime.checkpoint(runId, checkpointInput, authority);
+      const committedCheckpoint = next.latestCheckpointId ? this.store.getObjectiveCheckpoint(runId, next.latestCheckpointId) : null;
+      if (!committedCheckpoint || !ObjectivePortableCheckpointRecordSchema.safeParse(committedCheckpoint).success) {
+        throw new HttpError(409, "Objective checkpoint did not commit a complete portable recovery boundary.");
+      }
+      if (!replayed) {
+        this.appendObjectiveEvent("objective.checkpoint.committed", next, authority.actor, {
+          objectiveId: next.objectiveId,
+          requestKey,
+          checkpointId: next.latestCheckpointId,
+          eventCursor: parsed.eventCursor,
+          planRevision: next.activePlanRevision,
+          state: next.state,
+          reason: parsed.reason,
+          continuity: committedCheckpoint.continuity ?? { status: "unknown", capabilities: [], reason: "Unavailable" },
+          artifactHashes: committedCheckpoint.artifactHashes ?? [],
+          ...(Object.keys(terminalEvidence).length > 0
+            ? {
+                evidenceEventIds,
+                evidenceByTask: terminalEvidence,
+              }
+            : {}),
+        });
+        this.appendObjectiveApprovalRequestedEvent(run, next, authority.actor);
+      }
+      return next;
+    });
+  }
+
+  private deriveObjectiveCheckpointEvidence(
+    run: ObjectiveRunRecord,
+    authority: ObjectiveRuntimeAuthority,
+    eventCursor: number,
+    evidenceEventIds: readonly string[] = [],
+  ): Pick<ObjectiveCheckpointInput, "objectiveRevision" | "workflowRevision" | "workflowHash" | "controlPlanRevision" | "controlPlanHash" | "artifactHashes" | "workspaceEvidence" | "nativeSessions" | "continuity" | "unresolvedExternalOperations" | "policySnapshotHash" | "configSnapshotHash" | "attemptHighWater" | "eventHighWater" | "provenance"> {
+    const controlHead = this.store.getObjectiveControlHead(run.runId);
+    const controlRevision = controlHead ? this.store.getObjectiveControlPlanRevision(run.runId, controlHead.activeRevision) : null;
+    const artifactHashes = this.store.listObjectiveArtifacts({ runId: run.runId, limit: 2_000 }).map((artifact) => ({ id: artifact.id, hash: artifact.hash }));
+    const nativeSessions: NonNullable<ObjectiveCheckpointRecord["nativeSessions"]> = [];
+    for (const task of run.tasks) {
+      if (!task.agentId) continue;
+      const agent = this.store.getAgent(task.agentId);
+      if (!agent) continue;
+      const lease = this.store.listWorkerProcessLeases({ agentId: agent.id }).at(-1) ?? null;
+      const strongTransport = lease?.transport.kind === "worker-host"
+        && lease.transport.hostIdentity?.verification === "strong"
+        && lease.transport.workerIdentity?.verification === "strong";
+      const proven = Boolean(agent.nativeSessionId && strongTransport && ["running", "orphaned"].includes(lease?.state ?? ""));
+      nativeSessions.push({
+        agentId: agent.id,
+        attemptId: task.attemptId,
+        nativeSessionId: agent.nativeSessionId,
+        nativeRunId: agent.nativeRunId,
+        continuity: proven ? "proven" : "unknown",
+        continuityCapabilities: [
+          ...(agent.nativeSessionId ? ["native-session-id"] : []),
+          ...(strongTransport ? ["worker-host-adoption", "durable-event-replay"] : []),
+        ],
+        evidence: lease?.lastEventCursor === null || lease?.lastEventCursor === undefined ? [] : [`cursor:${lease.lastEventCursor}`],
+      });
+    }
+    const allProven = nativeSessions.length > 0 && nativeSessions.every((session) => session.continuity === "proven");
+    const continuity: NonNullable<ObjectiveCheckpointRecord["continuity"]> = {
+      status: allProven ? "proven" : "unknown",
+      capabilities: [...new Set(nativeSessions.flatMap((session) => session.continuityCapabilities))],
+      reason: allProven ? null : "At least one native session lacks strong retained transport/session continuity evidence.",
+    };
+    const workspace = authority.workspace ?? run.policy?.workspace ?? null;
+    const workspaceEvidence: NonNullable<ObjectiveCheckpointRecord["workspaceEvidence"]> = {
+      canonicalGrant: workspace,
+      git: captureGitWorkspaceEvidence(workspace?.path ?? null),
+      dirty: null,
+      patchHash: null,
+      worktree: null,
+    };
+    workspaceEvidence.dirty = workspaceEvidence.git.dirty;
+    workspaceEvidence.patchHash = workspaceEvidence.git.patchHash;
+    workspaceEvidence.worktree = workspaceEvidence.git.worktree;
+    const unresolvedExternalOperations: NonNullable<ObjectiveCheckpointInput["unresolvedExternalOperations"]> = this.store
+      .listObjectiveApprovals({ runId: run.runId, limit: 2_000 })
+      .filter((approval) => approval.status === "requested" && ["external", "irreversible"].includes(approval.sideEffectClass))
+      .map((approval) => ({
+        operationId: approval.operationId,
+        idempotencyKey: approval.requestKey,
+        requestHash: approval.requestHash,
+        receipt: null,
+        status: "unresolved" as const,
+      }));
+    const configSnapshotHash = createHash("sha256").update(stableJsonStringify(this.loaded.config)).digest("hex");
+    return {
+      objectiveRevision: run.objectiveRevision ?? 1,
+      workflowRevision: run.workflowRevision,
+      workflowHash: run.workflowHash,
+      controlPlanRevision: controlHead?.activeRevision ?? null,
+      controlPlanHash: controlRevision?.hash ?? null,
+      artifactHashes,
+      workspaceEvidence,
+      nativeSessions,
+      continuity,
+      unresolvedExternalOperations,
+      policySnapshotHash: run.policyHash ?? null,
+      configSnapshotHash,
+      attemptHighWater: eventCursor,
+      eventHighWater: eventCursor,
+      provenance: {
+        source: "daemon",
+        actor: authority.actor,
+        capturedAt: nowIso(),
+        evidenceEventIds: [...evidenceEventIds],
+        parentCheckpointId: run.latestCheckpointId,
+        baseCheckpointId: run.latestCheckpointId,
+      },
+    };
+  }
+
+  /** Read one checkpoint with an explicit portability/capability projection. */
+  private objectiveCheckpointDetail(request: IncomingMessage, runId: string, checkpointId: string): JsonValue {
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, "read an objective checkpoint");
+    const checkpoint = this.store.getObjectiveCheckpoint(runId, checkpointId);
+    if (!checkpoint) throw new HttpError(404, `Objective checkpoint not found: ${checkpointId}`);
+    const portable = ObjectivePortableCheckpointRecordSchema.safeParse(checkpoint);
+    return {
+      runId,
+      objectiveId: run.objectiveId,
+      checkpoint,
+      portable: portable.success,
+      capability: portable.success
+        ? portable.data.continuity ?? { status: "unknown", capabilities: [], reason: "Unavailable" }
+        : { status: "legacy", reason: "This checkpoint predates portable recovery evidence." },
+      commands: {
+        resume: portable.success && portable.data.continuity?.status === "proven",
+        retry: portable.success,
+        fork: portable.success,
+      },
+    } as unknown as JsonValue;
+  }
+
+  /**
+   * Offer an immutable, driver-neutral handoff at a committed checkpoint.
+   * Handoffs carry references to durable evidence and workspace state; they
+   * never copy a native transcript or claim that a process can be rewound.
+   */
+  private offerObjectiveHandoff(request: IncomingMessage, runId: string, payload: unknown): JsonValue {
+    const requestKey = this.requireIdempotencyKey(request);
+    const caller = this.objectiveCaller(request);
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, "offer an objective handoff");
+    this.requireFullAccessAgent(request, "offer an objective handoff");
+
+    let input: ObjectiveHandoffCreateInput;
+    try {
+      input = ObjectiveHandoffCreateInputSchema.parse(payload);
+    } catch {
+      throw new HttpError(400, "Invalid typed objective handoff request.");
+    }
+    const inputHash = objectiveHandoffReferenceHash(input);
+    const prior = this.store.getObjectiveHandoffByRequestKey(runId, requestKey);
+    if (prior) {
+      if (prior.inputHash !== inputHash) throw new HttpError(409, "Objective handoff request key is already bound to a different request.");
+      return {
+        status: "replayed",
+        envelope: prior,
+        acceptance: this.store.getObjectiveHandoffAcceptance(prior.id),
+        execution: null,
+      } as unknown as JsonValue;
+    }
+
+    const policy = run.policy;
+    if (!policy || !run.policyHash || !isObjectivePolicyHashValid(policy) || policy.policyHash !== run.policyHash || !/^[a-f0-9]{64}$/u.test(run.policyHash)) {
+      throw new HttpError(409, "Objective handoff requires a current, hash-verifiable objective policy.");
+    }
+    const checkpoint = this.requirePortableObjectiveCheckpoint(run, input.checkpointId);
+    if (!checkpoint.configSnapshotHash || !/^[a-f0-9]{64}$/u.test(checkpoint.configSnapshotHash)) {
+      throw new HttpError(409, "Objective handoff requires a hash-verifiable configuration snapshot reference.");
+    }
+    if (input.taskId !== undefined && input.taskId !== null) {
+      const task = run.tasks.find((candidate) => candidate.task.id === input.taskId);
+      if (!task) throw new HttpError(409, `Objective handoff task is not part of run ${runId}: ${input.taskId}`);
+      if (input.attemptId !== undefined && input.attemptId !== null && task.attemptId !== input.attemptId) {
+        throw new HttpError(409, `Objective handoff attempt does not match task ${input.taskId}.`);
+      }
+    }
+    if (input.nodeId !== undefined && input.nodeId !== null) {
+      const head = this.store.getObjectiveControlHead(runId);
+      const revision = head ? this.store.getObjectiveControlPlanRevision(runId, head.activeRevision) : null;
+      if (!revision || !this.objectiveControlNodeExists(revision.plan.root, input.nodeId)) {
+        throw new HttpError(409, `Objective handoff node is not part of the current control plan: ${input.nodeId}`);
+      }
+    }
+
+    const sourceTask = input.taskId === undefined || input.taskId === null
+      ? null
+      : run.tasks.find((candidate) => candidate.task.id === input.taskId) ?? null;
+    const sourceAgent = sourceTask?.agentId
+      ? this.store.getAgent(sourceTask.agentId)
+      : run.conductorAgentId
+        ? this.store.getAgent(run.conductorAgentId)
+        : caller;
+    if (!sourceAgent) throw new HttpError(409, "Objective handoff source has no durable native agent identity.");
+    // The caller was already authorized above. Keep the source binding
+    // explicit rather than inferring lineage from a transcript or label.
+    if (sourceAgent.runId !== runId || sourceAgent.workflowId !== run.workflowId) {
+      throw new HttpError(403, "Objective handoff source agent is outside this objective run.");
+    }
+    const sourceHarness = sourceAgent.harness ?? (sourceAgent.requestedHarness === "auto" ? null : sourceAgent.requestedHarness);
+    if (!sourceHarness) throw new HttpError(409, "Objective handoff source harness is unresolved; native continuity cannot be proven.");
+    const nativeSessions = checkpoint.nativeSessions ?? [];
+    const continuityEvidence = checkpoint.continuity ?? { status: "unknown" as const, capabilities: [], reason: "Unavailable" };
+    const sourceSession = nativeSessions.find((session) => session.agentId === sourceAgent.id) ?? null;
+    const continuityStatus = sourceSession?.continuity ?? "unknown";
+    const continuityCapabilities = sourceSession?.continuityCapabilities ?? continuityEvidence.capabilities;
+
+    const targetAgent = input.target.agentId ? this.store.getAgent(input.target.agentId) : null;
+    if (input.target.agentId && !targetAgent) throw new HttpError(409, `Objective handoff target agent not found: ${input.target.agentId}`);
+    if (targetAgent && (targetAgent.runId !== runId || (caller && !this.sharesAgentRoot(caller, targetAgent)))) {
+      throw new HttpError(403, "Objective handoff target agent is outside the objective root lineage.");
+    }
+    const targetHarness = targetAgent?.harness ?? (targetAgent?.requestedHarness === "auto" ? null : targetAgent?.requestedHarness) ?? input.target.harness;
+    if (!targetHarness || targetHarness !== input.target.harness) {
+      throw new HttpError(409, `Objective handoff target harness ${input.target.harness} is not the target agent's resolved harness.`);
+    }
+    const targetOrder = targetAgent
+      ? AgentWorkOrderSchema.safeParse(this.store.getMetadata<JsonValue>(`work-order:${targetAgent.id}`))
+      : null;
+    const availableCapabilities = targetOrder?.success && targetOrder.data.capabilities
+      ? targetOrder.data.capabilities
+      : policy.allowedCapabilities ?? [];
+    const targetPermission = input.target.permission ?? targetAgent?.permissions ?? policy.effectivePermission;
+    const targetModel = input.target.model === "auto"
+      ? targetAgent?.model ?? targetAgent?.requestedModel ?? "auto"
+      : input.target.model;
+    if (targetAgent && input.target.model !== "auto" && targetAgent.model !== null && targetAgent.model !== input.target.model) {
+      throw new HttpError(409, "Objective handoff target model does not match the native agent assignment.");
+    }
+    if (targetPermission === "full-access" && policy.effectivePermission !== "full-access") {
+      throw new HttpError(403, "Objective handoff target requests full-access above the objective policy.");
+    }
+    if (targetAgent && targetPermission === "full-access" && targetAgent.permissions !== "full-access") {
+      throw new HttpError(403, "Objective handoff target requests more permission than its native grant.");
+    }
+    const targetCapabilities = input.target.requiredCapabilities;
+    const missingTargetCapabilities = targetCapabilities.filter((capability) => !availableCapabilities.includes(capability));
+    if (missingTargetCapabilities.length > 0) {
+      throw new HttpError(403, `Objective handoff target is missing required capabilities: ${missingTargetCapabilities.join(", ")}.`);
+    }
+    const targetCeiling = input.target.sideEffectClassCeiling ?? policy.sideEffectClassCeiling;
+    if (sideEffectRank(targetCeiling) > sideEffectRank(policy.sideEffectClassCeiling)) {
+      throw new HttpError(403, "Objective handoff target exceeds the objective side-effect ceiling.");
+    }
+
+    const parent = input.parentHandoffId ? this.store.getObjectiveHandoff(input.parentHandoffId) : null;
+    if (input.parentHandoffId && (!parent || parent.runId !== runId || parent.objectiveId !== run.objectiveId)) {
+      throw new HttpError(409, "Objective handoff parent is missing or belongs to another objective lineage.");
+    }
+    const chain = parent ? [parent.id, ...parent.lineage.chain] : [];
+    if (chain.length > 128) throw new HttpError(409, "Objective handoff lineage exceeds the durable chain limit.");
+
+    const eventRefs = input.evidenceEventIds.map((id) => {
+      const event = this.store.getEventById(id);
+      if (!event || event.runId !== runId || event.cursor > checkpoint.eventCursor) {
+        throw new HttpError(409, `Objective handoff event evidence is unavailable: ${id}`);
+      }
+      return { id: event.id, cursor: event.cursor, hash: objectiveHandoffReferenceHash(event) };
+    });
+    const observationRefs = input.observationIds.map((id) => {
+      const observation = this.store.getObservationById(id);
+      const observationAgent = observation ? this.store.getAgent(observation.agentId) : null;
+      if (!observation || !observationAgent || observationAgent.runId !== runId || observation.eventCursor > checkpoint.eventCursor) {
+        throw new HttpError(409, `Objective handoff observation evidence is unavailable: ${id}`);
+      }
+      return { id: observation.id, agentId: observation.agentId, eventCursor: observation.eventCursor, hash: objectiveHandoffReferenceHash(observation) };
+    });
+    const checkpointArtifactRefs = new Set((checkpoint.artifactHashes ?? []).map((ref) => typeof ref === "string" ? ref : ref.id));
+    const artifactRefs = input.artifactIds.map((id) => {
+      const artifact = this.store.getObjectiveArtifact(id);
+      if (!artifact || artifact.runId !== runId || artifact.objectiveId !== run.objectiveId || !checkpointArtifactRefs.has(id)) {
+        throw new HttpError(409, `Objective handoff artifact evidence is unavailable at checkpoint ${checkpoint.id}: ${id}`);
+      }
+      return { id: artifact.id, hash: artifact.hash };
+    });
+    const workspaceEvidence = checkpoint.workspaceEvidence;
+    const workspace = workspaceEvidence?.canonicalGrant
+      ? {
+          ...workspaceEvidence.canonicalGrant,
+          git: workspaceEvidence.git,
+          dirty: workspaceEvidence.dirty,
+          patchHash: workspaceEvidence.patchHash,
+          worktree: workspaceEvidence.worktree,
+          snapshotHash: objectiveHandoffReferenceHash(workspaceEvidence),
+        }
+      : null;
+    const taskObjective = input.taskObjective;
+    const sourceAttemptId = input.attemptId ?? sourceTask?.attemptId ?? sourceAgent.objectiveAttemptId ?? null;
+    const envelopeWithoutHash = {
+      version: 1 as const,
+      id: `handoff:${createHash("sha256").update(`${runId}\u0000${requestKey}`).digest("hex")}`,
+      objectiveId: run.objectiveId,
+      runId,
+      objectiveRevision: run.objectiveRevision ?? 1,
+      workflowId: run.workflowId,
+      workflowRevision: run.workflowRevision,
+      workflowHash: run.workflowHash,
+      lineage: {
+        objectiveId: run.objectiveId,
+        runId,
+        nodeId: input.nodeId ?? null,
+        taskId: input.taskId ?? null,
+        attemptId: sourceAttemptId,
+        iterationKey: input.iterationKey ?? null,
+        parentHandoffId: parent?.id ?? null,
+        chain,
+      },
+      scope: {
+        intent: input.intent,
+        taskObjective,
+        constraints: input.constraints,
+        acceptanceCriteria: input.acceptanceCriteria,
+      },
+      source: {
+        harness: sourceHarness,
+        agentId: sourceAgent.id,
+        attemptId: sourceAttemptId,
+        nativeSessionId: sourceAgent.nativeSessionId,
+        nativeRunId: sourceAgent.nativeRunId,
+      },
+      target: {
+        harness: targetHarness,
+        model: targetModel,
+        agentId: targetAgent?.id ?? null,
+        permission: targetPermission,
+        requiredCapabilities: targetCapabilities,
+        sideEffectClassCeiling: targetCeiling,
+      },
+      evidence: {
+        eventCursor: checkpoint.eventCursor,
+        eventRefs,
+        observationRefs,
+        artifactRefs,
+        checkpoint: { id: checkpoint.id, sequence: checkpoint.sequence, hash: objectiveHandoffReferenceHash(checkpoint) },
+      },
+      workspace,
+      continuity: {
+        status: continuityStatus,
+        sourceHarness,
+        sourceAgentId: sourceAgent.id,
+        nativeSessionId: sourceSession?.nativeSessionId ?? sourceAgent.nativeSessionId,
+        nativeRunId: sourceSession?.nativeRunId ?? sourceAgent.nativeRunId,
+        capabilities: [...new Set(continuityCapabilities)],
+        evidenceEventIds: [],
+        hints: continuityStatus === "proven" ? ["same-native-session-may-be-reused"] : ["new-attempt-required", "native-continuity-unproven"],
+      },
+      sideEffects: (checkpoint.unresolvedExternalOperations ?? checkpoint.unresolvedExternalSideEffects ?? []).map((operation) => ({ ...operation })),
+      authority: {
+        permission: policy.effectivePermission,
+        // Policy allowedCapabilities are a ceiling, not a requirement. Only
+        // capabilities explicitly required by this handoff belong here.
+        requiredCapabilities: [...new Set(targetCapabilities)],
+        sideEffectClassCeiling: policy.sideEffectClassCeiling,
+        policySnapshotHash: run.policyHash,
+        configSnapshotHash: checkpoint.configSnapshotHash,
+      },
+      createdAt: nowIso(),
+      requestKey,
+      inputHash,
+      provenance: {
+        source: "daemon" as const,
+        actor: caller ? { type: "agent" as const, id: caller.id } : { type: "user" as const, id: "local-user" },
+        requestKey,
+        capturedAt: nowIso(),
+        evidenceEventIds: input.evidenceEventIds,
+      },
+    };
+    const contentHash = objectiveHandoffHash(envelopeWithoutHash as unknown as ObjectiveHandoffEnvelope);
+    const envelope = ObjectiveHandoffEnvelopeSchema.parse({ ...envelopeWithoutHash, contentHash });
+    let result;
+    try {
+      result = this.store.saveObjectiveHandoff(envelope, { fingerprint: inputHash });
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      throw new HttpError(409, error instanceof Error ? error.message : "Objective handoff could not be committed.");
+    }
+    if (result.status === "committed") {
+      this.appendObjectiveEvent("objective.handoff.offered", run, caller ? { type: "agent", id: caller.id } : { type: "user", id: "local-user" }, {
+        objectiveId: run.objectiveId,
+        handoffId: envelope.id,
+        requestKey,
+        checkpointId: checkpoint.id,
+        targetHarness,
+        targetAgentId: targetAgent?.id ?? null,
+        continuity: envelope.continuity.status,
+      });
+    }
+    return { status: result.status, envelope: result.envelope, acceptance: this.store.getObjectiveHandoffAcceptance(result.envelope.id), execution: null } as unknown as JsonValue;
+  }
+
+  private objectiveHandoffDetail(request: IncomingMessage, runId: string, handoffId: string): JsonValue {
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, "read an objective handoff");
+    const envelope = this.store.getObjectiveHandoff(handoffId);
+    if (!envelope || envelope.runId !== runId) throw new HttpError(404, `Objective handoff not found: ${handoffId}`);
+    const acceptance = this.store.getObjectiveHandoffAcceptance(handoffId);
+    let execution = null;
+    if (acceptance?.status === "accepted") {
+      try {
+        execution = objectiveHandoffExecutionPlan(envelope, acceptance);
+      } catch (error) {
+        throw new HttpError(409, error instanceof Error ? error.message : "Objective handoff acceptance is incompatible.");
+      }
+    }
+    return { envelope, acceptance, execution } as unknown as JsonValue;
+  }
+
+  /** Accept an envelope without mutating it; the supervisor may consume the returned plan. */
+  private acceptObjectiveHandoff(request: IncomingMessage, runId: string, handoffId: string, payload: unknown): JsonValue {
+    return this.objectiveCommandLedger(request, runId, "objective.handoff.accept", {
+      handoffId,
+      payload,
+    }, () => ({ status: "committed", result: this.acceptObjectiveHandoffCore(request, runId, handoffId, payload) }), undefined, "Objective handoff acceptance is already bound to a different request.");
+  }
+
+  private acceptObjectiveHandoffCore(request: IncomingMessage, runId: string, handoffId: string, payload: unknown): JsonValue {
+    const requestKey = this.requireIdempotencyKey(request);
+    const caller = this.objectiveCaller(request);
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, "accept an objective handoff");
+    const envelope = this.store.getObjectiveHandoff(handoffId);
+    if (!envelope || envelope.runId !== runId) throw new HttpError(404, `Objective handoff not found: ${handoffId}`);
+    const policy = run.policy;
+    if (!policy || !run.policyHash || !isObjectivePolicyHashValid(policy) || policy.policyHash !== run.policyHash) {
+      throw new HttpError(409, "Objective handoff acceptance requires a current, hash-verifiable objective policy.");
+    }
+    let input: ObjectiveHandoffAcceptanceInput;
+    try {
+      input = ObjectiveHandoffAcceptanceInputSchema.parse(payload);
+    } catch {
+      throw new HttpError(400, "Invalid typed objective handoff acceptance.");
+    }
+    if (input.envelopeId !== handoffId) throw new HttpError(400, "Handoff envelope id in the route and body must match.");
+    const isRejection = input.decision === "rejected";
+    const requestedRecipient = input.recipientAgentId ?? caller?.id ?? envelope.target.agentId;
+    if (caller && requestedRecipient !== caller.id) throw new HttpError(403, "An authenticated agent may accept a handoff only for itself.");
+    const recipient = requestedRecipient ? this.store.getAgent(requestedRecipient) : null;
+    if (requestedRecipient && !recipient) throw new HttpError(409, `Objective handoff recipient not found: ${requestedRecipient}`);
+    if (recipient && (recipient.runId !== runId || (caller && !this.sharesAgentRoot(caller, recipient)))) throw new HttpError(403, "Objective handoff recipient is outside the objective root lineage.");
+    if (envelope.target.agentId && requestedRecipient !== envelope.target.agentId) throw new HttpError(409, "Objective handoff is addressed to a different recipient agent.");
+    const recipientOrder = recipient ? AgentWorkOrderSchema.safeParse(this.store.getMetadata<JsonValue>(`work-order:${recipient.id}`)) : null;
+    const capabilities = input.capabilities.length > 0
+      ? input.capabilities
+      : recipientOrder?.success && recipientOrder.data.capabilities
+        ? recipientOrder.data.capabilities
+        : policy.allowedCapabilities ?? [];
+    const harness = input.harness ?? (recipient?.harness ?? (recipient?.requestedHarness === "auto" ? undefined : recipient?.requestedHarness)) ?? envelope.target.harness;
+    const model = input.model ?? recipient?.model ?? recipient?.requestedModel ?? envelope.target.model;
+    const permission = input.permission ?? recipient?.permissions ?? envelope.target.permission;
+    if (!isRejection) {
+      if (harness !== envelope.target.harness) throw new HttpError(409, `Handoff target harness mismatch: expected ${envelope.target.harness}, got ${harness}.`);
+      if (envelope.target.model !== "auto" && model !== envelope.target.model) throw new HttpError(409, "Handoff target model is fixed by the immutable envelope.");
+      if (permission !== envelope.target.permission) throw new HttpError(403, "Handoff acceptance cannot widen or narrow the immutable target authority.");
+      if (recipient && (recipient.harness !== null && recipient.harness !== harness || recipient.permissions !== permission)) throw new HttpError(409, "Recipient native authority does not match the immutable handoff target.");
+      const compatibility = validateObjectiveHandoffTarget(envelope, {
+        harness,
+        permission,
+        requiredCapabilities: envelope.target.requiredCapabilities,
+        capabilities,
+      });
+      if (!compatibility.ok) throw new HttpError(403, compatibility.reason);
+    }
+    const continuityStatus = input.continuityStatus;
+    const sameNativeIdentity = continuityStatus === "proven"
+      && harness === envelope.continuity.sourceHarness
+      && input.nativeSessionId !== null
+      && input.nativeSessionId === envelope.source.nativeSessionId
+      && input.nativeRunId === envelope.source.nativeRunId;
+    if (!isRejection && continuityStatus === "proven" && !sameNativeIdentity) {
+      throw new HttpError(409, "Proven continuity requires the source harness and native session/run identities to match exactly.");
+    }
+    const eventRefIds = new Set(envelope.evidence.eventRefs.map((ref) => ref.id));
+    const observationRefIds = new Set(envelope.evidence.observationRefs.map((ref) => ref.id));
+    const artifactRefIds = new Set(envelope.evidence.artifactRefs.map((ref) => ref.id));
+    for (const eventId of input.evidenceEventIds) {
+      const event = this.store.getEventById(eventId);
+      if (!event || event.runId !== runId || event.cursor > envelope.evidence.eventCursor || !eventRefIds.has(eventId)) {
+        throw new HttpError(409, `Acceptance evidence is not included in the immutable handoff: ${eventId}`);
+      }
+    }
+    for (const observationId of input.observationIds) {
+      if (!observationRefIds.has(observationId)) throw new HttpError(409, `Acceptance observation evidence is not included in the immutable handoff: ${observationId}`);
+      const observation = this.store.getObservationById(observationId);
+      if (!observation || observation.eventCursor > envelope.evidence.eventCursor) throw new HttpError(409, `Acceptance observation evidence is unavailable: ${observationId}`);
+    }
+    for (const artifactId of input.artifactIds) {
+      if (!artifactRefIds.has(artifactId)) throw new HttpError(409, `Acceptance artifact evidence is not included in the immutable handoff: ${artifactId}`);
+      const artifact = this.store.getObjectiveArtifact(artifactId);
+      if (!artifact || artifact.runId !== runId || artifact.objectiveId !== envelope.objectiveId) throw new HttpError(409, `Acceptance artifact evidence is unavailable: ${artifactId}`);
+    }
+    const acceptanceInput = {
+      ...input,
+      recipientAgentId: requestedRecipient ?? null,
+      harness,
+      model,
+      permission,
+      capabilities,
+      nativeSessionId: !isRejection && sameNativeIdentity ? input.nativeSessionId : null,
+      nativeRunId: !isRejection && sameNativeIdentity ? input.nativeRunId : null,
+    };
+    const inputHash = objectiveHandoffReferenceHash(acceptanceInput);
+    const prior = this.store.getObjectiveHandoffAcceptance(handoffId);
+    if (prior) {
+      if (prior.inputHash !== inputHash || prior.requestKey !== requestKey) throw new HttpError(409, "Objective handoff acceptance is already bound to a different request.");
+      const execution = prior.status === "accepted" ? objectiveHandoffExecutionPlan(envelope, prior) : null;
+      return { status: "replayed", envelope, acceptance: prior, execution } as unknown as JsonValue;
+    }
+    const acceptedAt = nowIso();
+    const recordWithoutHash = {
+      version: 1 as const,
+      id: `handoff-accept:${createHash("sha256").update(`${handoffId}\u0000${requestKey}`).digest("hex")}`,
+      envelopeId: handoffId,
+      objectiveId: envelope.objectiveId,
+      runId,
+      recipientAgentId: requestedRecipient ?? null,
+      target: {
+        harness: isRejection ? envelope.target.harness : harness,
+        model: isRejection ? envelope.target.model : model,
+        agentId: envelope.target.agentId,
+        permission: isRejection ? envelope.target.permission : permission,
+        requiredCapabilities: envelope.target.requiredCapabilities,
+        sideEffectClassCeiling: envelope.target.sideEffectClassCeiling,
+      },
+      capabilities,
+      nativeSessionId: !isRejection && sameNativeIdentity ? input.nativeSessionId : null,
+      nativeRunId: !isRejection && sameNativeIdentity ? input.nativeRunId : null,
+      continuityStatus: isRejection ? "unsupported" as const : sameNativeIdentity ? "proven" as const : "unknown" as const,
+      evidenceEventIds: input.evidenceEventIds,
+      status: isRejection ? "rejected" as const : "accepted" as const,
+      reason: input.reason ?? null,
+      requestKey,
+      inputHash,
+      acceptedAt,
+      provenance: {
+        source: "daemon" as const,
+        actor: caller ? { type: "agent" as const, id: caller.id } : { type: "user" as const, id: "local-user" },
+        requestKey,
+        capturedAt: acceptedAt,
+        evidenceEventIds: input.evidenceEventIds,
+      },
+    };
+    const contentHash = objectiveHandoffAcceptanceHash(recordWithoutHash as ObjectiveHandoffAcceptanceRecord);
+    const acceptance = ObjectiveHandoffAcceptanceRecordSchema.parse({ ...recordWithoutHash, contentHash });
+    let execution: ReturnType<typeof objectiveHandoffExecutionPlan> | null = null;
+    if (acceptance.status === "accepted") {
+      try {
+        execution = objectiveHandoffExecutionPlan(envelope, acceptance);
+      } catch (error) {
+        throw new HttpError(409, error instanceof Error ? error.message : "Objective handoff acceptance is incompatible.");
+      }
+    }
+    let result;
+    try {
+      result = this.store.saveObjectiveHandoffAcceptance(acceptance, { fingerprint: inputHash });
+    } catch (error) {
+      throw new HttpError(409, error instanceof Error ? error.message : "Objective handoff acceptance could not be committed.");
+    }
+    if (result.status === "committed") {
+      this.appendObjectiveEvent("objective.handoff.accepted", run, caller ? { type: "agent", id: caller.id } : { type: "user", id: "local-user" }, {
+        objectiveId: run.objectiveId,
+        handoffId,
+        requestKey,
+        recipientAgentId: requestedRecipient ?? null,
+        targetHarness: acceptance.status === "accepted" ? harness : envelope.target.harness,
+        mode: execution?.mode ?? "rejected",
+      });
+    }
+    return { status: result.status, envelope, acceptance: result.acceptance, execution } as unknown as JsonValue;
+  }
+
+  /**
+   * Resume is deliberately a capability check, not a process rewind. A
+   * native session may only be selected when the checkpoint proves continuity
+   * and the session identity remains bound to the same objective attempt.
+   */
+  private resumeObjectiveCheckpoint(request: IncomingMessage, runId: string, checkpointId: string, payload: unknown): JsonValue {
+    let fresh = false;
+    const result = this.objectiveCommandLedger(request, runId, "objective.checkpoint.resume", {
+      checkpointId,
+      payload,
+    }, () => ({ status: "committed", result: this.resumeObjectiveCheckpointCore(request, runId, checkpointId, payload, (isFresh) => {
+      fresh = isFresh;
+    }) }), () => {
+      if (fresh) void this.objectiveSupervisor.step(runId).catch(() => undefined);
+    });
+    return result;
+  }
+
+  private resumeObjectiveCheckpointCore(request: IncomingMessage, runId: string, checkpointId: string, payload: unknown, onFresh?: (fresh: boolean) => void): JsonValue {
+    const requestKey = this.requireIdempotencyKey(request);
+    const parsed = ObjectiveCheckpointResumeCommandSchema.parse({
+      ...(payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {}),
+      runId,
+      checkpointId,
+    });
+    const { run, authority } = this.objectiveMutationContext(request, runId, "resume an objective checkpoint");
+    const checkpoint = this.requirePortableObjectiveCheckpoint(run, checkpointId);
+    this.assertCheckpointSequence(checkpoint, parsed.expectedSequence);
+    const native = checkpoint.nativeSessions ?? [];
+    if (checkpoint.continuity?.status !== "proven" || native.length === 0 || native.some((session) => session.continuity !== "proven")) {
+      throw new HttpError(409, "Cannot resume the same native session: continuity is not proven. Use retry to re-execute an activity or fork from this committed checkpoint. No process rewind is implied.");
+    }
+    for (const session of native) {
+      const agent = this.store.getAgent(session.agentId);
+      const lease = agent ? this.store.listWorkerProcessLeases({ agentId: agent.id }).at(-1) ?? null : null;
+      const strongTransport = lease?.transport.kind === "worker-host"
+        && lease.transport.hostIdentity?.verification === "strong"
+        && lease.transport.workerIdentity?.verification === "strong";
+      if (!agent || agent.runId !== runId || agent.nativeSessionId !== session.nativeSessionId || !strongTransport || !["running", "orphaned"].includes(lease?.state ?? "")) {
+        throw new HttpError(409, `Cannot resume native session ${session.nativeSessionId ?? session.agentId}: current durable session continuity is no longer proven. Use retry or fork; no process rewind is implied.`);
+      }
+    }
+    if (parsed.attemptId !== undefined && !native.some((session) => session.attemptId === parsed.attemptId && session.continuity === "proven")) {
+      throw new HttpError(409, `Checkpoint ${checkpointId} does not prove continuity for attempt ${parsed.attemptId}.`);
+    }
+    const result = this.checkpointCommand(requestKey, authority, { operation: "resume", runId, checkpointId, expectedSequence: parsed.expectedSequence ?? null }, (isFresh) => {
+      onFresh?.(isFresh);
+      const output = {
+        version: 1,
+        operation: "resume",
+        status: "scheduled",
+        capability: "same-native-session",
+        runId,
+        checkpointId,
+        attemptId: parsed.attemptId ?? null,
+        nativeSessions: native,
+        note: "The supervisor may reattach the proven native session; this command never rewinds a process.",
+      };
+      if (isFresh) this.appendObjectiveEvent("objective.checkpoint.resume.requested", run, authority.actor, {
+        objectiveId: run.objectiveId,
+        checkpointId,
+        requestKey,
+        capability: "same-native-session",
+        continuity: checkpoint.continuity ?? { status: "unknown", capabilities: [], reason: "Unavailable" },
+      });
+      return output;
+    });
+    return result;
+  }
+
+  /** Retry names the exact task/control activity; it does not retry a whole run implicitly. */
+  private retryObjectiveCheckpoint(request: IncomingMessage, runId: string, checkpointId: string, payload: unknown): JsonValue {
+    let fresh = false;
+    const result = this.objectiveCommandLedger(request, runId, "objective.checkpoint.retry", {
+      checkpointId,
+      payload,
+    }, () => ({ status: "committed", result: this.retryObjectiveCheckpointCore(request, runId, checkpointId, payload, (isFresh) => {
+      fresh = isFresh;
+    }) }), () => {
+      if (fresh) void this.objectiveSupervisor.step(runId).catch(() => undefined);
+    });
+    return result;
+  }
+
+  private retryObjectiveCheckpointCore(request: IncomingMessage, runId: string, checkpointId: string, payload: unknown, onFresh?: (fresh: boolean) => void): JsonValue {
+    const requestKey = this.requireIdempotencyKey(request);
+    const parsed = ObjectiveCheckpointRetryCommandSchema.parse({
+      ...(payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {}),
+      runId,
+      checkpointId,
+    });
+    const { run, authority } = this.objectiveMutationContext(request, runId, "retry an objective checkpoint activity");
+    const checkpoint = this.requirePortableObjectiveCheckpoint(run, checkpointId);
+    this.assertCheckpointSequence(checkpoint, parsed.expectedSequence);
+    if (parsed.activity.kind === "task") {
+      const task = checkpoint.flatExecution?.tasks.find((candidate) => candidate.task.id === parsed.activity.id);
+      if (!task) throw new HttpError(409, `Checkpoint retry task is not part of objective ${run.objectiveId}: ${parsed.activity.id}`);
+      if (parsed.activity.attemptId !== undefined && parsed.activity.attemptId !== task.attemptId) {
+        throw new HttpError(409, `Checkpoint retry attempt does not match task ${parsed.activity.id}'s committed attempt.`);
+      }
+      if (run.latestCheckpointId !== checkpoint.id) {
+        throw new HttpError(409, "Checkpoint retry requires the latest committed checkpoint; re-read the objective and retry with its current boundary.");
+      }
+      const currentTask = run.tasks.find((candidate) => candidate.task.id === parsed.activity.id);
+      if (!currentTask) throw new HttpError(409, `Checkpoint retry task is not present in the current objective projection: ${parsed.activity.id}`);
+      if (["running", "waiting-approval"].includes(currentTask.state)) {
+        throw new HttpError(409, `Objective task ${parsed.activity.id} still has an active or approval-held attempt; retry would risk duplicate execution.`);
+      }
+      const taskStates = new Map(run.tasks.map((candidate) => [candidate.task.id, candidate.state]));
+      if (currentTask.task.dependsOn.some((dependencyId) => !["completed", "superseded"].includes(taskStates.get(dependencyId) ?? ""))) {
+        throw new HttpError(409, `Objective task ${parsed.activity.id} is blocked by an unfinished dependency; retry the dependency first.`);
+      }
+      const downstream = run.tasks.filter((candidate) => candidate.task.dependsOn.includes(parsed.activity.id));
+      if (downstream.some((candidate) => ["running", "completed", "waiting-approval"].includes(candidate.state))) {
+        throw new HttpError(409, `Objective task ${parsed.activity.id} has downstream work that must be reconciled before an exact retry.`);
+      }
+    } else {
+      const executions = checkpoint.treeExecution?.executions ?? [];
+      const found = executions.some((execution) => execution.key.nodeId === parsed.activity.id || `${execution.key.nodeId}@${execution.key.iterationKey}` === parsed.activity.id);
+      if (!found) throw new HttpError(409, `Checkpoint retry control activity is not part of its committed tree state: ${parsed.activity.id}`);
+    }
+    const activity = {
+      kind: parsed.activity.kind,
+      id: parsed.activity.id,
+      ...(parsed.activity.attemptId === undefined ? {} : { attemptId: parsed.activity.attemptId }),
+    };
+    const result = this.checkpointCommand(requestKey, authority, { operation: "retry", runId, checkpointId, activity, expectedSequence: parsed.expectedSequence ?? null }, (isFresh) => {
+      onFresh?.(isFresh);
+      let retryCheckpointId: string | null = null;
+      if (parsed.activity.kind === "task") {
+        const current = this.store.getObjectiveRun(runId);
+        if (!current || current.latestCheckpointId !== checkpoint.id) {
+          throw new HttpError(409, "Checkpoint retry lost its latest-checkpoint compare-and-swap fence.");
+        }
+        const resetTasks = current.tasks.map((candidate) => candidate.task.id === parsed.activity.id
+          ? {
+              ...candidate,
+              state: "queued" as const,
+              attemptId: null,
+              agentId: null,
+              output: null,
+              error: null,
+              startedAt: null,
+              finishedAt: null,
+            }
+          : candidate);
+        const resetRun = ObjectiveRunRecordSchema.parse({
+          ...current,
+          state: "executing",
+          tasks: resetTasks,
+          output: null,
+          error: null,
+          finishedAt: null,
+          updatedAt: nowIso(),
+        });
+        if (!this.store.updateObjectiveRun(resetRun, { expectedActivePlanRevision: current.activePlanRevision })) {
+          throw new HttpError(409, "Checkpoint retry could not claim the current objective projection.");
+        }
+        const cursor = Math.max(this.store.latestCursor(), checkpoint.eventHighWater ?? checkpoint.eventCursor);
+        const retryRun = this.objectiveRuntime.checkpoint(runId, {
+          eventCursor: cursor,
+          taskUpdates: [{ taskId: parsed.activity.id, state: "queued", attemptId: null, agentId: null, output: null, error: null, startedAt: null, finishedAt: null }],
+          reason: `Retry requested for committed task ${parsed.activity.id}${parsed.activity.attemptId ? ` attempt ${parsed.activity.attemptId}` : ""}.`,
+          requestKey: `${requestKey}:checkpoint`,
+          ...this.deriveObjectiveCheckpointEvidence(resetRun, authority, cursor),
+        }, authority);
+        retryCheckpointId = retryRun.latestCheckpointId;
+      }
+      const output = {
+        version: 1,
+        operation: "retry",
+        status: "scheduled",
+        capability: "reexecute-named-activity",
+        runId,
+        checkpointId,
+        retryCheckpointId,
+        activity,
+        note: "The named activity/attempt will be re-executed from committed state; no process rewind is implied.",
+      };
+      if (isFresh) this.appendObjectiveEvent("objective.checkpoint.retry.requested", run, authority.actor, {
+        objectiveId: run.objectiveId,
+        checkpointId,
+        requestKey,
+        activity,
+      });
+      return output;
+    });
+    return result;
+  }
+
+  /** Fork copies only committed state into a new run and records a new occurrence edge. */
+  private forkObjectiveCheckpoint(request: IncomingMessage, runId: string, checkpointId: string, payload: unknown): JsonValue {
+    return this.objectiveCommandLedger(request, runId, "objective.checkpoint.fork", {
+      checkpointId,
+      payload,
+    }, () => ({ status: "committed", result: this.forkObjectiveCheckpointCore(request, runId, checkpointId, payload) }));
+  }
+
+  private forkObjectiveCheckpointCore(request: IncomingMessage, runId: string, checkpointId: string, payload: unknown): JsonValue {
+    const requestKey = this.requireIdempotencyKey(request);
+    const parsed = ObjectiveCheckpointForkCommandSchema.parse({
+      ...(payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {}),
+      runId,
+      checkpointId,
+    });
+    const { run, caller, authority } = this.objectiveMutationContext(request, runId, "fork an objective checkpoint");
+    const checkpoint = this.requirePortableObjectiveCheckpoint(run, checkpointId);
+    this.assertCheckpointSequence(checkpoint, undefined);
+    const forkRequestKey = `objective-checkpoint-fork:${requestKey}`;
+    const sourceOccurrence = this.store.getObjectiveRunOccurrence(runId);
+    const targetRunId = parsed.newRunId ?? `objective-fork-${checkpoint.id}-${requestKey}`;
+    const existing = this.store.getObjectiveRun(targetRunId);
+    const fingerprint = createHash("sha256").update(stableJsonStringify({ runId, checkpointId, targetRunId, reason: parsed.reason })).digest("hex");
+    const result = this.checkpointCommand(requestKey, authority, { operation: "fork", runId, checkpointId, targetRunId, fingerprint }, () => {
+      if (existing) {
+        if (existing.objectiveId !== run.objectiveId) throw new HttpError(403, "Fork target run belongs to another objective.");
+        const existingOccurrence = this.store.getObjectiveRunOccurrence(existing.runId);
+        if (!existingOccurrence || existingOccurrence.forkedFromRunId !== runId || existingOccurrence.input === undefined) {
+          throw new HttpError(409, "Fork target run already exists but is not the durable fork for this checkpoint command.");
+        }
+        return { version: 1, operation: "fork", status: "replayed", capability: "new-run-from-committed-state", runId, checkpointId, newRunId: existing.runId, occurrenceId: existingOccurrence.id };
+      }
+      const controlRevision = checkpoint.controlPlanRevision === null || checkpoint.controlPlanRevision === undefined
+        ? null
+        : this.store.getObjectiveControlPlanRevision(runId, checkpoint.controlPlanRevision);
+      const flatTasks = checkpoint.flatExecution?.tasks ?? run.tasks;
+      // A fork never carries native attempts across run boundaries. Preserve
+      // only completed flat work (including its output); queued/running/
+      // failed work is deliberately re-queued for a fresh attempt in the
+      // child run. This keeps the fork a committed-state boundary without
+      // pretending that an opaque process was cloned.
+      const retainedTaskUpdates = flatTasks
+        .filter((task) => task.state === "completed")
+        .map((task) => ({
+          taskId: task.task.id,
+          state: "completed" as const,
+          attemptId: null,
+          agentId: null,
+          output: task.output,
+          error: null,
+          startedAt: task.startedAt,
+          finishedAt: task.finishedAt,
+        }));
+      const forkPlan = controlRevision
+        ? {
+            ...controlRevision.plan,
+            id: `${controlRevision.plan.id}:fork:${createHash("sha256").update(targetRunId).digest("hex").slice(0, 16)}`,
+          }
+        : null;
+      const workspace = run.policy?.workspace ?? checkpoint.workspaceEvidence?.canonicalGrant ?? this.objectiveWorkspaceGrant(runId);
+      const forkAuthority = this.objectiveAuthority(caller, workspace);
+      const policy = run.policy ? {
+        effectivePermission: run.policy.effectivePermission,
+        allowedCapabilities: run.policy.allowedCapabilities,
+        budget: run.policy.budget,
+        sideEffectClassCeiling: run.policy.sideEffectClassCeiling,
+        approvalPolicy: run.policy.approvalPolicy,
+        expiresAt: run.policy.expiresAt,
+      } : null;
+      const next = this.objectiveRuntime.create({
+        runId: targetRunId,
+        objectiveId: run.objectiveId,
+        objectiveRevision: run.objectiveRevision ?? 1,
+        workflowId: run.workflowId,
+        workflowRevision: run.workflowRevision,
+        workflowHash: run.workflowHash,
+        conductorAgentId: run.conductorAgentId,
+        workspace,
+        ...(policy ? { policy } : {}),
+        spec: run.spec,
+        tasks: flatTasks.map((record) => record.task),
+        context: checkpoint.flatExecution?.context ?? checkpoint.context,
+        ...(forkPlan ? { controlPlan: forkPlan } : {}),
+        requestKey: forkRequestKey,
+      }, forkAuthority);
+      if (workspace) this.saveObjectiveWorkspaceGrant(next.runId, workspace, caller);
+      const checkpointAuthority = next.policy
+        ? {
+            ...forkAuthority,
+            permissionCeiling: next.policy.effectivePermission,
+            allowedCapabilities: next.policy.allowedCapabilities,
+            policy: {
+              effectivePermission: next.policy.effectivePermission,
+              allowedCapabilities: next.policy.allowedCapabilities,
+              budget: next.policy.budget,
+              sideEffectClassCeiling: next.policy.sideEffectClassCeiling,
+              approvalPolicy: next.policy.approvalPolicy,
+              expiresAt: next.policy.expiresAt,
+            },
+          }
+        : forkAuthority;
+      const forked = this.objectiveRuntime.checkpoint(next.runId, {
+        eventCursor: checkpoint.eventHighWater ?? checkpoint.eventCursor,
+        context: checkpoint.context,
+        ...(retainedTaskUpdates.length > 0 ? { taskUpdates: retainedTaskUpdates } : {}),
+        outputs: checkpoint.outputs ?? {},
+        artifactHashes: checkpoint.artifactHashes ?? [],
+        workspaceEvidence: checkpoint.workspaceEvidence,
+        unresolvedExternalOperations: checkpoint.unresolvedExternalOperations ?? [],
+        policySnapshotHash: next.policyHash ?? null,
+        configSnapshotHash: checkpoint.configSnapshotHash ?? null,
+        attemptHighWater: checkpoint.attemptHighWater ?? checkpoint.eventCursor,
+        eventHighWater: checkpoint.eventHighWater ?? checkpoint.eventCursor,
+        provenance: {
+          source: "recovery",
+          actor: checkpointAuthority.actor,
+          capturedAt: nowIso(),
+          evidenceEventIds: checkpoint.provenance?.evidenceEventIds ?? [],
+          parentCheckpointId: checkpoint.id,
+          baseCheckpointId: checkpoint.id,
+        },
+        reason: `Forked from committed checkpoint ${checkpoint.id}: ${parsed.reason}`,
+        requestKey: `${forkRequestKey}:checkpoint`,
+      }, checkpointAuthority);
+      this.saveObjectiveRunOccurrence(next, {
+        kind: "fork",
+        occurrenceKey: parsed.occurrenceKey ?? `${checkpoint.id}:${targetRunId}`,
+        parentRunId: runId,
+        forkedFromRunId: runId,
+        forkedFromOccurrenceId: sourceOccurrence?.id ?? null,
+        input: checkpoint.flatExecution?.context ?? checkpoint.context,
+      }, forkAuthority.actor);
+      this.appendObjectiveEvent("objective.checkpoint.forked", next, forkAuthority.actor, {
+        objectiveId: next.objectiveId,
+        sourceRunId: runId,
+        sourceCheckpointId: checkpointId,
+        requestKey,
+        capability: "new-run-from-committed-state",
+        reason: parsed.reason,
+      });
+      return { version: 1, operation: "fork", status: "created", capability: "new-run-from-committed-state", runId, checkpointId, newRunId: forked.runId, newCheckpointId: forked.latestCheckpointId, occurrenceId: this.store.getObjectiveRunOccurrence(next.runId)?.id ?? null };
+    });
+    return result;
+  }
+
+  private requirePortableObjectiveCheckpoint(run: ObjectiveRunRecord, checkpointId: string): ObjectiveCheckpointRecord & Required<Pick<ObjectiveCheckpointRecord, "continuity" | "nativeSessions" | "flatExecution" | "workspaceEvidence" | "provenance">> {
+    const checkpoint = this.store.getObjectiveCheckpoint(run.runId, checkpointId);
+    if (!checkpoint) throw new HttpError(404, `Objective checkpoint not found: ${checkpointId}`);
+    const parsed = ObjectivePortableCheckpointRecordSchema.safeParse(checkpoint);
+    if (!parsed.success) throw new HttpError(409, `Checkpoint ${checkpointId} is legacy and has no portable recovery boundary. Commit a new checkpoint before using this command.`);
+    return parsed.data as ObjectiveCheckpointRecord & Required<Pick<ObjectiveCheckpointRecord, "continuity" | "nativeSessions" | "flatExecution" | "workspaceEvidence" | "provenance">>;
+  }
+
+  private assertCheckpointSequence(checkpoint: ObjectiveCheckpointRecord, expectedSequence: number | undefined): void {
+    if (expectedSequence !== undefined && checkpoint.sequence !== expectedSequence) {
+      throw new HttpError(409, `Checkpoint compare-and-swap conflict: expected sequence ${expectedSequence}, found ${checkpoint.sequence}.`);
+    }
+  }
+
+  private checkpointCommand(
+    requestKey: string,
+    authority: ObjectiveRuntimeAuthority,
+    identity: Record<string, JsonValue>,
+    produce: (fresh: boolean) => JsonValue,
+  ): JsonValue {
+    const fingerprintKey = `checkpoint-command-fingerprint:${createHash("sha256").update(requestKey).digest("hex")}`;
+    return this.store.durableTransaction(() => {
+      const fingerprint = createHash("sha256").update(stableJsonStringify({
+        ...identity,
+        actor: authority.actor,
+        policy: authority.policy ?? null,
+        workspace: authority.workspace ?? null,
+      })).digest("hex");
+      const priorFingerprint = this.store.getMetadata<string>(fingerprintKey);
+      if (priorFingerprint && priorFingerprint !== fingerprint) throw new HttpError(409, `Checkpoint command ${requestKey} is already bound to a different operation.`);
+      const prior = this.store.getCommandReceipt(requestKey);
+      if (prior) {
+        if (!priorFingerprint) throw new HttpError(409, `Checkpoint command ${requestKey} is already claimed by another operation.`);
+        return prior.result;
+      }
+      this.store.setMetadata(fingerprintKey, fingerprint);
+      const result = produce(true);
+      const now = nowIso();
+      if (!this.store.claimCommandReceipt(CommandReceiptSchema.parse({
+        idempotencyKey: requestKey,
+        accepted: true,
+        state: "settled",
+        result,
+        createdAt: now,
+        updatedAt: now,
+      }))) throw new HttpError(409, `Checkpoint command ${requestKey} was concurrently claimed.`);
+      return result;
+    });
+  }
+
+  private requestObjectiveApproval(request: IncomingMessage, runId: string, payload: unknown): ObjectiveRunRecord {
+    const requestKey = this.requireIdempotencyKey(request);
+    const parsed = ObjectiveApprovalInputSchema.parse(payload);
+    const { run, authority } = this.objectiveMutationContext(request, runId, "request approval for");
+    return this.store.durableTransaction(() => {
+      const replayed = this.objectiveRepository.getObjectiveActionReceipt(requestKey);
+      const approvalInput: ObjectiveApprovalRequestInput = {
+        kind: parsed.kind,
+        question: parsed.question,
+        operationId: parsed.operationId,
+        requestHash: parsed.requestHash,
+        policyHash: parsed.policyHash,
+        sideEffectClass: parsed.sideEffectClass,
+        canonicalTarget: parsed.canonicalTarget,
+        ...(parsed.capability !== undefined ? { capability: parsed.capability } : {}),
+        requestKey,
+        ...(parsed.taskId !== undefined ? { taskId: parsed.taskId } : {}),
+        ...(parsed.scope !== undefined ? { scope: parsed.scope } : {}),
+        ...(parsed.expiresAt !== undefined ? { expiresAt: parsed.expiresAt } : {}),
+      };
+      const next = this.objectiveRuntime.requestApproval(runId, approvalInput, authority);
+      if (!replayed) this.appendObjectiveApprovalRequestedEvent(run, next, authority.actor);
+      return next;
+    });
+  }
+
+  private resolveObjectiveApproval(
+    request: IncomingMessage,
+    runId: string,
+    approvalId: string,
+    payload: unknown,
+  ): ObjectiveRunRecord {
+    const requestKey = this.requireIdempotencyKey(request);
+    const parsed = ObjectiveApprovalResolutionInputSchema.parse(payload);
+    const caller = this.objectiveCaller(request);
+    // Approval resolution is deliberately a human control boundary. There
+    // is no governing-agent policy field in the current objective contract,
+    // so an authenticated agent cannot resolve it by implication.
+    if (caller) throw new HttpError(403, "Only a local user may resolve objective approvals.");
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    const approval = this.store.getObjectiveApproval(runId, approvalId);
+    if (!approval) throw new HttpError(404, `Objective approval not found: ${approvalId}`);
+    // An exact retry of a previously settled action must replay its durable
+    // receipt even if the approval's wall-clock expiry has since elapsed.
+    // New approve/reject attempts against an expired, still-requested
+    // approval remain blocked below; explicit expiry settlement is allowed.
+    const replayed = this.objectiveRepository.getObjectiveActionReceipt(requestKey);
+    const approvalExpired = approval.expiresAt !== null && Date.parse(approval.expiresAt) <= Date.now();
+    if (!replayed && approvalExpired && parsed.status !== "expired") {
+      throw new HttpError(409, `Objective approval ${approvalId} has expired.`);
+    }
+    const authority = this.objectiveAuthority(null);
+    return this.store.durableTransaction(() => {
+      const replayed = this.objectiveRepository.getObjectiveActionReceipt(requestKey);
+      const resolutionInput = {
+        status: parsed.status,
+        ...(parsed.decision !== undefined ? { decision: parsed.decision } : {}),
+        requestKey,
+      } as const;
+      const next = this.objectiveRuntime.resolveApproval(runId, approvalId, resolutionInput, authority);
+      if (!replayed) {
+        this.appendObjectiveEvent("objective.approval.resolved", next, authority.actor, {
+          objectiveId: next.objectiveId,
+          requestKey,
+          approvalId,
+          status: parsed.status,
+          state: next.state,
+        });
+      }
+      this.resolveAttentionForApproval(run, approval, parsed.status, parsed.decision ?? null, authority.actor, requestKey);
+      return next;
+    });
+  }
+
+  /**
+   * Public checkpoint callers may report progress, but they cannot author a
+   * terminal task result. A terminal update is accepted only when the durable
+   * objective assignment and the native terminal projection agree on every
+   * identity involved. The supervisor runner has a separate in-process path
+   * through ObjectiveSupervisor.acknowledge, so this guard does not weaken
+   * that daemon-owned reconciliation boundary.
+   */
+  private assertPublicObjectiveCheckpointEvidence(
+    run: ObjectiveRunRecord,
+    updates: readonly z.infer<typeof ObjectiveTaskUpdateInputSchema>[],
+    eventCursor: number,
+  ): Record<string, string[]> {
+    const evidenceByTask: Record<string, string[]> = {};
+    for (const update of updates) {
+      if (update.state !== "completed" && update.state !== "failed") continue;
+      const task = run.tasks.find((record) => record.task.id === update.taskId);
+      // Let ObjectiveRuntime produce its normal unknown-task diagnostic; this
+      // helper is only responsible for the terminal evidence boundary.
+      if (!task) continue;
+      if (!task.attemptId || !task.agentId) {
+        throw new ObjectiveRuntimeError(
+          `Objective task ${task.task.id} has no durable attempt assignment; terminal checkpoints require native evidence.`,
+          "invalid-state",
+        );
+      }
+      if (update.attemptId !== task.attemptId || update.agentId !== task.agentId) {
+        throw new ObjectiveRuntimeError(
+          `Objective task ${task.task.id} terminal checkpoint identity does not match its durable assignment.`,
+          "authority-exceeded",
+        );
+      }
+
+      const agent = this.store.getAgent(task.agentId);
+      if (!agent || agent.runId !== run.runId || agent.workflowId !== run.workflowId || agent.logicalAgentId !== task.attemptId) {
+        throw new ObjectiveRuntimeError(
+          `Objective task ${task.task.id} is not bound to a native agent in this objective run.`,
+          "authority-exceeded",
+        );
+      }
+      const conductor = run.conductorAgentId ? this.store.getAgent(run.conductorAgentId) : null;
+      const root = this.agentRoot(agent);
+      const belongsToLineage = run.conductorAgentId !== null
+        ? Boolean(conductor
+          && conductor.workflowId === run.workflowId
+          && this.sharesAgentRoot(agent, conductor)
+          && this.objectiveAgentWorkspaceAuthorized(run, agent, conductor))
+        : Boolean(root
+          && root.runId === run.runId
+          && root.workflowId === run.workflowId
+          && this.objectiveAgentWorkspaceAuthorized(run, agent, null));
+      if (!belongsToLineage) {
+        throw new ObjectiveRuntimeError(
+          `Objective task ${task.task.id} native agent is outside the objective root lineage.`,
+          "authority-exceeded",
+        );
+      }
+
+      const expectedStatus = update.state === "completed" ? "completed" : "failed";
+      if (agent.status !== expectedStatus) {
+        throw new ObjectiveRuntimeError(
+          `Objective task ${task.task.id} claims ${update.state}, but its native agent is ${agent.status}.`,
+          "invalid-state",
+        );
+      }
+      const evidence = this.objectiveTerminalEvidence(run, agent, task.attemptId, update.state, eventCursor);
+      if (evidence.length === 0) {
+        throw new ObjectiveRuntimeError(
+          `Objective task ${task.task.id} has no durable ${expectedStatus} evidence at or before checkpoint cursor ${eventCursor}.`,
+          "invalid-state",
+        );
+      }
+      evidenceByTask[task.task.id] = evidence.map((event) => event.id);
+    }
+    return evidenceByTask;
+  }
+
+  /**
+   * The objective run and its conductor's chat run are distinct durable
+   * resources. Workspace authority is the shared capability that binds the
+   * worker assignment to the persisted objective/conductor lineage; do not
+   * infer ownership from a matching conductor run ID.
+   */
+  private objectiveAgentWorkspaceAuthorized(
+    run: ObjectiveRunRecord,
+    agent: AgentRecord,
+    conductor: AgentRecord | null,
+  ): boolean {
+    const workerWorkspace: WorkspaceSpec = {
+      path: agent.workspacePath,
+      dirtyPolicy: "local-only",
+    };
+    try {
+      const objectiveGrant = this.objectiveWorkspaceGrant(run.runId);
+      const workerGrant = this.agentWorkspaceGrant(agent);
+      // Prefer the persisted work-order grant over the materialized path and
+      // require the two to agree. This keeps a tampered AgentRecord path from
+      // widening the workspace authority used by the terminal proof.
+      if (workerGrant && this.canonicalWorkspacePath(workerWorkspace.path, "Agent workspace") !== workerGrant.path) {
+        return false;
+      }
+      if (objectiveGrant) this.childWorkspaceGrant(objectiveGrant, workerWorkspace);
+      if (conductor) {
+        const conductorGrant = this.agentWorkspaceGrant(conductor);
+        if (conductorGrant) this.childWorkspaceGrant(conductorGrant, workerWorkspace);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Find terminal events without trusting a caller's cursor or payload. */
+  private objectiveTerminalEvidence(
+    run: ObjectiveRunRecord,
+    agent: AgentRecord,
+    attemptId: string,
+    state: "completed" | "failed",
+    eventCursor: number,
+  ): EventEnvelope[] {
+    const types = state === "completed"
+      ? ["agent.completed", "driver.run.completed"]
+      : ["agent.failed", "driver.run.failed"];
+    const evidence: EventEnvelope[] = [];
+    let after = 0;
+    while (after < eventCursor) {
+      const page = this.store.eventsAfter(after, {
+        runId: run.runId,
+        agentId: agent.id,
+        types,
+        limit: 10_000,
+      });
+      if (page.length === 0) break;
+      for (const event of page) {
+        if (event.cursor > eventCursor) break;
+        if (event.workflowId === run.workflowId && this.eventMatchesObjectiveAttempt(event, attemptId)) evidence.push(event);
+      }
+      const lastCursor = page.at(-1)?.cursor ?? after;
+      if (lastCursor <= after) break;
+      after = lastCursor;
+      if (page.length < 10_000) break;
+    }
+    return evidence;
+  }
+
+  private eventMatchesObjectiveAttempt(event: EventEnvelope, attemptId: string): boolean {
+    const payload = jsonRecord(event.payload);
+    const explicitAttemptIds = ["objectiveAttemptId", "attemptId"]
+      .filter((key) => Object.prototype.hasOwnProperty.call(payload, key))
+      .map((key) => payload[key]);
+    // Native terminal events historically carried only the durable agent ID.
+    // AgentRecord.logicalAgentId is the assignment's attempt identity, so an
+    // absent payload field remains provable through that durable binding.
+    return explicitAttemptIds.length === 0
+      || explicitAttemptIds.every((value) => typeof value === "string" && value === attemptId);
+  }
+
+  private objectiveMutationContext(
+    request: IncomingMessage,
+    runId: string,
+    action: string,
+  ): { run: ObjectiveRunRecord; authority: ObjectiveRuntimeAuthority; caller: AgentRecord | null } {
+    // Validate the capability before looking at mutation details. This keeps
+    // an invalid token from being confused with a legitimate empty/missing
+    // objective projection.
+    const caller = this.objectiveCaller(request);
+    const run = this.store.getObjectiveRun(runId);
+    if (!run) throw new HttpError(404, `Objective run not found: ${runId}`);
+    this.requireObjectiveAccess(request, run, action);
+    return { run, authority: this.objectiveAuthority(caller, this.effectiveWorkspaceGrant(this.objectiveWorkspaceGrant(run.runId), caller)), caller };
+  }
+
+  private objectiveAuthority(caller: AgentRecord | null, workspace: WorkspaceSpec | null = null): ObjectiveRuntimeAuthority {
+    const global = this.objectiveGlobalPolicyCeiling();
+    return caller
+      ? {
+          actor: { type: "agent", id: caller.id },
+          permissionCeiling: caller.permissions,
+          workspace,
+          allowedCapabilities: global.allowedCapabilities ?? [],
+          policy: { ...global, allowedCapabilities: global.allowedCapabilities ?? [], effectivePermission: caller.permissions },
+        }
+      : {
+          actor: { type: "user", id: "local-user" },
+          permissionCeiling: "full-access",
+          workspace,
+          allowedCapabilities: global.allowedCapabilities ?? [],
+          policy: { ...global, allowedCapabilities: global.allowedCapabilities ?? [] },
+        };
+  }
+
+  private objectiveGlobalPolicyCeiling(): ObjectivePolicyRequest {
+    const configured = this.loaded.config.policy;
+    const budget = {
+      ...configured.budget,
+      maxConcurrentAgents: intersectNullableLimit(configured.budget.maxConcurrentAgents, this.loaded.config.agents.maxConcurrent),
+      maxDepth: intersectNullableLimit(configured.budget.maxDepth, this.loaded.config.agents.maxDepth),
+    };
+    return {
+      effectivePermission: configured.effectivePermission,
+      allowedCapabilities: configured.allowedCapabilities,
+      budget,
+      sideEffectClassCeiling: configured.sideEffectClassCeiling,
+      approvalPolicy: configured.approvalPolicy,
+      expiresAt: configured.expiresAt,
+    };
+  }
+
+  /**
+   * Resolve the immutable workspace capability for a newly-created
+   * objective. An authenticated agent inherits its own native work-order
+   * grant; body-provided workspace fields are only checked as children of
+   * that grant. A local user can explicitly choose a project workspace.
+   */
+  private objectiveWorkspaceGrantForCreate(
+    parsed: z.infer<typeof ObjectiveCreateInputSchema>,
+    caller: AgentRecord | null,
+  ): WorkspaceSpec | null {
+    if (caller) {
+      const inherited = this.agentWorkspaceGrant(caller);
+      if (!inherited) throw new HttpError(409, "Authenticated objective creation requires an attached workspace grant.");
+      if (parsed.workspace) this.childWorkspaceGrant(inherited, parsed.workspace);
+      return inherited;
+    }
+    if (parsed.workspace) return this.canonicalWorkspaceSpec(parsed.workspace, "Objective workspace");
+    const explicit = (parsed.tasks ?? []).map((task) => task.workspace).filter((workspace): workspace is WorkspaceSpec => Boolean(workspace));
+    if (explicit.length === 0) return null;
+    // Preserve compatibility with the compact API, which historically put
+    // the selected project path on each first-plan task. Treat the first path
+    // as the user's explicit project grant and require every sibling task to
+    // remain beneath it.
+    const grant = this.canonicalWorkspaceSpec(explicit[0] as WorkspaceSpec, "Objective workspace");
+    for (const workspace of explicit) this.childWorkspaceGrant(grant, workspace);
+    return grant;
+  }
+
+  private objectiveWorkspaceGrantForPlan(tasks: readonly ObjectiveTask[], caller: AgentRecord | null): WorkspaceSpec | null {
+    if (caller) return this.agentWorkspaceGrant(caller);
+    const explicit = tasks.map((task) => task.workspace).filter((workspace): workspace is WorkspaceSpec => Boolean(workspace));
+    return explicit.length > 0 ? this.canonicalWorkspaceSpec(explicit[0] as WorkspaceSpec, "Objective workspace") : null;
+  }
+
+  /**
+   * Normalize task workspace paths before ObjectiveRuntime sees them. The
+   * check is repeated against the caller grant when a child agent contributes
+   * a replan, so a broader objective grant cannot be used to widen that child.
+   */
+  private normalizeObjectiveTasks(
+    tasks: readonly ObjectiveTask[],
+    objectiveGrant: WorkspaceSpec | null,
+    caller: AgentRecord | null,
+  ): ObjectiveTask[] {
+    const callerGrant = caller ? this.agentWorkspaceGrant(caller) : null;
+    if (objectiveGrant && callerGrant) {
+      // A caller whose current native grant is no longer inside the
+      // objective's immutable grant cannot replan, even if it submits no
+      // explicit task path (the runner would otherwise fall back to cwd).
+      this.childWorkspaceGrant(objectiveGrant, callerGrant);
+    }
+    return tasks.map((task) => {
+      if (!task.workspace) return task;
+      let workspace = objectiveGrant
+        ? this.childWorkspaceGrant(objectiveGrant, task.workspace)
+        : this.canonicalWorkspaceSpec(task.workspace, "Objective task workspace");
+      if (callerGrant) workspace = this.childWorkspaceGrant(callerGrant, workspace);
+      return { ...task, workspace };
+    });
+  }
+
+  private effectiveWorkspaceGrant(objectiveGrant: WorkspaceSpec | null, caller: AgentRecord | null): WorkspaceSpec | null {
+    const callerGrant = caller ? this.agentWorkspaceGrant(caller) : null;
+    if (!objectiveGrant) return callerGrant;
+    if (!callerGrant) return objectiveGrant;
+    try {
+      return this.childWorkspaceGrant(objectiveGrant, callerGrant);
+    } catch {
+      // Keep the objective grant as the runtime ceiling. normalizeObjectiveTasks
+      // performs the caller-specific check and returns the useful 403 detail.
+      return objectiveGrant;
+    }
+  }
+
+  private agentWorkspaceGrant(agent: AgentRecord): WorkspaceSpec | null {
+    const raw = this.store.getMetadata<JsonValue>(`work-order:${agent.id}`);
+    const parsed = raw ? AgentWorkOrderSchema.safeParse(raw) : null;
+    const candidate = parsed?.success ? parsed.data.workspace : { path: agent.workspacePath, dirtyPolicy: "local-only" as const };
+    try {
+      return this.canonicalWorkspaceSpec(candidate, "Agent workspace grant");
+    } catch (error) {
+      if (error instanceof HttpError) throw new HttpError(409, `Agent workspace grant is unavailable: ${error.message}`);
+      throw error;
+    }
+  }
+
+  private objectiveWorkspaceGrant(runId: string): WorkspaceSpec | null {
+    const raw = this.store.getMetadata<JsonValue>(objectiveWorkspaceKey(runId));
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+    const record = raw as Record<string, unknown>;
+    if (record.version !== 1) throw new HttpError(409, "Objective workspace authority is malformed and cannot be verified.");
+    const parsed = WorkspaceSpecSchema.safeParse(record.workspace);
+    if (!parsed.success) throw new HttpError(409, "Objective workspace authority is malformed and cannot be verified.");
+    try {
+      return this.canonicalWorkspaceSpec(parsed.data, "Objective workspace grant");
+    } catch (error) {
+      if (error instanceof HttpError) throw new HttpError(409, `Objective workspace authority is unavailable: ${error.message}`);
+      throw error;
+    }
+  }
+
+  private saveObjectiveWorkspaceGrant(runId: string, workspace: WorkspaceSpec, caller: AgentRecord | null): void {
+    const existing = this.objectiveWorkspaceGrant(runId);
+    if (existing && existing.path !== workspace.path) {
+      throw new HttpError(409, "Objective workspace authority is immutable and cannot be widened.");
+    }
+    this.store.setMetadata(objectiveWorkspaceKey(runId), {
+      version: 1,
+      runId,
+      workspace: serializableWorkspaceSpec(workspace),
+      source: caller ? "agent" : "user",
+      conductorAgentId: caller?.id ?? null,
+    });
+  }
+
+  private canonicalWorkspaceSpec(workspace: WorkspaceSpec, label: string): WorkspaceSpec {
+    return { ...workspace, path: this.canonicalWorkspacePath(workspace.path, label) };
+  }
+
+  private appendObjectiveApprovalRequestedEvent(
+    previous: ObjectiveRunRecord | null,
+    next: ObjectiveRunRecord,
+    actor: ObjectiveActor,
+  ): void {
+    const approvalId = next.pendingApprovalId;
+    if (!approvalId || approvalId === previous?.pendingApprovalId) return;
+    const approval = this.store.getObjectiveApproval(next.runId, approvalId);
+    if (!approval) return;
+    this.appendObjectiveEvent("objective.approval.requested", next, actor, {
+      objectiveId: next.objectiveId,
+      requestKey: approval.requestKey,
+      approvalId: approval.id,
+      kind: approval.kind,
+      taskId: approval.taskId,
+      status: approval.status,
+      question: approval.question,
+      planRevision: approval.planRevision,
+      operationId: approval.operationId,
+      sideEffectClass: approval.sideEffectClass,
+      canonicalTarget: approval.canonicalTarget,
+      expiresAt: approval.expiresAt,
+    });
+  }
+
+  private appendObjectiveEvent(
+    type: string,
+    run: ObjectiveRunRecord,
+    actor: ObjectiveActor,
+    payload: Record<string, JsonValue>,
+  ): void {
+    this.store.appendEvent({
+      type,
+      workflowId: run.workflowId,
+      runId: run.runId,
+      agentId: actor.type === "agent" ? actor.id : run.conductorAgentId,
+      occurredAt: nowIso(),
+      payload: { ...payload, actor },
+      provenance: { source: "daemon" },
+    });
   }
 
   private async createAgent(request: IncomingMessage, payload: unknown): Promise<unknown> {
@@ -1736,14 +5709,17 @@ export class SymphonyDaemon {
       objective: z.string().min(1), model: z.string().default("auto"),
       harness: z.enum(["auto", "codex", "claude", "cursor", "opencode", "pi", "acp"]).default("auto"),
       permissions: z.enum(["read-only", "full-access"]).optional(),
-      outputSchema: z.record(z.string(), JsonValueSchema), routing: z.unknown().optional(), workspace: z.unknown().optional(), inputs: z.array(z.unknown()).default([]),
+      outputSchema: z.record(z.string(), JsonValueSchema), routing: z.unknown().optional(), workspace: WorkspaceSpecSchema.optional(), inputs: z.array(z.unknown()).default([]),
     }).parse(payload);
+    const parentWorkspace = WorkspaceSpecSchema.safeParse(parentOrder.workspace);
+    if (!parentWorkspace.success) throw new HttpError(409, "Parent work order has no valid workspace grant.");
+    const workspace = this.childWorkspaceGrant(parentWorkspace.data, child.workspace);
     const workOrder = {
       workflowId: parent.workflowId, runId: parent.runId, parentAgentId: parent.id, depth: parent.depth + 1,
       mission: parentOrder.mission, objective: child.objective, model: child.model, harness: child.harness,
       permissions: child.permissions ?? parent.permissions, outputSchema: child.outputSchema,
       ...(child.routing === undefined ? {} : { routing: child.routing }),
-      workspace: child.workspace ?? parentOrder.workspace, inputs: child.inputs,
+      workspace, inputs: child.inputs,
     };
     const receipt = await this.command(CommandSchema.parse({
       idempotencyKey,
@@ -1788,6 +5764,37 @@ export class SymphonyDaemon {
       : { type: "user", id: null };
   }
 
+  private workflowRunOrigin(actor: Command["actor"]): WorkflowRunOrigin {
+    if (actor.type !== "agent") {
+      return {
+        kind: "user",
+        threadId: null,
+        parentRunId: null,
+        parentAgentId: null,
+        baseDepth: -1,
+        permissionCeiling: "full-access",
+      };
+    }
+    if (!actor.id) throw new HttpError(401, "An agent workflow run requires an authenticated actor id.");
+    const parent = this.agents.get(actor.id);
+    const maxDepth = this.loaded.config.agents.maxDepth;
+    if (maxDepth !== null && parent.depth + 1 > maxDepth) {
+      throw new HttpError(403, `Maximum agent depth ${maxDepth} exceeded.`);
+    }
+    const parentRun = this.store.getRun(parent.runId);
+    const threadId = parent.workflowId.startsWith("chat:")
+      ? parent.workflowId.slice("chat:".length)
+      : parentRun?.origin?.threadId ?? null;
+    return {
+      kind: "agent",
+      threadId,
+      parentRunId: parent.runId,
+      parentAgentId: parent.id,
+      baseDepth: parent.depth,
+      permissionCeiling: parent.permissions,
+    };
+  }
+
   private requireFullAccessAgent(request: IncomingMessage, action: string): void {
     const callerId = request.headers["x-symphony-agent-id"];
     if (callerId === undefined) return;
@@ -1800,11 +5807,155 @@ export class SymphonyDaemon {
     }
   }
 
+  /** Authority callbacks for the daemon-owned semantic message bus. */
+  private agentMessageAuthority() {
+    return {
+      canAppend: (actorId: string, input: AgentMessageInput) => actorId === "local-user"
+        || (input.senderId === actorId && this.agentMessageCanAccess(actorId, input)),
+      canRead: (actorId: string, message: AgentMessageRecord) => this.agentMessageCanAccess(actorId, message),
+      canHandle: (actorId: string, message: AgentMessageRecord, _decision: AgentMessageDecision) => actorId === "local-user"
+        || this.agentMessageCanAccess(actorId, message),
+      canCancel: (actorId: string, message: AgentMessageRecord) => actorId === "local-user"
+        || this.agentMessageCanAccess(actorId, message),
+      canExpire: (actorId: string, message: AgentMessageRecord) => actorId === "local-user"
+        || actorId === "system:message-expiry"
+        || this.agentMessageCanAccess(actorId, message),
+    };
+  }
+
+  private agentMessageCanAccess(actorId: string, message: Pick<AgentMessageRecord, "senderId" | "recipientId" | "parentAgentId" | "objectiveId" | "runId">): boolean {
+    if (actorId === "local-user") return true;
+    const actor = this.store.getAgent(actorId);
+    if (!actor) return false;
+    if ([message.senderId, message.recipientId, message.parentAgentId].includes(actorId)) return true;
+    for (const targetId of [message.senderId, message.recipientId, message.parentAgentId]) {
+      if (!targetId) continue;
+      const target = this.store.getAgent(targetId);
+      if (target && (this.isAgentAncestor(actor, target) || this.isAgentAncestor(target, actor))) return true;
+    }
+    if (message.runId === actor.runId) return true;
+    if (message.objectiveId !== null && this.store.listObjectiveRuns({ objectiveId: message.objectiveId, limit: 2_000 }).some((run) => run.runId === actor.runId)) return true;
+    return false;
+  }
+
+  private isAgentAncestor(ancestor: AgentRecord, descendant: AgentRecord): boolean {
+    let current: AgentRecord | null = descendant;
+    const visited = new Set<string>();
+    while (current.parentAgentId !== null) {
+      if (visited.has(current.id)) return false;
+      visited.add(current.id);
+      const parent = this.store.getAgent(current.parentAgentId);
+      if (!parent) return false;
+      if (parent.id === ancestor.id) return true;
+      current = parent;
+    }
+    return false;
+  }
+
   private requireAgentAuthentication(request: IncomingMessage, agentId: string): void {
     const callerId = request.headers["x-symphony-agent-id"];
     const token = request.headers["x-symphony-agent-token"];
     if (callerId !== agentId || typeof token !== "string" || !this.agents.authenticate(agentId, token)) {
       throw new HttpError(401, "Invalid agent coordination token");
+    }
+  }
+
+  /**
+   * Native agents get a capability token, not the broad user control plane.
+   * Keep coordination operations inside the caller's durable agent tree so a
+   * compromised or confused child cannot steer unrelated work in the store.
+   */
+  private requireAgentTargetAccess(request: IncomingMessage, targetAgentId: string, action: string): void {
+    const callerId = request.headers["x-symphony-agent-id"];
+    if (callerId === undefined) return;
+    const token = request.headers["x-symphony-agent-token"];
+    if (typeof callerId !== "string" || typeof token !== "string") {
+      throw new HttpError(401, "Invalid agent coordination token");
+    }
+    const caller = this.store.getAgent(callerId);
+    if (!caller || !this.agents.authenticate(callerId, token)) {
+      throw new HttpError(401, "Invalid agent coordination token");
+    }
+    const target = this.store.getAgent(targetAgentId);
+    if (!target) throw new HttpError(404, `Agent not found: ${targetAgentId}`);
+    if (!this.sharesAgentRoot(caller, target)) {
+      throw new HttpError(403, `An authenticated agent may ${action} only agents in its root lineage.`);
+    }
+  }
+
+  /**
+   * Workflow runs are a separate durable resource from their step agents. A
+   * run must therefore be authorized from its immutable origin when present,
+   * with the materialized run agents as a compatibility path for older runs.
+   * An authenticated agent can never fall back to broad run access.
+   */
+  private requireAgentRunAccess(request: IncomingMessage, runId: string, action: string): void {
+    const callerId = request.headers["x-symphony-agent-id"];
+    if (callerId === undefined) return;
+    const token = request.headers["x-symphony-agent-token"];
+    if (typeof callerId !== "string" || typeof token !== "string") {
+      throw new HttpError(401, "Invalid agent coordination token");
+    }
+    const caller = this.store.getAgent(callerId);
+    if (!caller || !this.agents.authenticate(callerId, token)) {
+      throw new HttpError(401, "Invalid agent coordination token");
+    }
+    const run = this.store.getRun(runId);
+    if (!run) throw new HttpError(404, `Workflow run not found: ${runId}`);
+
+    const originAgent = run.origin?.parentAgentId ? this.store.getAgent(run.origin.parentAgentId) : null;
+    const runAgents = this.store.listAgents({ runId });
+    const ownedByCaller = (originAgent && this.sharesAgentRoot(caller, originAgent))
+      || runAgents.some((agent) => this.sharesAgentRoot(caller, agent));
+    if (!ownedByCaller) {
+      throw new HttpError(403, `An authenticated agent may ${action} only runs in its root lineage.`);
+    }
+  }
+
+  private sharesAgentRoot(left: AgentRecord, right: AgentRecord): boolean {
+    const leftRoot = this.agentRoot(left);
+    const rightRoot = this.agentRoot(right);
+    return Boolean(
+      leftRoot
+      && rightRoot
+      && leftRoot.id === rightRoot.id
+      && leftRoot.runId === rightRoot.runId,
+    );
+  }
+
+  private agentRoot(agent: AgentRecord): AgentRecord | null {
+    let current = agent;
+    const visited = new Set<string>();
+    while (current.parentAgentId !== null) {
+      if (visited.has(current.id)) return null;
+      visited.add(current.id);
+      const parent = this.store.getAgent(current.parentAgentId);
+      if (!parent) return null;
+      current = parent;
+    }
+    return current;
+  }
+
+  /**
+   * Canonicalize a child workspace before it enters an AgentWorkOrder. A
+   * lexical path check alone is insufficient: symlinks can escape a grant
+   * after normalization. Realpath both sides and compare path components.
+   */
+  private childWorkspaceGrant(parent: z.infer<typeof WorkspaceSpecSchema>, child?: z.infer<typeof WorkspaceSpecSchema>): z.infer<typeof WorkspaceSpecSchema> {
+    try {
+      return containedChildWorkspaceGrant(parent, child, this.loaded.rootDirectory);
+    } catch (error) {
+      if (error instanceof WorkspaceContainmentError) throw new HttpError(403, error.message);
+      throw error;
+    }
+  }
+
+  private canonicalWorkspacePath(inputPath: string, label: string): string {
+    try {
+      return containedCanonicalWorkspacePath(inputPath, this.loaded.rootDirectory, label);
+    } catch (error) {
+      if (error instanceof WorkspaceContainmentError) throw new HttpError(403, error.message);
+      throw error;
     }
   }
 
@@ -1995,18 +6146,31 @@ export class SymphonyDaemon {
         if (previous?.hash === ir.hash) {
           result = previous as unknown as JsonValue;
           if (this.loaded.config.workflows.triggersEnabled) {
-            this.triggers.register(new WorkflowCompiler().compile(previous.definition, previous.revision));
+            this.registerWorkflowTriggers(new WorkflowCompiler().compile(previous.definition, previous.revision));
           }
         } else {
+          // Claim the activation policy before the workflow record becomes
+          // visible. If the daemon dies between registration and trigger
+          // startup, recovery still sees the agent proposal as pending.
+          this.persistWorkflowTriggerPolicy(
+            ir,
+            command.actor.type === "agent" ? "pending" : "active",
+            command.actor.type === "agent" ? "agent" : "user",
+          );
           result = this.workflows.register(ir) as unknown as JsonValue;
-          if (this.loaded.config.workflows.triggersEnabled) this.triggers.register(ir);
+          if (this.loaded.config.workflows.triggersEnabled) {
+            this.registerWorkflowTriggers(ir);
+          }
         }
       } else if (command.type === "workflow.run") {
         const payload = command.payload as Record<string, JsonValue>;
         result = this.workflows.start(
           String(payload.workflowId),
           payload.input ?? {},
-          { runId: commandDerivedId("run", command.idempotencyKey) },
+          {
+            runId: commandDerivedId("run", command.idempotencyKey),
+            origin: this.workflowRunOrigin(command.actor),
+          },
         ) as unknown as JsonValue;
       } else if (command.type === "workflow.cancel") result = this.workflows.cancel(String((command.payload as Record<string, JsonValue>).runId)) as unknown as JsonValue;
       else if (command.type === "plugin.invoke") {
@@ -2083,7 +6247,7 @@ export class SymphonyDaemon {
         if (registered) {
           const candidate = new WorkflowCompiler().compile(payload, registered.revision);
           if (candidate.hash === registered.hash) {
-            if (this.loaded.config.workflows.triggersEnabled) this.triggers.register(candidate);
+            if (this.loaded.config.workflows.triggersEnabled) this.registerWorkflowTriggers(candidate);
             return this.settleRecoveredCommandReceipt(receipt, registered as unknown as JsonValue);
           }
         }
@@ -2680,15 +6844,72 @@ export class SymphonyDaemon {
         types: UI_EVENT_TYPES.filter((type) => type !== "chat.message.updated" && !type.startsWith("driver.tool.")),
         typePrefixes: UI_EVENT_PREFIXES,
       }),
-      workflows: this.store.listWorkflows() as unknown as JsonValue[],
+      workflows: this.workflowReadProjection() as unknown as JsonValue[],
       runs: runs as unknown as JsonValue[], agents,
-      messages: [], projects: this.projects.list(), costs: summarizeUsage(usage),
+      messages: [], attentions: this.store.listObjectiveAttentions({ limit: 2_000 }), projects: this.projects.list(), costs: summarizeUsage(usage),
       runCosts: Object.fromEntries(runs.map((run) => [run.id, summarizeUsage(usage.filter((event) => event.runId === run.id))])),
       agentCosts: Object.fromEntries(agents.map((agent) => [agent.id, summarizeUsage(usage.filter((event) => event.agentId === agent.id))])),
       plugins: this.store.listPluginStates() as unknown as JsonValue[],
       settings: this.settings(),
       daemon: { version: "0.1.0", startedAt: this.startedAt, noPlugins: this.options.noPlugins ?? false },
     };
+  }
+
+  private workflowTriggerPolicy(ir: WorkflowIr): WorkflowTriggerPolicy | null | "invalid" {
+    const value = this.store.getMetadata<JsonValue>(workflowTriggerPolicyKey(ir.definition.id));
+    if (value === null) return null;
+    const parsed = WorkflowTriggerPolicySchema.safeParse(value);
+    if (!parsed.success) return "invalid";
+    return parsed.data;
+  }
+
+  /**
+   * Rebuild a trigger only after consulting its durable activation policy.
+   * Unknown legacy workflows default to active for backwards compatibility;
+   * newly registered agent workflows always persist `pending` before their
+   * workflow record is written, so a crash cannot silently activate them.
+   */
+  private registerWorkflowTriggers(ir: WorkflowIr): void {
+    const policy = this.workflowTriggerPolicy(ir);
+    const matches = policy !== null
+      && policy !== "invalid"
+      && policy.workflowId === ir.definition.id
+      && policy.revision === ir.revision
+      && policy.hash === ir.hash;
+    const mode = policy === "invalid" ? "pending" : matches ? policy.mode : "active";
+    if (policy === null || (policy !== "invalid" && !matches)) {
+      this.persistWorkflowTriggerPolicy(ir, "active", "user");
+    }
+    this.triggers.register(ir, { mode });
+  }
+
+  private persistWorkflowTriggerPolicy(ir: WorkflowIr, mode: WorkflowTriggerPolicy["mode"], source: WorkflowTriggerPolicy["source"]): void {
+    this.store.setMetadata(workflowTriggerPolicyKey(ir.definition.id), WorkflowTriggerPolicySchema.parse({
+      version: 1,
+      workflowId: ir.definition.id,
+      revision: ir.revision,
+      hash: ir.hash,
+      mode,
+      source,
+      updatedAt: nowIso(),
+    }) as unknown as JsonValue);
+  }
+
+  private workflowReadProjection(): Array<JsonValue> {
+    return this.store.listWorkflows().map((record) => {
+      const value = this.store.getMetadata<JsonValue>(workflowTriggerPolicyKey(record.id));
+      const parsed = value === null ? null : WorkflowTriggerPolicySchema.safeParse(value);
+      const policy = parsed === null ? null : parsed.success ? parsed.data : "invalid" as const;
+      const matches = policy !== null
+        && policy !== "invalid"
+        && policy.workflowId === record.id
+        && policy.revision === record.revision
+        && policy.hash === record.hash;
+      return {
+        ...record,
+        triggerState: policy === "invalid" ? "pending" : matches && policy.mode === "pending" ? "pending" : "active",
+      } as unknown as JsonValue;
+    });
   }
 
   private usageHeatmap(weeks: number) {
@@ -2712,7 +6933,11 @@ export class SymphonyDaemon {
       const day = byDate.get(localDateKey(new Date(event.recordedAt)));
       if (!day) continue;
       day.eventCount += 1;
-      if (event.costAmount === null) day.unknownEvents += 1;
+      // The heatmap's contract is explicitly USD. Provider-reported amounts
+      // in another currency are still recorded as usage, but remain unknown
+      // here until a durable FX snapshot exists; never add EUR/JPY/etc. to a
+      // number labelled USD.
+      if (!isKnownUsdCost(event)) day.unknownEvents += 1;
       else day.knownCost += event.costAmount;
     }
     return {
@@ -2792,10 +7017,27 @@ export class SymphonyDaemon {
     return settings;
   }
 
-  private events(request: IncomingMessage, response: ServerResponse, url: URL): void {
+  private events(
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    scopedRunId?: string,
+    scopedTypes?: readonly string[],
+  ): void {
     const cursor = Number(url.searchParams.get("after") ?? request.headers["last-event-id"] ?? 0);
     const uiProjection = url.searchParams.get("projection") === "ui";
-    const eventOptions = uiProjection ? { types: UI_EVENT_TYPES, typePrefixes: UI_EVENT_PREFIXES } : {};
+    const queryTypes = url.searchParams.getAll("type").flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
+    const queryPrefixes = url.searchParams.getAll("typePrefix").flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean);
+    // Explicit control-plan streams are semantic invalidation channels, not
+    // generic UI projections. Keep their type scope authoritative even if a
+    // caller appends `projection=ui` or unrelated query filters.
+    const requestedTypes = scopedTypes ?? (uiProjection ? UI_EVENT_TYPES : queryTypes);
+    const requestedPrefixes = scopedTypes ? [] : (uiProjection ? UI_EVENT_PREFIXES : queryPrefixes);
+    const eventOptions = {
+      ...((scopedRunId ?? url.searchParams.get("runId")) ? { runId: scopedRunId ?? url.searchParams.get("runId") as string } : {}),
+      ...(requestedTypes.length > 0 ? { types: requestedTypes } : {}),
+      ...(requestedPrefixes.length > 0 ? { typePrefixes: requestedPrefixes } : {}),
+    };
     response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform", connection: "keep-alive", "x-accel-buffering": "no" });
     // Flush an initial frame even when the client is already at the latest cursor.
     // Without it, fetch() does not resolve until the 15s heartbeat and a healthy
@@ -2805,9 +7047,15 @@ export class SymphonyDaemon {
     let replaying = true;
     const buffered: EventEnvelope[] = [];
     const unsubscribe = this.store.onEvent((event) => {
-      if (uiProjection && !isUiProjectionEvent(event.type)) return;
+      if (!eventMatchesFilter(event, eventOptions)) return;
       if (replaying) buffered.push(event);
-      else writeEvent(response, event);
+      else {
+        // Chat presentation events may persist only a message identity to
+        // keep the event log bounded. Rehydrate that identity against the
+        // authoritative transcript before sending the live UI projection so
+        // live delivery has the same shape as replay after a reload.
+        for (const projected of projectStoredBacklog(this.store, [event])) writeEvent(response, projected);
+      }
     });
 
     // Subscribe before taking the high-water mark so events cannot fall into
@@ -2984,6 +7232,113 @@ class HttpError extends Error {
   constructor(readonly status: number, message: string) { super(message); }
 }
 
+/** Read-only Git evidence. Any command failure is retained as an unproven value. */
+function captureGitWorkspaceEvidence(workspacePath: string | null): {
+  repo: string | null;
+  repository?: string;
+  ref: string | null;
+  commit: string | null;
+  dirty: boolean | null;
+  patchHash: string | null;
+  worktree: string | null;
+} {
+  const empty = { repo: null, ref: null, commit: null, dirty: null, patchHash: null, worktree: null };
+  if (!workspacePath) return empty;
+  const git = (args: string[]): string | null => {
+    try {
+      const value = execFileSync("git", ["-C", workspacePath, ...args], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        maxBuffer: 8 * 1024 * 1024,
+      }).trim();
+      return value || null;
+    } catch {
+      return null;
+    }
+  };
+  const root = git(["rev-parse", "--show-toplevel"]);
+  if (!root) return empty;
+  const remote = redactGitRemote(git(["config", "--get", "remote.origin.url"]));
+  const ref = git(["symbolic-ref", "--short", "HEAD"]);
+  const commit = git(["rev-parse", "HEAD"]);
+  const status = git(["status", "--porcelain"]);
+  const patch = status ? git(["diff", "--binary", "HEAD"]) : null;
+  return {
+    repo: remote ?? root,
+    ...(remote ? { repository: remote } : {}),
+    ref,
+    commit,
+    dirty: status === null ? null : status.length > 0,
+    patchHash: patch ? createHash("sha256").update(patch).digest("hex") : null,
+    worktree: root,
+  };
+}
+
+function redactGitRemote(remote: string | null): string | null {
+  if (!remote) return null;
+  try {
+    const parsed = new URL(remote);
+    parsed.username = "";
+    parsed.password = "";
+    return parsed.toString();
+  } catch {
+    // SCP-style remotes have no URL parser representation. Do not persist a
+    // potentially credential-bearing value; the canonical local worktree is
+    // still a provable repository identity.
+    return null;
+  }
+}
+
+function sideEffectRank(value: "read" | "local" | "external" | "irreversible"): number {
+  return value === "read" ? 0 : value === "local" ? 1 : value === "external" ? 2 : 3;
+}
+
+function intersectNullableLimit(left: number | null, right: number | null): number | null {
+  if (left === null) return right;
+  if (right === null) return left;
+  return Math.min(left, right);
+}
+
+function objectiveRuntimeHttpStatus(error: unknown): number | null {
+  if (!(error instanceof ObjectiveRuntimeError)) return null;
+  switch (error.code) {
+    case "not-found":
+    case "approval-not-found":
+      return 404;
+    case "invalid-plan":
+      return 400;
+    case "authority-exceeded":
+      return 403;
+    case "invalid-authority":
+      return 401;
+    case "idempotency-conflict":
+    case "revision-conflict":
+    case "invalid-state":
+    case "replan-limit":
+    case "approval-required":
+      return 409;
+    case "policy-expired":
+    case "policy-mismatch":
+      return 409;
+  }
+}
+
+function objectiveOccurrenceOutcomeFromRunState(
+  state: ObjectiveRunRecord["state"],
+): ObjectiveOccurrenceOutcomeState {
+  switch (state) {
+    case "planning": return "queued";
+    case "awaiting-approval": return "waiting";
+    case "executing":
+    case "evaluating":
+    case "replanning": return "running";
+    case "succeeded": return "succeeded";
+    case "failed": return "failed";
+    case "cancelled": return "cancelled";
+    case "interrupted": return "interrupted";
+  }
+}
+
 class DriverUpdateOutcomeUnknownError extends HttpError {
   constructor(message: string, options?: ErrorOptions) {
     super(425, message);
@@ -3012,7 +7367,22 @@ async function body(request: IncomingMessage): Promise<unknown> {
 }
 
 function writeEvent(response: ServerResponse, event: EventEnvelope): void {
-  response.write(`id: ${event.cursor}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
+  // The store sanitizes new writes. Re-project here as a defense-in-depth
+  // boundary for legacy rows created before worker payload limits existed.
+  const isWorkerEvent = event.provenance?.source === "driver" || event.provenance?.rawProvenance !== undefined;
+  const provenance = isWorkerEvent && event.provenance?.rawProvenance
+    ? {
+      ...event.provenance,
+      rawProvenance: {
+        ...event.provenance.rawProvenance,
+        payload: projectWorkerEventPayload(event.provenance.rawProvenance.payload) as JsonValue,
+      },
+    }
+    : event.provenance;
+  const exported = isWorkerEvent
+    ? { ...event, payload: projectWorkerEventPayload(event.payload) as JsonValue, provenance }
+    : event;
+  response.write(`id: ${exported.cursor}\nevent: ${exported.type}\ndata: ${JSON.stringify(exported)}\n\n`);
 }
 
 function projectStoredBacklog(store: SymphonyStore, events: EventEnvelope[]): EventEnvelope[] {
@@ -3044,12 +7414,14 @@ function chatUpdateKey(event: EventEnvelope): string | null {
   return messageId ? `${threadId ?? "unknown"}:${messageId}` : null;
 }
 
-function summarizeUsage(events: UsageEvent[]): JsonValue {
+export function summarizeUsage(events: UsageEvent[]): JsonValue {
   const byBasis: Record<string, number> = {};
   let knownTotal = 0;
   let unknownEvents = 0;
   for (const event of events) {
-    if (event.costAmount === null) {
+    // This projection is labelled USD. Do not silently treat a provider's
+    // non-USD amount as dollars without a durable FX snapshot.
+    if (!isKnownUsdCost(event)) {
       unknownEvents += 1;
       continue;
     }
@@ -3059,12 +7431,29 @@ function summarizeUsage(events: UsageEvent[]): JsonValue {
   return { currency: "USD", knownTotal, unknownEvents, eventCount: events.length, byBasis };
 }
 
+function isKnownUsdCost(event: UsageEvent): event is UsageEvent & { costAmount: number } {
+  return event.costAmount !== null && event.currency.trim().toUpperCase() === "USD";
+}
+
 function hashMission(statement: string, keyResults: string[]): string {
   return createHash("sha256").update(`${statement}\0${keyResults.join("\0")}`).digest("hex");
 }
 
 function projectIdForPath(workspacePath: string): string {
   return `project-${createHash("sha256").update(workspacePath).digest("hex").slice(0, 16)}`;
+}
+
+function objectiveWorkspaceKey(runId: string): string {
+  return `objective-workspace:${runId}`;
+}
+
+function serializableWorkspaceSpec(workspace: WorkspaceSpec): JsonValue {
+  return {
+    path: workspace.path,
+    dirtyPolicy: workspace.dirtyPolicy,
+    ...(workspace.remoteRepository ? { remoteRepository: workspace.remoteRepository } : {}),
+    ...(workspace.startingRef ? { startingRef: workspace.startingRef } : {}),
+  };
 }
 
 type ToolLifecycle = "started" | "updated" | "completed";
@@ -3739,6 +8128,40 @@ function localDateKey(value: Date): string {
 function isUiProjectionEvent(type: string): boolean {
   return UI_EVENT_TYPES.includes(type as (typeof UI_EVENT_TYPES)[number])
     || UI_EVENT_PREFIXES.some((prefix) => type.startsWith(prefix));
+}
+
+function eventMatchesFilter(
+  event: EventEnvelope,
+  options: { runId?: string; types?: readonly string[]; typePrefixes?: readonly string[] },
+): boolean {
+  if (options.runId !== undefined && event.runId !== options.runId) return false;
+  const typeMatch = options.types === undefined || options.types.length === 0 || options.types.includes(event.type);
+  const prefixMatch = options.typePrefixes === undefined
+    || options.typePrefixes.length === 0
+    || options.typePrefixes.some((prefix) => event.type.startsWith(prefix));
+  // Storage treats explicit type and prefix filters as an OR. Preserve that
+  // contract for live events so an SSE subscriber sees the same stream during
+  // replay and after the subscription high-water mark.
+  if (options.types?.length && options.typePrefixes?.length) return typeMatch || prefixMatch;
+  return typeMatch && prefixMatch;
+}
+
+function attentionApprovalStatus(
+  input: ObjectiveAttentionResolveRequest,
+): Extract<ObjectiveApprovalRecord["status"], "approved" | "rejected" | "expired" | "cancelled"> | null {
+  if (input.status === "expired") return "expired";
+  if (input.status === "cancelled") return "cancelled";
+  const decision = input.decision;
+  if (decision && typeof decision === "object" && !Array.isArray(decision) && typeof decision.approved === "boolean") {
+    return decision.approved ? "approved" : "rejected";
+  }
+  if (decision === true || decision === "approved") return "approved";
+  if (decision === false || decision === "rejected") return "rejected";
+  return null;
+}
+
+function attentionApprovalResolutionKey(sourceRequestKey: string, attentionId: string): string {
+  return `objective-attention-approval:${sourceRequestKey}:${attentionId}`;
 }
 
 function commandFingerprint(command: Command): string {

@@ -66,6 +66,53 @@ function toolEvent(cursor: number, type: string, occurredAt: string, payload: Ev
 }
 
 describe("trace timing", () => {
+  it("ignores late driver events that do not render a visible span", () => {
+    const lateOutput = toolEvent(1, "driver.output.delta", "2026-08-31T00:00:00.000Z", {
+      text: "adopted output",
+    });
+    const settledAgentWithLateMetadata = {
+      ...baseAgent,
+      updatedAt: "2026-08-31T01:00:00.000Z",
+    };
+    const model = buildTraceModel(snapshot(settledAgentWithLateMetadata, [lateOutput]));
+
+    expect(model.range.max).toBe(Date.parse(baseAgent.finishedAt!));
+    expect(model.spans).toHaveLength(2);
+  });
+
+  it("collapses long idle gaps between reusable chat turns without changing their latency", () => {
+    const first = {
+      ...baseAgent,
+      id: "turn-1",
+      startedAt: "2026-08-30T00:00:00.000Z",
+      updatedAt: "2026-08-30T00:00:05.000Z",
+      finishedAt: "2026-08-30T00:00:05.000Z",
+    };
+    const second = {
+      ...baseAgent,
+      id: "turn-2",
+      startedAt: "2026-08-30T12:00:00.000Z",
+      updatedAt: "2026-08-30T12:00:10.000Z",
+      finishedAt: "2026-08-30T12:00:10.000Z",
+    };
+    const chatSnapshot: RunSnapshot = {
+      ...snapshot(first),
+      runId: "chat-run:thread-1",
+      workflowId: "chat:thread-1",
+      agents: [first, second],
+    };
+
+    const model = buildTraceModel(chatSnapshot);
+    const firstSpan = model.spans.find((span) => span.id === first.id)!;
+    const secondSpan = model.spans.find((span) => span.id === second.id)!;
+
+    expect(model.range.max - model.range.min).toBe(16_000);
+    expect(secondSpan.startedAt - firstSpan.endedAt!).toBe(1_000);
+    expect(firstSpan.latencyMs).toBe(5_000);
+    expect(secondSpan.latencyMs).toBe(10_000);
+    expect(model.collapsedIdleMs).toBe(43_194_000);
+  });
+
   it("keeps all settled span timestamps stable across observations and refreshes", () => {
     const events = [
       toolEvent(1, "driver.tool.started", "2026-08-30T00:00:05.000Z", {

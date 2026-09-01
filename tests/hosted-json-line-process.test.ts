@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { HostedJsonLineProcess } from "../packages/drivers/src/hosted-process.js";
 import { JsonLineProcess } from "../packages/drivers/src/process.js";
 import {
@@ -26,6 +26,7 @@ function wait(ms: number): Promise<void> {
 
 class HostedSupervisor implements DriverProcessSupervisor {
   lease: WorkerProcessLease | null = null;
+  retirementRequests: Array<{ leaseId: string; reason: string; error: string | null | undefined }> = [];
   generation = 1;
   readonly root: string;
 
@@ -140,6 +141,23 @@ class HostedSupervisor implements DriverProcessSupervisor {
       exitCode: result.exitCode,
       signal: result.signal,
       error: result.error ?? null,
+      revision: lease.revision + 1,
+    });
+    return this.lease;
+  }
+
+  requestProcessRetirement(
+    leaseId: string,
+    request: { reason: "controller-lost"; error?: string | null },
+  ): WorkerProcessLease {
+    const lease = this.require(leaseId);
+    this.retirementRequests.push({ leaseId, reason: request.reason, error: request.error });
+    this.lease = WorkerProcessLeaseSchema.parse({
+      ...lease,
+      retirementRequestedAt: new Date().toISOString(),
+      retirementReason: request.reason,
+      error: request.error ?? lease.error,
+      updatedAt: new Date().toISOString(),
       revision: lease.revision + 1,
     });
     return this.lease;
@@ -397,6 +415,61 @@ describe("hosted JSONL process", () => {
     await wait(20);
     expect(() => process.kill(workerPid, 0)).toThrow();
     expect(() => process.kill(hostPid as number, 0)).toThrow();
+  });
+
+  it("persists a controller-lost retirement intent when reconnect grace is exhausted", async () => {
+    const supervisor = new HostedSupervisor();
+    const unexpected: Error[] = [];
+    const transport = new HostedJsonLineProcess({
+      command: process.execPath,
+      args: [resolve("tests/fixtures/worker-host-child.mjs")],
+      cwd: process.cwd(),
+      env: process.env,
+      processSupervisor: supervisor,
+      processRole: "codex-app-server",
+    }, {
+      onNotification: () => undefined,
+      onUnexpectedExit: (error: Error) => unexpected.push(error),
+    });
+
+    await transport.activate();
+    const response = await transport.request("fixture/echo", { phase: "before-reconnect-exhaustion" });
+    const workerPid = (response as { pid: number }).pid;
+    const hostPid = supervisor.lease?.transport.kind === "worker-host"
+      ? supervisor.lease.transport.hostIdentity?.pid
+      : null;
+    expect(workerPid).toBeGreaterThan(0);
+    expect(hostPid).toBeGreaterThan(0);
+
+    const internals = transport as unknown as {
+      connection: { socket: { destroy: () => void } } | null;
+      connectionOptions: { socketPath: string };
+    };
+    internals.connectionOptions.socketPath = join(supervisor.root, "missing-controller.sock");
+    const initialNow = Date.now();
+    let nowCalls = 0;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => {
+      nowCalls += 1;
+      return nowCalls <= 1 ? initialNow : initialNow + 10_000;
+    });
+    internals.connection?.socket.destroy();
+    await expect.poll(() => supervisor.retirementRequests.length, { timeout: 3_000, interval: 10 }).toBe(1);
+    now.mockRestore();
+
+    expect(supervisor.retirementRequests[0]).toMatchObject({ reason: "controller-lost" });
+    expect(supervisor.lease).toMatchObject({
+      state: "running",
+      retirementReason: "controller-lost",
+      retirementRequestedAt: expect.any(String),
+    });
+    expect(unexpected).toHaveLength(1);
+    expect(() => process.kill(workerPid, 0)).not.toThrow();
+
+    try {
+      process.kill(-(hostPid as number), "SIGKILL");
+    } catch {
+      // The host-side controller grace may have already retired the group.
+    }
   });
 
   it("rejects adoption when the worker host has acknowledged output beyond the durable projection", async () => {

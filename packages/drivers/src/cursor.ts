@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import { Cursor, type AgentOptions, type SDKMessage } from "@cursor/sdk";
 import { environmentWithoutDaemonSecret, type SecretStore, type SymphonyConfig } from "@symphony/config";
 import { existsSync } from "node:fs";
@@ -9,16 +8,17 @@ import type {
   DriverDoctorResult,
   DriverEvent,
   DriverLifecycleOptions,
+  DriverMessageRequest,
   DriverSession,
   DriverStartRequest,
   JsonValue,
   ModelDescriptor,
   WorkerDriver,
 } from "@symphony/protocol";
-import { buildAgentPrompt } from "./prompt.js";
+import { buildAgentPrompt, coordinationPromptOptions } from "./prompt.js";
 import { HostedJsonLineProcess } from "./hosted-process.js";
 import { JsonLineProcess, asObject, asString, type JsonLineRpcTransport } from "./process.js";
-import { capabilities, emit, makeSession, record, stringifyError, toJson, type Emit } from "./common.js";
+import { capabilities, emit, makeSession, messageRequest, record, stringifyError, toJson, withMessageIdentity, type Emit } from "./common.js";
 
 export type EffectiveModel = {
   mode: "auto" | "explicit" | "resolved-auto";
@@ -33,7 +33,9 @@ type InitialCursorDispatch = {
   generation: number;
 };
 type CursorPromptDispatch = {
+  attemptId: string;
   requestId: string;
+  contentHash: string;
   state: "dispatching" | "accepted";
   baseRunId: string | null;
   baseGeneration: number;
@@ -172,7 +174,7 @@ export class CursorDriver implements WorkerDriver {
       const result = asObject(await rpc.requestWithId(
         initial.requestId,
         "session/start",
-        { requestId: initial.requestId, prompt: buildAgentPrompt(request.workOrder), options: prepared.options, effectiveModel: prepared.effectiveModel },
+        { requestId: initial.requestId, prompt: buildAgentPrompt(request.workOrder, coordinationPromptOptions(request)), options: prepared.options, effectiveModel: prepared.effectiveModel },
         0,
         (value) => this.acceptDispatch(active, asObject(value), "start-response"),
       ));
@@ -243,7 +245,7 @@ export class CursorDriver implements WorkerDriver {
         ? rpc.requestWithId(
             initial.requestId,
             "session/start",
-            { requestId: initial.requestId, prompt: buildAgentPrompt(request.workOrder), options: prepared.options, effectiveModel: prepared.effectiveModel },
+            { requestId: initial.requestId, prompt: buildAgentPrompt(request.workOrder, coordinationPromptOptions(request)), options: prepared.options, effectiveModel: prepared.effectiveModel },
             0,
             (value) => this.acceptDispatch(active, asObject(value), "replayed-start-response"),
           )
@@ -298,16 +300,34 @@ export class CursorDriver implements WorkerDriver {
     }
   }
 
-  async sendMessage(session: DriverSession, message: string): Promise<{
+  async sendMessage(session: DriverSession, message: string, request?: DriverMessageRequest): Promise<{
     receiptId: string;
     queued: boolean;
     terminalBoundary?: boolean;
     session?: DriverSession;
   }> {
     const active = this.require(session);
-    const requestId = `cursor:prompt:${session.metadata.agentId ?? session.nativeSessionId}:${randomUUID()}`;
+    const durableBase = messageRequest(message, request);
+    const durable = request
+      ? durableBase
+      : { ...durableBase, requestId: `cursor:prompt:${session.metadata.agentId ?? session.nativeSessionId}:${durableBase.requestId.replace(/^legacy:/u, "")}` };
+    const existing = active.promptDispatch;
+    if (existing) {
+      if (existing.requestId === durable.requestId && (existing.contentHash === durable.contentHash || existing.contentHash === "")) {
+        return { receiptId: durable.requestId, queued: false, ...(active.session.state === "running" ? { session: active.session } : {}) };
+      }
+      if (existing.state === "dispatching" || active.running) {
+        throw new Error("Cursor native message is already pending with a different durable identity.");
+      }
+      // The prior accepted marker is historical after terminal projection;
+      // reuse the same slot for a new durable follow-up.
+      active.promptDispatch = null;
+    }
+    const requestId = durable.requestId;
     active.promptDispatch = {
+      attemptId: durable.attemptId,
       requestId,
+      contentHash: durable.contentHash,
       state: "dispatching",
       baseRunId: active.session.nativeRunId,
       baseGeneration: active.generation,
@@ -318,10 +338,16 @@ export class CursorDriver implements WorkerDriver {
     const result = asObject(await active.rpc.requestWithId(requestId, "session/prompt", {
       prompt: message,
       requestId,
+      contentHash: durable.contentHash,
       effectiveModel: active.effectiveModel,
     }, 0));
     const terminalBoundary = result.terminalBoundary === true;
+    if (!terminalBoundary && (asString(result.requestId) !== durable.requestId || asString(result.contentHash) !== durable.contentHash)) {
+      throw new Error("Cursor host did not echo the durable follow-up identity; acceptance is unknown.");
+    }
     if (terminalBoundary) {
+      // This response explicitly says no prompt crossed the native boundary;
+      // the runtime may retry it once the preceding result is acknowledged.
       active.promptDispatch = null;
       this.checkpoint(active);
     } else {
@@ -329,7 +355,7 @@ export class CursorDriver implements WorkerDriver {
       this.acceptPromptDispatch(active, result, "follow-up-response");
     }
     return {
-      receiptId: requestId,
+      receiptId: durable.requestId,
       queued: result.queued === true,
       ...(terminalBoundary ? { terminalBoundary: true } : { session: active.session }),
     };
@@ -488,13 +514,22 @@ export class CursorDriver implements WorkerDriver {
         active.terminalGeneration = generation ?? active.generation;
       }
       this.checkpoint(active);
-      if (result.usage) emit(consumer, "usage.recorded", { usage: result.usage, basis: "harness-reported" }, hostedFrameId ? `${hostedFrameId}:usage.recorded` : undefined);
+      if (result.usage) emit(consumer, "usage.recorded", withMessageIdentity({
+        usage: result.usage,
+        basis: "harness-reported",
+        runId: runId ?? active.session.nativeRunId,
+        generation: generation ?? active.generation,
+      }, active.promptDispatch), hostedFrameId ? `${hostedFrameId}:usage.recorded` : undefined);
       if (result.status === "finished") {
-        if (result.result) emit(consumer, "output.completed", { text: result.result }, hostedFrameId ? `${hostedFrameId}:output.completed` : undefined);
-        if (queuedPrompts === 0) emit(consumer, "run.completed", result, hostedFrameId ? `${hostedFrameId}:run.completed` : undefined);
+        if (result.result) emit(consumer, "output.completed", withMessageIdentity({ text: result.result, runId: runId ?? active.session.nativeRunId, generation: generation ?? active.generation }, active.promptDispatch), hostedFrameId ? `${hostedFrameId}:output.completed` : undefined);
+        if (queuedPrompts === 0) emit(consumer, "run.completed", withMessageIdentity({ ...result, runId: runId ?? active.session.nativeRunId, generation: generation ?? active.generation }, active.promptDispatch), hostedFrameId ? `${hostedFrameId}:run.completed` : undefined);
         else emit(consumer, "log", { phase: "cursor-run-completed-with-queued-prompts", runId, generation, queuedPrompts }, hostedFrameId ? `${hostedFrameId}:turn.queued` : undefined);
-      } else if (result.status === "cancelled") emit(consumer, "run.cancelled", result, hostedFrameId ? `${hostedFrameId}:run.cancelled` : undefined);
-      else emit(consumer, "run.failed", normalizeCursorFailurePayload(result), hostedFrameId ? `${hostedFrameId}:run.failed` : undefined);
+      } else if (result.status === "cancelled") emit(consumer, "run.cancelled", withMessageIdentity({ ...result, runId: runId ?? active.session.nativeRunId, generation: generation ?? active.generation }, active.promptDispatch), hostedFrameId ? `${hostedFrameId}:run.cancelled` : undefined);
+      else emit(consumer, "run.failed", withMessageIdentity({ ...normalizeCursorFailurePayload(result), runId: runId ?? active.session.nativeRunId, generation: generation ?? active.generation }, active.promptDispatch), hostedFrameId ? `${hostedFrameId}:run.failed` : undefined);
+      // Retain accepted identity in the lease after terminal projection. A
+      // replay can then correlate the native run without redispatching; the
+      // next distinct follow-up replaces this historical marker.
+      if (queuedPrompts === 0) this.checkpoint(active);
       if (runId && generation !== null) {
         // The result acknowledgement is intentionally sent only after the
         // process lease and runtime event projection have synchronously
@@ -513,7 +548,8 @@ export class CursorDriver implements WorkerDriver {
       active.terminalRunId = runId ?? active.session.nativeRunId;
       active.terminalGeneration = generation ?? active.generation;
       this.checkpoint(active);
-      emit(consumer, "run.failed", normalizeCursorFailurePayload(params), hostedFrameId ? `${hostedFrameId}:run.failed` : undefined);
+      emit(consumer, "run.failed", { ...normalizeCursorFailurePayload(params), runId: runId ?? active.session.nativeRunId, generation: generation ?? active.generation }, hostedFrameId ? `${hostedFrameId}:run.failed` : undefined);
+      this.checkpoint(active);
       return;
     }
     if (method === "cursor/cancelled") {
@@ -531,6 +567,7 @@ export class CursorDriver implements WorkerDriver {
           ? `${hostedFrameId}:run.cancelled`
           : `cursor-run:${String(active.session.nativeRunId)}:${active.generation}:cancelled`,
       );
+      this.checkpoint(active);
       return;
     }
     emit(consumer, "log", message, hostedFrameId);
@@ -620,9 +657,10 @@ export class CursorDriver implements WorkerDriver {
     const pending = active.promptDispatch;
     if (!pending) return;
     const requestId = asString(value.requestId);
+    const contentHash = asString(value.contentHash);
     const runId = asString(value.runId);
     const generation = typeof value.generation === "number" && Number.isSafeInteger(value.generation) ? value.generation : null;
-    if (!requestId || requestId !== pending.requestId || !runId || generation === null) return;
+    if (!requestId || requestId !== pending.requestId || (pending.contentHash && contentHash !== pending.contentHash) || !runId || generation === null) return;
     if (generation <= pending.baseGeneration && runId === pending.baseRunId) return;
     active.promptDispatch = { ...pending, state: "accepted", runId, generation };
     this.checkpoint(active);
@@ -680,6 +718,8 @@ export class CursorDriver implements WorkerDriver {
   private retainedPromptDispatch(state: Record<string, unknown>): CursorPromptDispatch | null {
     const value = record(state.promptDispatch);
     const requestId = asString(value.requestId);
+    const attemptId = asString(value.attemptId);
+    const contentHash = asString(value.contentHash);
     if (!requestId || (value.state !== "dispatching" && value.state !== "accepted")) return null;
     const baseGeneration = typeof value.baseGeneration === "number" && Number.isSafeInteger(value.baseGeneration)
       ? value.baseGeneration
@@ -688,7 +728,9 @@ export class CursorDriver implements WorkerDriver {
       ? value.generation
       : null;
     return {
+      attemptId: attemptId ?? requestId,
       requestId,
+      contentHash: contentHash ?? "",
       state: value.state,
       baseRunId: asString(value.baseRunId) ?? null,
       baseGeneration,

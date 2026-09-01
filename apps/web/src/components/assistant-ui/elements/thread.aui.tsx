@@ -8,7 +8,6 @@ import {
 import { File } from "@/components/assistant-ui/elements/file";
 import { ThreadFollowupSuggestions } from "@/components/assistant-ui/elements/follow-up-suggestions.aui";
 import { Image } from "@/components/assistant-ui/elements/image";
-import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
 import {
   Reasoning,
   ReasoningContent,
@@ -61,11 +60,18 @@ import {
 } from "@phosphor-icons/react";
 import {
   createContext,
+  lazy,
+  Suspense,
   useContext,
   type ComponentType,
   type FC,
   type PropsWithChildren,
 } from "react";
+
+// Markdown pulls the unified/remark pipeline into the initial chat bundle.
+// Load it only when an assistant text part is actually rendered; the plain
+// text fallback keeps the message readable while the renderer arrives.
+const MarkdownText = lazy(() => import("@/components/assistant-ui/elements/markdown-text").then((module) => ({ default: module.MarkdownText })));
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -439,7 +445,9 @@ const AssistantMessage: FC = () => {
               case "text":
                 return (
                   <div data-slot="aui_assistant-text-part" className="my-3 first:mt-0 last:mb-0">
-                    <MarkdownText />
+                    <Suspense fallback={<span className="whitespace-pre-wrap">{part.text}</span>}>
+                      <MarkdownText />
+                    </Suspense>
                   </div>
                 );
               case "reasoning":

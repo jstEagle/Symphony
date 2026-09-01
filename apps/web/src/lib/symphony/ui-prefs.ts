@@ -28,12 +28,14 @@ export function writePinnedIds(ids: string[]): void {
   writeJson(PINNED_KEY, ids);
 }
 
-export function readActiveConversationId(): string | null {
-  return readJson<string | null>(ACTIVE_KEY, null);
+export function readActiveConversationId(scope?: string): string | null {
+  const scoped = scopedKey(ACTIVE_KEY, scope);
+  const value = readJson<string | null>(scoped, null);
+  return value ?? (scope ? readJson<string | null>(ACTIVE_KEY, null) : null);
 }
 
-export function writeActiveConversationId(id: string | null): void {
-  writeJson(ACTIVE_KEY, id);
+export function writeActiveConversationId(id: string | null, scope?: string): void {
+  writeJson(scopedKey(ACTIVE_KEY, scope), id);
 }
 
 export function readInboxIds(): string[] {
@@ -72,4 +74,8 @@ function readStringIds(key: string): string[] {
   const value = readJson<unknown>(key, []);
   if (!Array.isArray(value)) return [];
   return [...new Set(value.filter((item): item is string => typeof item === "string" && item.trim().length > 0))];
+}
+
+function scopedKey(key: string, scope?: string): string {
+  return scope ? `${key}.${encodeURIComponent(scope)}` : key;
 }

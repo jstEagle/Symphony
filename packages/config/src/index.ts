@@ -3,6 +3,12 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { z } from "zod";
+import {
+  ObjectiveApprovalPolicySchema,
+  ObjectiveBudgetLimitsSchema,
+  ObjectiveSideEffectClassSchema,
+  PermissionSchema,
+} from "@symphony/protocol";
 
 const CommandSchema = z.object({
   command: z.string().min(1),
@@ -48,6 +54,17 @@ export const SymphonyConfigSchema = z.object({
       recoveryConcurrency: z.number().int().min(1).max(32).default(4),
       cancellationAcknowledgementTimeoutMs: z.number().int().min(10).max(600_000).default(3_000),
       cancellationTerminationGraceMs: z.number().int().min(10).max(600_000).default(5_000),
+    })
+    .prefault({}),
+  /** Daemon-wide objective policy ceilings applied at admission time. */
+  policy: z
+    .object({
+      effectivePermission: PermissionSchema.default("full-access"),
+      allowedCapabilities: z.array(z.string().min(1)).max(256).default([]),
+      budget: ObjectiveBudgetLimitsSchema.prefault({}),
+      sideEffectClassCeiling: ObjectiveSideEffectClassSchema.default("local"),
+      approvalPolicy: ObjectiveApprovalPolicySchema.default({ mode: "never" }),
+      expiresAt: z.iso.datetime({ offset: true }).nullable().default(null),
     })
     .prefault({}),
   workerHosts: z
@@ -160,6 +177,10 @@ export const SymphonyConfigSchema = z.object({
       directory: z.string().default(".symphony/workflows"),
       maxLoopIterations: z.number().int().positive().default(100),
       triggersEnabled: z.boolean().default(true),
+      // Daemon-owned approval expiry reconciliation. Keep this in the
+      // checked-in config schema so operators can tune polling without an
+      // environment variable or a code change.
+      approvalExpiryScanMs: z.number().int().min(100).max(600_000).default(1_000),
     })
     .prefault({}),
   plugins: z

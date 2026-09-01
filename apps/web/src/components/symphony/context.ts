@@ -22,6 +22,7 @@ import type {
 import type { RuntimeMode } from "@/lib/symphony/runtime-client";
 
 export type SymphonyContextValue = {
+  windowId: string;
   ready: boolean;
   error: string | null;
   clearError: () => void;

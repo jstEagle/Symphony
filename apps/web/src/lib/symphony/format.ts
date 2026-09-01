@@ -7,6 +7,8 @@ import type {
   NativeAgentStatus,
 } from "./contracts";
 
+export type ObjectiveBudgetFormatKind = "count" | "tokens" | "seconds" | "cost";
+
 export function relativeTime(iso: string, now = Date.now()): string {
   const then = Date.parse(iso);
   if (!Number.isFinite(then)) return iso;
@@ -59,6 +61,56 @@ export function costLabel(cost: CostSummary): string {
   if (cost.provenance === "pending") return `${amount} pending`;
   if ((cost.unknownEvents ?? 0) > 0) return `${amount} · ${cost.unknownEvents} unknown`;
   return `${amount} ${cost.provenance}`;
+}
+
+/** Format a measured objective counter without turning missing data into zero. */
+export function formatObjectiveUsage(
+  value: number | null | undefined,
+  kind: ObjectiveBudgetFormatKind,
+  unknown = false,
+): string {
+  if (unknown || value === null || value === undefined || !Number.isFinite(value)) return "Unknown";
+  if (kind === "cost") return formatCost(value);
+  if (kind === "seconds") return formatDurationSeconds(value);
+  return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(value);
+}
+
+/** Null is an explicit unlimited ceiling; unavailable limits remain unknown. */
+export function formatObjectiveLimit(
+  value: number | null | undefined,
+  available: boolean,
+  kind: ObjectiveBudgetFormatKind,
+): string {
+  if (!available || value === undefined || (value !== null && !Number.isFinite(value))) return "Unknown";
+  if (value === null) return "No limit";
+  return formatObjectiveUsage(value, kind);
+}
+
+export function formatObjectiveBudgetPair(
+  consumed: number | null | undefined,
+  limit: number | null | undefined,
+  available: boolean,
+  kind: ObjectiveBudgetFormatKind,
+  unknown = false,
+): string {
+  return `${formatObjectiveUsage(consumed, kind, unknown)} / ${formatObjectiveLimit(limit, available, kind)}`;
+}
+
+export function formatObjectiveExpiry(expiresAt: string | null | undefined, now = Date.now()): string {
+  if (expiresAt === null) return "No expiry";
+  if (!expiresAt) return "Unknown";
+  const timestamp = Date.parse(expiresAt);
+  if (!Number.isFinite(timestamp)) return "Unknown";
+  const label = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(timestamp);
+  return timestamp <= now ? `Expired ${label}` : `Expires ${label}`;
+}
+
+function formatDurationSeconds(value: number): string {
+  if (value < 60) return `${Math.round(value)}s`;
+  const minutes = Math.floor(value / 60);
+  const seconds = Math.round(value % 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 export function compactAgentState(status: NativeAgentStatus): AgentState {

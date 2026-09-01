@@ -1,20 +1,36 @@
 "use client";
 
-import { ClockCounterClockwise, FlowArrow, Pulse, TreeStructure } from "@phosphor-icons/react";
-import { useCallback, type ReactNode } from "react";
+import { ClockCounterClockwise, FlowArrow, Pulse } from "@phosphor-icons/react";
+import { lazy, Suspense, useCallback, useMemo, useState, type ReactNode } from "react";
+import { useQuery } from "@tanstack/react-query";
 import type { RunSnapshot, WorkNode } from "@/lib/symphony/contracts";
-import { costLabel, isActivelyWorkingAgent, loaderForHarness, statusLabel } from "@/lib/symphony/format";
+import { isActivelyWorkingAgent, loaderForHarness } from "@/lib/symphony/format";
 import { progressCopy } from "@/lib/symphony/project";
 import { AgentLoader } from "@/components/symphony/agent-tool";
-import { RunTrace } from "@/components/symphony/run-trace";
-import { WorkflowGraph } from "@/components/symphony/workflow-graph";
+import { objectiveProjectionState, selectLatestObjective, type ObjectiveProjectionState } from "@/lib/symphony/objective-project";
+import { projectObjectiveSnapshot, type ObjectiveWorkspaceProjection } from "@/lib/symphony/objective-snapshot";
+import {
+  fetchObjectiveSnapshot,
+  fetchObjectiveList,
+  newIdempotencyKey,
+  reviewObjectiveArtifact,
+  resolveObjectiveApproval,
+} from "@/lib/symphony/runtime-client";
+import type { WorkspaceTab } from "@/lib/symphony/workspace-tabs";
 import { PluginSlot } from "@/components/symphony/plugin-slots";
 import { cn } from "@/lib/utils";
 
-export type RunWorkspaceTab = "Overview" | "Trace" | "Graph" | "Activity";
+// Graph and trace carry separate interaction/runtime primitives. Keep them
+// out of the run-details chunk until the user actually opens that surface.
+const RunTrace = lazy(() => import("@/components/symphony/run-trace").then((module) => ({ default: module.RunTrace })));
+const WorkflowGraph = lazy(() => import("@/components/symphony/workflow-graph").then((module) => ({ default: module.WorkflowGraph })));
+const ObjectiveRunline = lazy(() => import("@/components/symphony/objective-runline").then((module) => ({ default: module.ObjectiveRunline })));
+const ObjectiveWorkbench = lazy(() => import("@/components/symphony/objective-workbench").then((module) => ({ default: module.ObjectiveWorkbench })));
+
+export type RunWorkspaceTab = Exclude<WorkspaceTab, "Chat" | "ControlRoom" | "Studio">;
 
 const TAB_COPY: Record<RunWorkspaceTab, string> = {
-  Overview: "Mission, progress, and participating agents.",
+  Runline: "Mission, frontier, and causal work packets.",
   Trace: "Execution timing and delegation structure.",
   Graph: "Workflow structure and agent relationships.",
   Activity: "A chronological record of the run.",
@@ -31,6 +47,7 @@ export function RunDetails({
   onSelectAgent: (id: string) => void;
   tab: RunWorkspaceTab;
 }) {
+  const objective = useObjectiveProjection(snapshot, tab === "Runline");
   const live = snapshot.agents.filter((agent) => isActivelyWorkingAgent(agent.state)).length;
   const liveAgent = snapshot.agents.find((agent) => isActivelyWorkingAgent(agent.state));
   const selectGraphNode = useCallback((node: WorkNode) => {
@@ -48,8 +65,28 @@ export function RunDetails({
             liveAgentHarness={liveAgent?.harness}
           />
 
-          {tab === "Overview" ? (
-            <Overview snapshot={snapshot} live={live} onSelectAgent={onSelectAgent} />
+          {tab === "Runline" ? (
+            <>
+              <Suspense fallback={<RunSurfaceLoading label="Loading runline" />}>
+                {objective.workspace ? (
+                  <ObjectiveWorkbench
+                    workspace={objective.workspace}
+                    onOpenAgent={onSelectAgent}
+                    onResolveApproval={objective.resolveApproval}
+                    onReviewArtifact={objective.reviewArtifact}
+                    resolvingApprovalId={objective.resolvingApprovalId}
+                    approvalError={objective.approvalError}
+                  />
+                ) : objective.state === "loading" ? (
+                  <ObjectiveLoading />
+                ) : objective.state === "unavailable" ? (
+                  <ObjectiveUnavailable source={objective.errorSource} error={objective.error} />
+                ) : (
+                  <ObjectiveRunline snapshot={snapshot} onSelectAgent={onSelectAgent} />
+                )}
+              </Suspense>
+              <PluginSlot name="run-details.section" />
+            </>
           ) : null}
 
           {tab === "Trace" ? (
@@ -63,7 +100,9 @@ export function RunDetails({
               <div className="flex flex-1">
                 <Surface className="min-h-[28rem] w-full overflow-hidden p-5 md:p-6">
                   <SectionHeading title="Trace waterfall" meta={`${snapshot.agents.length} agents`} />
-                  <RunTrace snapshot={snapshot} onSelectAgent={onSelectAgent} />
+                  <Suspense fallback={<RunSurfaceLoading label="Loading trace" />}>
+                    <RunTrace snapshot={snapshot} onSelectAgent={onSelectAgent} />
+                  </Suspense>
                 </Surface>
               </div>
             )
@@ -79,12 +118,14 @@ export function RunDetails({
               />
             ) : (
               <Surface className="symphony-graph-surface min-h-[34rem] flex-1 overflow-hidden p-0">
-                <WorkflowGraph
-                  nodes={snapshot.nodes}
-                  edges={snapshot.edges}
-                  selectedId={selectedAgentId}
-                  onSelect={selectGraphNode}
-                />
+                <Suspense fallback={<RunSurfaceLoading label="Loading graph" />}>
+                  <WorkflowGraph
+                    nodes={snapshot.nodes}
+                    edges={snapshot.edges}
+                    selectedId={selectedAgentId}
+                    onSelect={selectGraphNode}
+                  />
+                </Suspense>
               </Surface>
             )
           ) : null}
@@ -129,6 +170,184 @@ export function RunDetails({
   );
 }
 
+function useObjectiveProjection(snapshot: RunSnapshot, enabled: boolean): {
+  workspace: ObjectiveWorkspaceProjection | null;
+  state: ObjectiveProjectionState;
+  errorSource: "list" | "snapshot" | null;
+  error: string | null;
+  resolveApproval: (approvalId: string, decision: "approved" | "rejected") => Promise<void>;
+  resolvingApprovalId: string | null;
+  approvalError: string | null;
+  reviewArtifact: (artifactId: string, state: "verified" | "rejected", reason: string) => Promise<void>;
+} {
+  const workflowId = snapshot.workflowId?.trim() ?? "";
+  const conductorAgentId = snapshot.agents.find((agent) => agent.depth === 0)?.id ?? null;
+  const agentIds = useMemo(() => snapshot.agents.map((agent) => agent.id), [snapshot.agents]);
+  const live = snapshot.mode === "live";
+  const listQuery = useQuery({
+    // Fetch the authoritative bounded list once, then select by conversation
+    // ownership below. Filtering only by workflow hid standalone/manual
+    // objectives whose workflow identity is intentionally independent.
+    queryKey: ["symphony", "objectives", "all"],
+    enabled: enabled && live,
+    queryFn: ({ signal }) => fetchObjectiveList({ limit: 200 }, signal),
+    retry: false,
+    staleTime: 1_000,
+    refetchOnWindowFocus: true,
+  });
+
+  const objectiveRun = useMemo(
+    () => selectLatestObjective(listQuery.data?.objectives ?? [], {
+      workflowId,
+      runId: snapshot.runId,
+      conductorAgentId,
+      agentIds,
+    }),
+    [agentIds, conductorAgentId, listQuery.data?.objectives, snapshot.runId, workflowId],
+  );
+  const snapshotQuery = useQuery({
+    queryKey: ["symphony", "objective-snapshot", objectiveRun?.objectiveId ?? null],
+    enabled: enabled && live && objectiveRun !== null,
+    queryFn: ({ signal }) => fetchObjectiveSnapshot(objectiveRun!.objectiveId, signal),
+    retry: false,
+    staleTime: 1_000,
+    refetchOnWindowFocus: true,
+  });
+  const [resolvingApprovalId, setResolvingApprovalId] = useState<string | null>(null);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
+  const [artifactError, setArtifactError] = useState<string | null>(null);
+
+  const resolveApproval = useCallback(async (approvalId: string, decision: "approved" | "rejected") => {
+    if (!objectiveRun || resolvingApprovalId !== null) return;
+    setResolvingApprovalId(approvalId);
+    setApprovalError(null);
+    try {
+      const pending = snapshotQuery.data?.approvals.find((approval) => approval.id === approvalId);
+      if (!pending || pending.status !== "requested") {
+        const refreshed = await snapshotQuery.refetch();
+        if (refreshed.error) throw refreshed.error;
+        throw new Error("This approval is no longer pending. The objective was refreshed.");
+      }
+
+      // The mutation response is intentionally not projected into the UI: the
+      // next render must come from a fresh daemon detail/list response.
+      await resolveObjectiveApproval(
+        objectiveRun.runId,
+        approvalId,
+        { status: decision },
+        newIdempotencyKey(),
+      );
+      const [refreshedSnapshot, refreshedList] = await Promise.all([
+        snapshotQuery.refetch(),
+        listQuery.refetch(),
+      ]);
+      if (refreshedSnapshot.error) throw refreshedSnapshot.error;
+      if (refreshedList.error) throw refreshedList.error;
+      if (!refreshedSnapshot.data || refreshedSnapshot.data.objective.objectiveId !== objectiveRun.objectiveId) {
+        throw new Error("The approval was resolved, but the authoritative objective snapshot could not be refreshed.");
+      }
+    } catch (error) {
+      setApprovalError(errorMessage(error));
+      // A failed mutation may still have been committed before transport loss;
+      // reconcile from the daemon so a retry cannot act on stale local state.
+      void snapshotQuery.refetch();
+    } finally {
+      setResolvingApprovalId(null);
+    }
+  }, [listQuery, objectiveRun, resolvingApprovalId, snapshotQuery]);
+
+  const reviewArtifact = useCallback(async (artifactId: string, state: "verified" | "rejected", reason: string) => {
+    if (!objectiveRun) return;
+    const artifact = snapshotQuery.data?.artifacts.find((candidate) => candidate.id === artifactId);
+    if (!artifact || artifact.reviewState !== "pending") {
+      setArtifactError("This artifact review is stale. Refreshing the objective snapshot.");
+      await snapshotQuery.refetch();
+      return;
+    }
+    setArtifactError(null);
+    try {
+      await reviewObjectiveArtifact(artifact.runId, artifactId, { state, reason }, newIdempotencyKey());
+      const refreshed = await snapshotQuery.refetch();
+      if (refreshed.error) throw refreshed.error;
+      const updated = refreshed.data?.artifacts.find((candidate) => candidate.id === artifactId);
+      if (!updated || updated.reviewState !== state) throw new Error("The artifact review was accepted, but the authoritative snapshot did not advance.");
+    } catch (error) {
+      setArtifactError(errorMessage(error));
+      void snapshotQuery.refetch();
+    }
+  }, [objectiveRun, snapshotQuery]);
+
+  const workspace = useMemo(() => {
+    const value = snapshotQuery.data;
+    if (listQuery.error || snapshotQuery.error || !value || !objectiveRun || value.objective?.objectiveId !== objectiveRun.objectiveId) return null;
+    return projectObjectiveSnapshot(value);
+  }, [listQuery.error, objectiveRun, snapshotQuery.data, snapshotQuery.error]);
+
+  const snapshotIdentityError = objectiveRun && snapshotQuery.data
+    && snapshotQuery.data.objective?.objectiveId !== objectiveRun.objectiveId
+    ? new Error("The daemon returned an objective snapshot for a different objective.")
+    : null;
+
+  const state = objectiveProjectionState({
+    enabled,
+    live,
+    listPending: listQuery.isPending,
+    listFetching: listQuery.isFetching,
+    listError: listQuery.error,
+    objectiveRun,
+    snapshotPending: snapshotQuery.isPending,
+    snapshotFetching: snapshotQuery.isFetching,
+    snapshotError: snapshotQuery.error ?? snapshotIdentityError,
+    snapshotReady: snapshotQuery.data?.objective?.objectiveId === objectiveRun?.objectiveId,
+  });
+  const errorSource = listQuery.error ? "list" : snapshotQuery.error ? "snapshot" : null;
+  const errorSourceWithIdentity = errorSource ?? (snapshotIdentityError ? "snapshot" : null);
+  const error = listQuery.error ? errorMessage(listQuery.error) : snapshotQuery.error ? errorMessage(snapshotQuery.error) : snapshotIdentityError ? snapshotIdentityError.message : null;
+  return { workspace, state, errorSource: errorSourceWithIdentity, error, resolveApproval, resolvingApprovalId, approvalError: approvalError ?? artifactError, reviewArtifact };
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function ObjectiveLoading() {
+  return (
+    <div className="flex min-h-[18rem] flex-1 items-center justify-center text-xs text-muted-foreground">
+      <div className="flex items-center gap-2">
+        <AgentLoader kind="square" size={18} label="Loading objective" />
+        <span>Loading objective…</span>
+      </div>
+    </div>
+  );
+}
+
+function ObjectiveUnavailable({ source, error }: { source: "list" | "snapshot" | null; error: string | null }) {
+  const subject = source === "snapshot" ? "objective snapshot" : "objective list";
+  return (
+    <div className="flex min-h-[18rem] flex-1 items-center justify-center px-5 text-center" role="alert" aria-live="assertive">
+      <div className="max-w-md">
+        <span className="mx-auto grid size-9 place-items-center rounded-full border border-warning/30 bg-warning/10 text-warning" aria-hidden="true">!</span>
+        <h3 className="mt-3 text-sm font-medium text-foreground/90">Authoritative runline unavailable</h3>
+        <p className="mt-1.5 text-[11px] leading-5 text-muted-foreground">
+          The daemon {subject} could not be loaded. Reconnecting will retry the authoritative objective projection; chat activity is not substituted here.
+        </p>
+        {error ? <p className="mt-2 break-words font-mono text-[10px] text-warning/85">{error}</p> : null}
+      </div>
+    </div>
+  );
+}
+
+function RunSurfaceLoading({ label }: { label: string }) {
+  return (
+    <div className="grid min-h-[28rem] place-items-center text-xs text-muted-foreground">
+      <span className="flex items-center gap-2">
+        <AgentLoader kind="square" size={16} label={label} />
+        {label}…
+      </span>
+    </div>
+  );
+}
+
 function WorkspaceHeader({
   tab,
   snapshot,
@@ -168,84 +387,6 @@ function WorkspaceHeader({
   );
 }
 
-function Overview({
-  snapshot,
-  live,
-  onSelectAgent,
-}: {
-  snapshot: RunSnapshot;
-  live: number;
-  onSelectAgent: (id: string) => void;
-}) {
-  return (
-    <div className="grid flex-1 gap-5 xl:grid-cols-[minmax(0,1.4fr)_minmax(20rem,0.72fr)]">
-      <div className="space-y-5">
-        <Surface className="p-6 md:p-8">
-          <SectionHeading title="Mission" meta={`Revision ${snapshot.mission.revision}`} />
-          <p className="max-w-4xl text-pretty text-lg leading-8 tracking-[-0.015em] text-foreground/95 md:text-xl">
-            {snapshot.mission.statement}
-          </p>
-          {snapshot.mission.keyResults.length > 0 ? (
-            <ul className="mt-6 grid gap-2 sm:grid-cols-2">
-              {snapshot.mission.keyResults.map((result) => (
-                <li key={result} className="flex min-h-12 items-start gap-3 rounded-lg bg-muted/35 px-4 py-3 text-xs leading-5 text-muted-foreground">
-                  <span className="mt-2 size-1 shrink-0 rounded-full bg-foreground/65" />
-                  <span>{result}</span>
-                </li>
-              ))}
-            </ul>
-          ) : null}
-        </Surface>
-
-        <div className="grid grid-cols-2 gap-2 lg:grid-cols-4">
-          <Fact label="Status" value={snapshot.phase} />
-          <Fact label="Agents" value={String(snapshot.agents.length)} />
-          <Fact label="Active" value={String(live)} />
-          <Fact label="Cost" value={costLabel(snapshot.cost)} />
-        </div>
-        <PluginSlot name="run-details.section" />
-      </div>
-
-      <Surface className="min-h-[22rem] p-5 md:p-6">
-        <SectionHeading title="Agents" meta={`${snapshot.agents.length} total`} />
-        {snapshot.agents.length === 0 ? (
-          <div className="grid min-h-64 place-items-center px-5 text-center">
-            <div>
-              <TreeStructure className="mx-auto size-7 text-muted-foreground/65" weight="light" />
-              <p className="mt-3 text-[13px] font-medium">No agents yet</p>
-              <p className="mt-1 text-xs text-muted-foreground">Delegated work will appear here.</p>
-            </div>
-          </div>
-        ) : (
-          <div className="space-y-1">
-            {snapshot.agents.map((agent) => (
-              <button
-                key={agent.id}
-                type="button"
-                onClick={() => onSelectAgent(agent.id)}
-                className="flex min-h-12 w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors hover:bg-muted/55"
-              >
-                <AgentLoader
-                  kind={loaderForHarness(agent.harness)}
-                  size={15}
-                  label={`${agent.name} ${agent.state}`}
-                  animated={isActivelyWorkingAgent(agent.state)}
-                  tone={agent.state === "succeeded" ? "success" : agent.state === "failed" ? "danger" : agent.state === "running" || agent.state === "queued" ? "info" : "warning"}
-                />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-[13px] font-medium" title={agent.objective}>{agent.name}</span>
-                  <span className="mt-0.5 block truncate text-[10px] text-muted-foreground">{agent.harness} · {agent.model}</span>
-                </span>
-                <span className="text-[10px] text-muted-foreground">{statusLabel(agent.state, agent.nativeStatus)}</span>
-              </button>
-            ))}
-          </div>
-        )}
-      </Surface>
-    </div>
-  );
-}
-
 function EmptyWorkspace({
   icon,
   title,
@@ -279,15 +420,6 @@ function SectionHeading({ title, meta }: { title: string; meta: string }) {
     <div className="mb-5 flex items-center justify-between gap-3">
       <h3 className="text-[13px] font-medium text-foreground/90">{title}</h3>
       <span className="text-[10px] text-muted-foreground">{meta}</span>
-    </div>
-  );
-}
-
-function Fact({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="min-h-24 rounded-xl bg-card/65 p-4 md:p-5">
-      <p className="text-[10px] text-muted-foreground">{label}</p>
-      <p className="mt-3 truncate text-base font-medium capitalize tracking-[-0.02em]" title={value}>{value}</p>
     </div>
   );
 }

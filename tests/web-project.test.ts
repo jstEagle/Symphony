@@ -144,10 +144,10 @@ function agentRecord(status: NativeAgentStatus): AgentRecord {
   };
 }
 
-function bootstrap(agent: AgentRecord, runStatus = "completed"): BootstrapEnvelope {
+function bootstrap(agent: AgentRecord, runStatus = "completed", extraAgents: AgentRecord[] = []): BootstrapEnvelope {
   return {
     mode: "runtime",
-    agents: [agent],
+    agents: [agent, ...extraAgents],
     agentCosts: {},
     runs: [{
       id: "chat-run:thread-1",
@@ -221,5 +221,54 @@ describe("durable chat projection", () => {
     expect(snapshot.events.find((item) => item.id === "event-2")?.detail).toContain("Delivered");
     expect(snapshot.events.find((item) => item.id === "event-4")?.detail).toContain("Outcome was unknown");
     expect(snapshot.events.every((item) => item.source === "runtime-observed")).toBe(true);
+  });
+
+  it("scopes structural workflow activity to child runs linked through the conductor tree", () => {
+    const child = {
+      ...agentRecord("running"),
+      id: "agent-child",
+      logicalAgentId: "logical-agent-child",
+      workflowId: "workflow-child",
+      runId: "run-child",
+      parentAgentId: "agent-1",
+      depth: 1,
+    };
+    const childStep: EventEnvelope = {
+      id: "child-step",
+      cursor: 5,
+      type: "workflow.step.completed",
+      workflowId: "workflow-child",
+      runId: "run-child",
+      agentId: null,
+      occurredAt: "2026-08-30T00:00:05.000Z",
+      payload: { stepId: "compile", output: "ok" },
+      provenance: { source: "workflow" },
+    };
+    const unrelatedStep: EventEnvelope = {
+      ...childStep,
+      id: "unrelated-step",
+      cursor: 6,
+      workflowId: "workflow-unrelated",
+      runId: "run-unrelated",
+    };
+    const chatContainer: EventEnvelope = {
+      ...childStep,
+      id: "chat-container",
+      cursor: 7,
+      type: "workflow.run.started",
+      workflowId: "chat:thread-1",
+      runId: "chat-run:thread-1",
+      payload: {},
+    };
+
+    const snapshot = snapshotForThread(
+      thread,
+      bootstrap(agentRecord("running"), "running", [child]),
+      [childStep, unrelatedStep, chatContainer],
+    );
+
+    expect(snapshot.traceEvents.map((event) => event.id)).toEqual(["child-step", "chat-container"]);
+    expect(snapshot.events.map((event) => event.id)).toEqual(["chat-container", "child-step"]);
+    expect(snapshot.events.some((event) => event.id === "unrelated-step")).toBe(false);
   });
 });

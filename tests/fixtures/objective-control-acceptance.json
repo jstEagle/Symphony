@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "suite": "objective-control-harness",
+  "scenarios": [
+    {
+      "id": "adaptive-build-evaluate-revise",
+      "title": "Adaptive build -> evaluate -> revise",
+      "expected": "pass",
+      "publicApis": ["ObjectiveRuntime.create", "ObjectiveRuntime.checkpoint", "ObjectiveRuntime.commitPlan"]
+    },
+    {
+      "id": "nested-loops",
+      "title": "Nested bounded loops",
+      "expected": "pass",
+      "publicApis": ["compileObjectiveControlPlan", "nextObjectiveControlIntent", "applyObjectiveControlAcknowledgement"]
+    },
+    {
+      "id": "parallel-backpressure",
+      "title": "Parallel backpressure",
+      "expected": "pass",
+      "publicApis": ["compileObjectiveControlPlan", "nextObjectiveControlIntent"],
+      "gap": "The reducer must leave a queued sibling undispatched until the running child settles."
+    },
+    {
+      "id": "approval-interruption-resume",
+      "title": "Approval interruption and resume",
+      "expected": "pass",
+      "publicApis": ["ObjectiveRuntime.checkpoint", "ObjectiveRuntime.resolveApproval"]
+    },
+    {
+      "id": "crash-replay-exactly-once",
+      "title": "Crash/replay exactly-once acknowledgement",
+      "expected": "pass",
+      "publicApis": ["nextObjectiveControlIntent", "applyObjectiveControlAcknowledgement", "ObjectiveRuntime.create"]
+    },
+    {
+      "id": "dynamic-plan-mutation",
+      "title": "Evidence-gated dynamic plan mutation",
+      "expected": "pass",
+      "publicApis": ["ObjectiveControlMutationSchema", "validateObjectiveControlMutationTarget", "applyObjectiveControlMutation"]
+    },
+    {
+      "id": "dependency-gating",
+      "title": "Dependency-gated frontier",
+      "expected": "pass",
+      "publicApis": ["ObjectiveControlMutationSchema", "nextObjectiveControlIntent", "applyObjectiveControlAcknowledgement"]
+    },
+    {
+      "id": "requires-approval",
+      "title": "Per-agent approval gate",
+      "expected": "pass",
+      "publicApis": ["ObjectiveControlMutationSchema", "nextObjectiveControlIntent", "applyObjectiveControlAcknowledgement"]
+    },
+    {
+      "id": "budget-evidence-completion",
+      "title": "Budget/evidence-gated completion",
+      "expected": "pass",
+      "publicApis": ["ObjectiveRuntime.create", "ObjectiveRuntime.checkpoint", "ObjectiveBudgetLimitsSchema"]
+    },
+    {
+      "id": "frontend-projection",
+      "title": "Frontend-as-projection semantics",
+      "expected": "pass",
+      "publicApis": ["projectObjectiveRun", "buildControlRoomViewModel", "objectiveEventQueryPlan"]
+    }
+  ]
+}

@@ -1,0 +1,217 @@
+.library {
+  /* Surface tokens intentionally resolve through the active daemon theme. */
+  --cap-accent: var(--info);
+  --cap-positive: var(--success);
+  --cap-warning: var(--warning);
+  --cap-danger: var(--destructive);
+  --cap-line: color-mix(in oklab, var(--border) 80%, transparent);
+  --cap-soft-line: color-mix(in oklab, var(--border) 54%, transparent);
+  --cap-panel: color-mix(in oklab, var(--card) 83%, transparent);
+  --cap-panel-strong: color-mix(in oklab, var(--card) 94%, transparent);
+  --cap-subtle: color-mix(in oklab, var(--foreground) 64%, transparent);
+  min-height: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  overflow: hidden;
+  color: var(--foreground);
+  background: var(--background);
+  font-size: 0.78rem;
+}
+
+.header {
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--cap-line);
+  padding: 1.25rem clamp(1rem, 3vw, 2.25rem) 1.1rem;
+  background: color-mix(in oklab, var(--background) 94%, var(--foreground));
+}
+
+.eyebrow,
+.sectionKicker,
+.sidebarMeta,
+.metadata,
+.mono,
+.typeBadge,
+.required,
+.shortcut {
+  font-family: var(--font-mono-family);
+}
+
+.eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--info);
+  font-size: 0.59rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.eyebrow svg { width: 0.85rem; height: 0.85rem; }
+.eyebrowRule { width: 2.2rem; height: 1px; margin-left: 0.15rem; background: color-mix(in oklab, var(--info) 45%, transparent); }
+.headerRow { display: flex; align-items: flex-end; justify-content: space-between; gap: 1rem; margin-top: 0.55rem; }
+.title { margin: 0; font-family: var(--font-display-family); font-size: clamp(1.1rem, 2vw, 1.42rem); font-weight: 600; letter-spacing: -0.04em; }
+.subtitle { max-width: 42rem; margin: 0.3rem 0 0; color: var(--muted-foreground); font-size: 0.72rem; line-height: 1.55; }
+.registryCount { display: inline-flex; align-items: center; gap: 0.42rem; flex-shrink: 0; color: var(--muted-foreground); font-family: var(--font-mono-family); font-size: 0.6rem; white-space: nowrap; }
+.registryDot { width: 0.38rem; height: 0.38rem; border-radius: 999px; background: var(--success); box-shadow: 0 0 0 3px color-mix(in oklab, var(--success) 12%, transparent); }
+
+.notice { display: flex; align-items: center; gap: 0.5rem; border-bottom: 1px solid color-mix(in oklab, var(--warning) 24%, transparent); padding: 0.55rem clamp(1rem, 3vw, 2.25rem); color: var(--warning); background: color-mix(in oklab, var(--warning) 7%, transparent); font-size: 0.68rem; }
+.noticeSuccess { border-bottom-color: color-mix(in oklab, var(--success) 24%, transparent); color: var(--success); background: color-mix(in oklab, var(--success) 7%, transparent); }
+.noticeDanger { border-bottom-color: color-mix(in oklab, var(--destructive) 24%, transparent); color: var(--destructive); background: color-mix(in oklab, var(--destructive) 7%, transparent); }
+.notice svg { width: 0.9rem; height: 0.9rem; flex-shrink: 0; }
+.notice span { flex: 1; }
+.notice button { display: inline-grid; place-items: center; border: 0; padding: 0.15rem; color: currentColor; background: transparent; }
+
+.body { display: flex; min-height: 0; flex: 1; overflow: hidden; }
+.sidebar { display: flex; width: min(20rem, 31vw); min-width: 16rem; flex-shrink: 0; flex-direction: column; border-right: 1px solid var(--cap-line); background: color-mix(in oklab, var(--sidebar) 78%, transparent); }
+.searchWrap { position: relative; margin: 0.85rem 0.8rem 0.55rem; }
+.searchIcon { position: absolute; top: 50%; left: 0.65rem; width: 0.85rem; height: 0.85rem; transform: translateY(-50%); color: var(--muted-foreground); pointer-events: none; }
+.searchInput { width: 100%; height: 2rem; border: 1px solid var(--cap-soft-line); border-radius: 0.5rem; padding: 0 2.1rem 0 2rem; color: var(--foreground); outline: none; background: color-mix(in oklab, var(--background) 76%, transparent); font-size: 0.72rem; transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease; }
+.searchInput::placeholder { color: color-mix(in oklab, var(--muted-foreground) 80%, transparent); }
+.searchInput:focus { border-color: color-mix(in oklab, var(--ring) 60%, transparent); box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 11%, transparent); background: var(--background); }
+.shortcut { position: absolute; top: 50%; right: 0.55rem; transform: translateY(-50%); border: 1px solid var(--cap-soft-line); border-radius: 0.25rem; padding: 0.08rem 0.28rem; color: var(--muted-foreground); font-size: 0.58rem; line-height: 1.1; }
+.filterRow { display: flex; gap: 0.22rem; padding: 0 0.8rem 0.75rem; overflow-x: auto; }
+.filterButton { border: 1px solid transparent; border-radius: 0.32rem; padding: 0.27rem 0.42rem; color: var(--muted-foreground); background: transparent; font-family: var(--font-mono-family); font-size: 0.58rem; text-transform: capitalize; transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease; }
+.filterButton:hover { color: var(--foreground); background: color-mix(in oklab, var(--accent) 70%, transparent); }
+.filterButtonActive { border-color: var(--cap-soft-line); color: var(--foreground); background: var(--accent); }
+.sidebarMeta { display: flex; justify-content: space-between; border-top: 1px solid var(--cap-soft-line); padding: 0.65rem 0.8rem 0.4rem; color: var(--muted-foreground); font-size: 0.57rem; letter-spacing: 0.08em; text-transform: uppercase; }
+.list { min-height: 0; flex: 1; overflow-y: auto; padding: 0.2rem 0.5rem 0.7rem; }
+.listItem { display: block; width: 100%; margin-bottom: 0.25rem; border: 1px solid transparent; border-radius: 0.55rem; padding: 0.65rem 0.65rem 0.58rem; color: var(--foreground); text-align: left; background: transparent; cursor: pointer; transition: background-color 150ms ease, border-color 150ms ease, transform 150ms var(--ease-out); }
+.listItem:hover { border-color: var(--cap-soft-line); background: color-mix(in oklab, var(--card) 55%, transparent); }
+.listItem:active { transform: translateY(1px); }
+.listItem:focus-visible, .historyItem:focus-visible, .iconButton:focus-visible, .addTrigger:focus-visible, .triggerEmpty button:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.listItemSelected { border-color: color-mix(in oklab, var(--info) 32%, var(--cap-line)); background: color-mix(in oklab, var(--info) 8%, var(--card)); box-shadow: inset 2px 0 0 var(--info); }
+.listItemTop { display: flex; align-items: center; gap: 0.5rem; }
+.listItemName { min-width: 0; flex: 1; overflow: hidden; font-size: 0.73rem; font-weight: 520; text-overflow: ellipsis; white-space: nowrap; }
+.listItemBottom { display: flex; min-width: 0; align-items: center; gap: 0.38rem; margin-top: 0.38rem; color: var(--muted-foreground); font-size: 0.59rem; }
+.listItemSummary { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.listItemDivider { color: var(--border); }
+.sidebarFootnote { display: flex; align-items: center; gap: 0.35rem; margin: 0; border-top: 1px solid var(--cap-soft-line); padding: 0.62rem 0.8rem 0.7rem; color: var(--muted-foreground); font-size: 0.59rem; }
+.sidebarFootnote svg { width: 0.8rem; height: 0.8rem; }
+
+.status { display: inline-flex; align-items: center; gap: 0.28rem; flex-shrink: 0; border: 1px solid transparent; border-radius: 999px; padding: 0.18rem 0.4rem; font-family: var(--font-mono-family); font-size: 0.54rem; line-height: 1; text-transform: lowercase; }
+.status > span { width: 0.3rem; height: 0.3rem; border-radius: 999px; background: currentColor; }
+.statusActive { border-color: color-mix(in oklab, var(--success) 26%, transparent); color: var(--success); background: color-mix(in oklab, var(--success) 9%, transparent); }
+.statusDraft { border-color: color-mix(in oklab, var(--info) 23%, transparent); color: var(--info); background: color-mix(in oklab, var(--info) 8%, transparent); }
+.statusDeprecated { border-color: color-mix(in oklab, var(--muted-foreground) 26%, transparent); color: var(--muted-foreground); background: color-mix(in oklab, var(--muted-foreground) 7%, transparent); }
+
+.detail { min-width: 0; flex: 1; overflow-y: auto; padding: clamp(1rem, 3vw, 2rem) clamp(1rem, 4vw, 3rem) 3rem; background: radial-gradient(circle at 90% 0%, color-mix(in oklab, var(--info) 4%, transparent), transparent 35rem); }
+.detailHeader { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; max-width: 90rem; margin: 0 auto 1.35rem; }
+.detailHeading { min-width: 0; }
+.detailTitleRow { display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem; }
+.detailTitleRow h2 { margin: 0; font-family: var(--font-display-family); font-size: clamp(1.2rem, 2.7vw, 1.75rem); font-weight: 600; letter-spacing: -0.045em; }
+.versionBadge { border: 1px solid color-mix(in oklab, var(--info) 28%, transparent); border-radius: 0.32rem; padding: 0.25rem 0.38rem; color: var(--info); background: color-mix(in oklab, var(--info) 8%, transparent); font-family: var(--font-mono-family); font-size: 0.61rem; }
+.detailDescription { max-width: 47rem; margin: 0.45rem 0 0; color: var(--muted-foreground); font-size: 0.76rem; line-height: 1.55; }
+.metadata { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.65rem; color: color-mix(in oklab, var(--muted-foreground) 85%, transparent); font-size: 0.55rem; }
+.metadata span { color: var(--border); }
+.actionRow { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.4rem; }
+.detailGrid { display: grid; grid-template-columns: minmax(0, 1.45fr) minmax(16rem, 0.8fr); align-items: start; gap: 0.85rem; max-width: 90rem; margin: 0 auto; }
+.primaryColumn, .secondaryColumn { display: grid; gap: 0.85rem; min-width: 0; }
+.panel { border: 1px solid var(--cap-line); border-radius: 0.75rem; padding: 1rem; background: linear-gradient(145deg, color-mix(in oklab, var(--cap-panel-strong) 86%, transparent), color-mix(in oklab, var(--cap-panel) 82%, transparent)); box-shadow: 0 10px 35px color-mix(in oklab, var(--surface-shadow) 45%, transparent), inset 0 1px 0 color-mix(in oklab, var(--foreground) 4%, transparent); }
+.panelHeading { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
+.panelHeading > svg { width: 1.05rem; height: 1.05rem; color: var(--muted-foreground); }
+.sectionKicker { margin: 0 0 0.27rem; color: var(--info); font-size: 0.55rem; letter-spacing: 0.14em; text-transform: uppercase; }
+.panel h2 { margin: 0; font-size: 0.9rem; font-weight: 570; letter-spacing: -0.015em; }
+.panelIntro { margin: 0.45rem 0 0.85rem; color: var(--muted-foreground); font-size: 0.68rem; line-height: 1.5; }
+.panelFootnote { margin: 0.85rem 0 0; border-top: 1px solid var(--cap-soft-line); padding-top: 0.7rem; color: var(--muted-foreground); font-size: 0.6rem; line-height: 1.45; }
+.parameterList { display: grid; gap: 0.75rem; }
+.parameterField { display: grid; gap: 0.34rem; }
+.parameterLabelRow { display: flex; align-items: center; gap: 0.4rem; }
+.parameterLabelRow label { font-size: 0.69rem; font-weight: 540; }
+.typeBadge, .required { color: var(--muted-foreground); font-size: 0.53rem; }
+.typeBadge { border: 1px solid var(--cap-soft-line); border-radius: 0.22rem; padding: 0.13rem 0.25rem; }
+.required { margin-left: auto; color: var(--warning); text-transform: uppercase; letter-spacing: 0.07em; }
+.parameterField input:not([type="checkbox"]), .parameterField select, .parameterField textarea, .triggerRow input, .triggerRow select { width: 100%; min-height: 2rem; border: 1px solid var(--cap-soft-line); border-radius: 0.42rem; padding: 0.42rem 0.55rem; color: var(--foreground); outline: none; background: color-mix(in oklab, var(--background) 64%, transparent); font: inherit; font-size: 0.69rem; transition: border-color 140ms ease, box-shadow 140ms ease, background-color 140ms ease; }
+.parameterField input:not([type="checkbox"]):focus, .parameterField select:focus, .parameterField textarea:focus, .triggerRow input:focus, .triggerRow select:focus { border-color: color-mix(in oklab, var(--ring) 60%, transparent); box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 10%, transparent); background: var(--background); }
+.parameterField textarea { resize: vertical; line-height: 1.45; }
+.parameterField select, .triggerRow select { appearance: none; padding-right: 1.7rem; }
+.selectWrap { position: relative; }
+.selectWrap select { display: block; }
+.selectWrap > svg { position: absolute; top: 50%; right: 0.55rem; width: 0.78rem; height: 0.78rem; transform: translateY(-50%); color: var(--muted-foreground); pointer-events: none; }
+.fieldDescription { margin: 0; color: var(--muted-foreground); font-size: 0.6rem; line-height: 1.45; }
+.fieldError { display: flex; align-items: center; gap: 0.25rem; margin: 0; color: var(--destructive); font-size: 0.6rem; }
+.fieldError svg { width: 0.75rem; height: 0.75rem; }
+.parameterFieldError input:not([type="checkbox"]), .parameterFieldError select, .parameterFieldError textarea { border-color: color-mix(in oklab, var(--destructive) 50%, transparent); }
+.toggle { display: inline-flex; align-items: center; gap: 0.5rem; min-height: 2rem; color: var(--muted-foreground); font-size: 0.67rem; cursor: pointer; }
+.toggle input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.toggle input:focus-visible + .toggleTrack { outline: 2px solid var(--ring); outline-offset: 2px; }
+.toggleTrack { display: inline-flex; align-items: center; width: 2rem; height: 1.1rem; border: 1px solid var(--cap-soft-line); border-radius: 999px; padding: 0.14rem; background: var(--muted); transition: background-color 140ms ease; }
+.toggleTrack span { width: 0.72rem; height: 0.72rem; border-radius: 999px; background: var(--muted-foreground); transition: transform 140ms var(--ease-out), background-color 140ms ease; }
+.toggle input:checked + .toggleTrack { background: color-mix(in oklab, var(--success) 34%, var(--muted)); }
+.toggle input:checked + .toggleTrack span { transform: translateX(0.86rem); background: var(--success); }
+.jsonInput { font-family: var(--font-mono-family) !important; font-size: 0.63rem !important; }
+
+.triggerEditor { display: grid; gap: 0.5rem; }
+.triggerEmpty { display: flex; align-items: center; justify-content: space-between; gap: 0.75rem; color: var(--muted-foreground); font-size: 0.66rem; }
+.triggerEmpty button, .addTrigger { display: inline-flex; align-items: center; gap: 0.3rem; border: 1px solid var(--cap-soft-line); border-radius: 0.38rem; padding: 0.38rem 0.5rem; color: var(--foreground); background: color-mix(in oklab, var(--accent) 62%, transparent); font-size: 0.62rem; }
+.triggerEmpty button svg, .addTrigger svg { width: 0.75rem; height: 0.75rem; }
+.triggerRow { display: grid; grid-template-columns: minmax(5.4rem, 0.38fr) minmax(0, 1fr) auto; align-items: center; gap: 0.4rem; }
+.triggerType { position: relative; }
+.triggerType > svg { position: absolute; top: 50%; right: 0.42rem; width: 0.75rem; height: 0.75rem; transform: translateY(-50%); color: var(--muted-foreground); pointer-events: none; }
+.iconButton { display: inline-grid; place-items: center; width: 2rem; height: 2rem; border: 1px solid transparent; border-radius: 0.38rem; color: var(--muted-foreground); background: transparent; }
+.iconButton:hover { color: var(--destructive); background: color-mix(in oklab, var(--destructive) 9%, transparent); }
+.iconButton svg { width: 0.83rem; height: 0.83rem; }
+.addTrigger { justify-self: start; margin-top: 0.1rem; }
+
+.emptySubtle { display: flex; align-items: center; gap: 0.4rem; color: var(--muted-foreground); font-size: 0.66rem; }
+.emptySubtle svg { width: 0.85rem; height: 0.85rem; }
+.defaultsList { display: grid; gap: 0.45rem; margin: 0.85rem 0 0; }
+.defaultsList > div { display: flex; align-items: baseline; justify-content: space-between; gap: 0.75rem; border-bottom: 1px solid var(--cap-soft-line); padding-bottom: 0.45rem; }
+.defaultsList > div:last-child { border-bottom: 0; padding-bottom: 0; }
+.defaultsList dt { color: var(--muted-foreground); font-size: 0.61rem; }
+.defaultsList dd { max-width: 66%; margin: 0; overflow: hidden; color: var(--foreground); font-family: var(--font-mono-family); font-size: 0.6rem; text-align: right; text-overflow: ellipsis; white-space: nowrap; }
+.historyList { display: grid; gap: 0.22rem; margin-top: 0.85rem; }
+.historyItem { display: grid; grid-template-columns: 2.2rem minmax(0, 1fr) auto; align-items: center; gap: 0.4rem; border: 1px solid transparent; border-radius: 0.42rem; padding: 0.46rem 0.42rem; color: var(--foreground); text-align: left; background: transparent; }
+.historyItem:hover { border-color: var(--cap-soft-line); background: color-mix(in oklab, var(--accent) 48%, transparent); }
+.historyItemSelected { border-color: color-mix(in oklab, var(--info) 28%, transparent); background: color-mix(in oklab, var(--info) 7%, transparent); }
+.historyVersion { color: var(--info); font-family: var(--font-mono-family); font-size: 0.6rem; }
+.historyDate { color: var(--muted-foreground); font-size: 0.61rem; }
+.diffBlock { margin-top: 0.9rem; border-top: 1px solid var(--cap-soft-line); padding-top: 0.8rem; }
+.diffBlock > label { display: block; margin-bottom: 0.4rem; color: var(--muted-foreground); font-size: 0.61rem; }
+.diffHint { color: var(--muted-foreground); font-size: 0.62rem; }
+.diffList { display: grid; gap: 0.35rem; margin-top: 0.65rem; }
+.diffEntry { border: 1px solid var(--cap-soft-line); border-radius: 0.42rem; background: color-mix(in oklab, var(--background) 42%, transparent); }
+.diffEntry summary { display: flex; align-items: center; gap: 0.38rem; padding: 0.42rem 0.48rem; cursor: pointer; list-style: none; font-size: 0.62rem; }
+.diffEntry summary::-webkit-details-marker { display: none; }
+.diffEntry summary > svg { width: 0.7rem; height: 0.7rem; margin-left: auto; color: var(--muted-foreground); transition: transform 140ms ease; }
+.diffEntry[open] summary > svg { transform: rotate(180deg); }
+.diffMarker { display: inline-grid; place-items: center; width: 1rem; height: 1rem; border-radius: 0.22rem; font-family: var(--font-mono-family); font-size: 0.68rem; }
+.diffAdded { color: var(--success); background: color-mix(in oklab, var(--success) 13%, transparent); }
+.diffRemoved { color: var(--destructive); background: color-mix(in oklab, var(--destructive) 13%, transparent); }
+.diffChanged { color: var(--warning); background: color-mix(in oklab, var(--warning) 13%, transparent); }
+.diffValues { display: grid; gap: 0.35rem; border-top: 1px solid var(--cap-soft-line); padding: 0.45rem; }
+.diffValues pre { max-height: 10rem; margin: 0; overflow: auto; border-radius: 0.3rem; padding: 0.45rem; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono-family); font-size: 0.56rem; line-height: 1.4; }
+.diffBefore { color: color-mix(in oklab, var(--destructive) 85%, var(--foreground)); background: color-mix(in oklab, var(--destructive) 6%, transparent); }
+.diffAfter { color: color-mix(in oklab, var(--success) 86%, var(--foreground)); background: color-mix(in oklab, var(--success) 6%, transparent); }
+.noDiff { display: flex; align-items: center; gap: 0.35rem; margin-top: 0.65rem; color: var(--success); font-size: 0.62rem; }
+.noDiff svg { width: 0.78rem; height: 0.78rem; }
+
+.confirmDialog { max-width: 29rem; }
+.confirmCallout { display: flex; align-items: flex-start; gap: 0.5rem; border: 1px solid color-mix(in oklab, var(--info) 21%, transparent); border-radius: 0.5rem; padding: 0.6rem 0.7rem; color: var(--muted-foreground); background: color-mix(in oklab, var(--info) 6%, transparent); font-size: 0.66rem; line-height: 1.4; }
+.confirmCallout svg { width: 0.88rem; height: 0.88rem; flex-shrink: 0; color: var(--info); }
+
+.emptyLibrary, .emptyDetail { display: grid; place-items: center; min-height: 10rem; padding: 2rem 1rem; color: var(--muted-foreground); text-align: center; }
+.emptyDetail { flex: 1; min-height: 18rem; }
+.emptyLibrary svg, .emptyDetail svg { width: 1.5rem; height: 1.5rem; color: var(--info); opacity: 0.6; }
+.emptyLibrary h2, .emptyDetail h2 { margin: 0.6rem 0 0; color: var(--foreground); font-size: 0.8rem; font-weight: 540; }
+.emptyLibrary p, .emptyDetail p { max-width: 19rem; margin: 0.35rem 0 0; font-size: 0.65rem; line-height: 1.5; }
+
+@media (max-width: 900px) {
+  .sidebar { width: min(17rem, 36vw); min-width: 14rem; }
+  .detailGrid { grid-template-columns: minmax(0, 1fr); }
+  .secondaryColumn { grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; }
+}
+
+@media (max-width: 680px) {
+  .body { overflow: auto; flex-direction: column; }
+  .sidebar { width: 100%; min-width: 0; max-height: 20rem; border-right: 0; border-bottom: 1px solid var(--cap-line); }
+  .list { max-height: 12rem; }
+  .detail { overflow: visible; }
+  .detailHeader { flex-direction: column; }
+  .actionRow { justify-content: flex-start; }
+  .secondaryColumn { grid-template-columns: minmax(0, 1fr); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .searchInput, .filterButton, .listItem, .parameterField input:not([type="checkbox"]), .parameterField select, .parameterField textarea, .triggerRow input, .triggerRow select, .toggleTrack, .toggleTrack span, .diffEntry summary > svg { transition: none; }
+}

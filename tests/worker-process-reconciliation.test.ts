@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { loadConfig, SecretStore, writeDefaultConfig } from "../packages/config/src/index.js";
 import { capabilities, emit, makeSession } from "../packages/drivers/src/common.js";
 import { DriverRegistry } from "../packages/drivers/src/registry.js";
+import { WorkerHostConnection } from "../packages/drivers/src/index.js";
 import {
   AgentRecordSchema,
   AgentWorkOrderSchema,
@@ -68,6 +70,29 @@ class LedgerDriver implements WorkerDriver {
 
   async sendMessage(): Promise<{ receiptId: string; queued: boolean }> { return { receiptId: "fixture", queued: false }; }
   async cancel(): Promise<void> {}
+}
+
+/** A native session whose process callback is intentionally never forwarded. */
+class MissedExitDriver extends LedgerDriver {
+  readonly attachedIdentity = identity(8842, "boot:missed-exit");
+
+  override async start(
+    request: DriverStartRequest,
+    _onEvent: (event: DriverEvent) => void,
+    options?: DriverLifecycleOptions,
+  ): Promise<DriverSession> {
+    const supervisor = options?.processSupervisor;
+    if (!supervisor) throw new Error("Missing process supervisor.");
+    const lease = supervisor.reserveProcess({
+      role: "missed-exit-fixture",
+      command: "fixture",
+      args: [],
+      cwd: request.workOrder.workspace.path,
+      adapterVersion: "fixture",
+    });
+    supervisor.attachProcess(lease.id, this.attachedIdentity);
+    return makeSession(this.id, `native-${request.agentId}`, {}, `turn-${request.agentId}`);
+  }
 }
 
 class SynchronousTerminalResumeDriver extends LedgerDriver {
@@ -441,6 +466,79 @@ function fixture(root: string, driver: WorkerDriver = new LedgerDriver()) {
 }
 
 describe("worker process reconciliation", () => {
+  it("adopts and terminates a controller-lost hosted lease even after its agent is terminal", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-process-controller-lost-retirement-"));
+    temporary.push(root);
+    const driver = new HostedAdoptionDriver();
+    const { store, coordinator } = fixture(root, driver);
+    const { agent: active, order } = activeAgent(root, "controller-lost-retirement");
+    const terminal = AgentRecordSchema.parse({
+      ...active,
+      status: "failed",
+      error: "Controller reconnect grace exhausted.",
+      finishedAt: new Date().toISOString(),
+    });
+    store.saveAgent(terminal);
+    store.setMetadata(`work-order:${terminal.id}`, order);
+    const host = identity(7442, "boot:controller-lost-host");
+    const leaseId = saveOldHostedLease(store, terminal, host);
+    const adoptLease = vi.spyOn(store, "adoptWorkerProcessLease");
+    store.durablyTouchWorkerProcessLease(leaseId, {
+      retirementRequestedAt: new Date().toISOString(),
+      retirementReason: "controller-lost",
+      error: "Worker-host controller reconnect grace exhausted.",
+    });
+    expect(store.getWorkerProcessLease(leaseId)).toMatchObject({ retirementReason: "controller-lost" });
+
+    const close = vi.fn();
+    const fake = Object.assign(new EventEmitter(), {
+      accepted: {
+        hostInstanceId: `host-instance-${terminal.id}`,
+        workerPid: 4343,
+        workerRunning: true,
+      },
+      socket: { destroyed: false },
+      close,
+    });
+    const request = vi.fn(async (message: Record<string, unknown>) => {
+      if (message.type === "shutdown") {
+        fake.socket.destroyed = true;
+        queueMicrotask(() => fake.emit("close"));
+      }
+      return { state: "applied" };
+    });
+    fake.request = request;
+    const connect = vi.spyOn(WorkerHostConnection, "connect").mockResolvedValue(fake as unknown as WorkerHostConnection);
+
+    coordinator.reconcileWorkerProcesses(() => ({ status: "exact", identity: host, detail: "Exact live controller-lost host." }));
+    expect(store.recentEvents({ agentId: terminal.id })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "supervisor.host.adoption-pending", payload: expect.objectContaining({ retirementReason: "controller-lost" }) }),
+    ]));
+    await coordinator.recover();
+
+    expect(driver.resumes).toBe(0);
+    expect(adoptLease).toHaveBeenCalled();
+    expect(store.getWorkerProcessLease(leaseId)).toMatchObject({ daemonOwnerId: expect.not.stringMatching(/^previous-daemon$/u), state: "exited" });
+    expect(store.recentEvents({ agentId: terminal.id })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "supervisor.host.adopted" }),
+    ]));
+    expect(connect).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "signal", signal: "SIGTERM" }));
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ type: "shutdown" }));
+    expect(close).toHaveBeenCalledOnce();
+    expect(store.getWorkerProcessLease(leaseId)).toMatchObject({
+      state: "exited",
+      retirementRequestedAt: null,
+      retirementReason: null,
+      error: "Controller-lost worker-host retirement completed.",
+    });
+    expect(store.recentEvents({ agentId: terminal.id })).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "supervisor.host.adopted", payload: expect.objectContaining({ continuity: "controller-lost-retirement-adopted" }) }),
+      expect.objectContaining({ type: "supervisor.process.exited", payload: expect.objectContaining({ retirementReason: "controller-lost" }) }),
+    ]));
+    store.close();
+  });
+
   it("never signals a PID-reuse mismatch and fails the agent closed", () => {
     const root = mkdtempSync(join(tmpdir(), "symphony-process-mismatch-"));
     temporary.push(root);
@@ -865,6 +963,64 @@ describe("worker process reconciliation", () => {
     expect(store.listWorkerProcessLeases({ agentId: created.id })).toEqual([
       expect.objectContaining({ state: "reserved", role: "hung-fixture", identity: null }),
     ]);
+    store.close();
+  });
+
+  it("reconciles a missed exit callback without redispatching the native work", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-process-missed-callback-"));
+    temporary.push(root);
+    const driver = new MissedExitDriver();
+    const { store, coordinator } = fixture(root, driver);
+
+    const created = await coordinator.create(workOrder(root, "missed-exit"));
+    await expect.poll(() => coordinator.get(created.id).status).toBe("running");
+    const lease = store.listWorkerProcessLeases({ agentId: created.id, states: ["running"] })[0];
+    if (!lease) throw new Error("Expected a running native process lease.");
+
+    coordinator.reconcileActiveProcesses(() => ({
+      status: "dead",
+      detail: "Fixture process exited before its driver callback was delivered.",
+    }));
+    await expect.poll(() => coordinator.get(created.id).status).toBe("interrupted");
+
+    expect(store.getWorkerProcessLease(lease.id)).toMatchObject({
+      state: "exited",
+      activeTurnId: null,
+      error: expect.stringContaining("Fixture process exited"),
+    });
+    expect(store.recentEvents({ agentId: created.id }).filter((event) => event.type === "agent.interrupted")).toHaveLength(1);
+    expect(store.recentEvents({ agentId: created.id }).filter((event) => event.type === "supervisor.process.exited")).toHaveLength(1);
+    expect(driver.resumes).toBe(0);
+
+    // A second pass is idempotent and cannot redispatch or emit another
+    // interruption once the durable agent is terminal.
+    coordinator.reconcileActiveProcesses(() => ({ status: "dead", detail: "Should not be consulted again." }));
+    expect(store.recentEvents({ agentId: created.id }).filter((event) => event.type === "agent.interrupted")).toHaveLength(1);
+    store.close();
+  });
+
+  it("keeps an exact live retained process running during reconciliation", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-process-live-reconcile-"));
+    temporary.push(root);
+    const driver = new MissedExitDriver();
+    const { store, coordinator } = fixture(root, driver);
+
+    const created = await coordinator.create(workOrder(root, "live-reconcile"));
+    await expect.poll(() => coordinator.get(created.id).status).toBe("running");
+    const lease = store.listWorkerProcessLeases({ agentId: created.id, states: ["running"] })[0];
+    if (!lease) throw new Error("Expected a running native process lease.");
+    const beforeEvents = store.recentEvents({ agentId: created.id });
+
+    coordinator.reconcileActiveProcesses(() => ({
+      status: "exact",
+      identity: driver.attachedIdentity,
+      detail: "Fixture process remains alive with the recorded birth identity.",
+    }));
+
+    expect(coordinator.get(created.id)).toMatchObject({ status: "running" });
+    expect(store.getWorkerProcessLease(lease.id)).toMatchObject({ state: "running" });
+    expect(store.recentEvents({ agentId: created.id })).toHaveLength(beforeEvents.length);
+    expect(driver.resumes).toBe(0);
     store.close();
   });
 });

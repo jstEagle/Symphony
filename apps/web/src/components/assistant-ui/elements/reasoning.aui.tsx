@@ -1,13 +1,12 @@
 "use client";
 
-import { memo, useCallback, useRef } from "react";
+import { lazy, memo, Suspense, useCallback, useRef } from "react";
 import {
   useScrollLock,
   useAuiState,
   type ReasoningMessagePartComponent,
   type ReasoningGroupComponent,
 } from "@assistant-ui/react";
-import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
 import {
   ANIMATION_DURATION,
   ReasoningRoot as ReasoningRootBase,
@@ -56,7 +55,12 @@ function ReasoningRoot({
   );
 }
 
-const ReasoningImpl: ReasoningMessagePartComponent = () => <MarkdownText />;
+const MarkdownText = lazy(() => import("@/components/assistant-ui/elements/markdown-text").then((module) => ({ default: module.MarkdownText })));
+const ReasoningImpl: ReasoningMessagePartComponent = () => (
+  <Suspense fallback={<span className="whitespace-pre-wrap">Reasoning…</span>}>
+    <MarkdownText />
+  </Suspense>
+);
 
 const ReasoningGroupImpl: ReasoningGroupComponent = ({
   children,

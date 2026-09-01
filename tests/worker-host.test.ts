@@ -357,6 +357,22 @@ describe("worker host external process", () => {
     expect(() => process.kill(host.workerPid as number, 0)).toThrow();
   });
 
+  it("retires the native process after controller grace expires without a successor", async () => {
+    const host = await startHost();
+    const connection = await authenticate(host);
+    const hello = await connection.waitFor((message) => message.type === "hello.accepted");
+    host.workerPid = hello.workerPid as number;
+    await connection.waitFor((message) => message.type === "replay.complete");
+    await connection.waitFor((message) => outputPayload(message)?.type === "fixture.ready");
+
+    await connection.close();
+    await expect.poll(
+      () => host.process.exitCode ?? host.process.signalCode,
+      { timeout: 8_000, interval: 50 },
+    ).not.toBeNull();
+    expect(processIsAlive(host.workerPid as number)).toBe(false);
+  });
+
   it("fails closed when the durable spool exceeds its bound", async () => {
     const host = await startHost({ maxSpoolBytes: 1_024, maxSpoolFrames: 8 });
     const connection = await authenticate(host);

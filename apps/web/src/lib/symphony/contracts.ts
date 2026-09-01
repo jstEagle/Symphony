@@ -1,3 +1,34 @@
+import type {
+  ObjectiveActor,
+  ObjectiveApprovalRecord,
+  ObjectiveBudgetDebitRecord,
+  ObjectiveBudgetLedgerRecord,
+  ObjectiveBudgetReservationRecord,
+  ObjectiveCheckpointRecord,
+  ObjectiveRunRecord,
+  ObjectiveTaskRecord,
+  ObjectiveControlPlanRevision,
+  ObjectiveControlPlanSnapshot,
+  ObjectiveAggregateSnapshot,
+  ObjectiveAggregateRecord,
+} from "../../../../../packages/protocol/src/index.js";
+
+export type {
+  ObjectiveActor,
+  ObjectiveApprovalRecord,
+  ObjectiveBudgetDebitRecord,
+  ObjectiveBudgetLedgerRecord,
+  ObjectiveBudgetReservationRecord,
+  ObjectiveCheckpointRecord,
+  ObjectivePolicySnapshot,
+  ObjectiveRunRecord,
+  ObjectiveTaskRecord,
+  ObjectiveControlPlanRevision,
+  ObjectiveControlPlanSnapshot,
+  ObjectiveAggregateSnapshot,
+  ObjectiveAggregateRecord,
+} from "../../../../../packages/protocol/src/index.js";
+
 export type JsonValue =
   | string
   | number
@@ -81,9 +112,78 @@ export type WorkflowMission = {
   id?: string;
 };
 
+export type WorkflowRevisionRecord = {
+  id: string;
+  revision: number;
+  mission: JsonValue;
+  definition: JsonValue;
+  ir: JsonValue;
+  hash: string;
+  createdAt: string;
+};
+
+/** The immutable plan snapshot returned with a durable objective detail. */
+export type ObjectivePlanRevisionRecord = Readonly<{
+  version: 1;
+  id: string;
+  runId: string;
+  objectiveId: string;
+  workflowId: string;
+  workflowRevision: number;
+  workflowHash: string;
+  planRevision: number;
+  tasks: ObjectiveTaskRecord[];
+  createdBy: ObjectiveActor;
+  requestKey: string;
+  createdAt: string;
+}>;
+
+/** Read-only objective endpoints are authoritative daemon projections. */
+export type ObjectiveListResponse = {
+  objectives: ObjectiveRunRecord[];
+  limit: number;
+};
+
+/** One atomic objective projection. All child records share this cursor fence. */
+export type ObjectiveSnapshotResponse = ObjectiveAggregateSnapshot;
+
+export type ObjectiveAggregateListResponse = {
+  aggregates: ObjectiveAggregateRecord[];
+  limit: number;
+};
+
+export type ObjectiveDetailResponse = {
+  run: ObjectiveRunRecord;
+  planRevisions: ObjectivePlanRevisionRecord[];
+  checkpoints: ObjectiveCheckpointRecord[];
+  approvals: ObjectiveApprovalRecord[];
+  /** Optional in the rolling API contract; absent on legacy daemon responses. */
+  budgetLedger?: ObjectiveBudgetLedgerRecord | null;
+  reservations?: ObjectiveBudgetReservationRecord[] | null;
+  debits?: ObjectiveBudgetDebitRecord[] | null;
+  events: EventEnvelope[];
+  eventCursor: number;
+  hasMore: boolean;
+  /** Optional on older daemons; the dedicated strategy endpoint is preferred. */
+  control?: ObjectiveControlProjection | null;
+};
+
+/** The immutable tree projection used by the Strategy surface when available. */
+export type ObjectiveControlProjection = Readonly<{
+  runId: string;
+  objectiveId: string;
+  planId: string;
+  revision: ObjectiveControlPlanRevision;
+  snapshot: ObjectiveControlPlanSnapshot;
+}>;
+
 export type Agent = {
   id: string;
+  /** Stable work-order identity from the daemon's agent ledger. */
+  logicalAgentId?: string;
   parentId?: string;
+  /** Optional graph-only dependency references when a workflow supplies them. */
+  dependsOn?: string[];
   depth: number;
   name: string;
   objective: string;
@@ -112,6 +212,11 @@ export type WorkNode = {
   label: string;
   detail: string;
   agentId?: string;
+  /** Durable identity used for graph reconciliation and React keys. */
+  ledgerId?: string;
+  runId?: string;
+  rootId?: string;
+  turn?: number;
   state: AgentState;
   x: number;
   y: number;
@@ -424,6 +529,7 @@ export type BootstrapEnvelope = {
   threads: ChatThreadRecord[];
   messages: ConversationMessage[];
   projects: ProjectRecord[];
+  workflows: WorkflowRevisionRecord[];
   agents: AgentRecord[];
   runs: WorkflowRunRecord[];
   costs: CostSummary;

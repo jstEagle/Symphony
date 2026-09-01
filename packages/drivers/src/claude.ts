@@ -5,12 +5,12 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
   DriverDoctorResult, DriverEvent, DriverLifecycleOptions, DriverSession, DriverStartRequest,
-  JsonValue, ModelDescriptor, WorkerDriver,
+  JsonValue, ModelDescriptor, WorkerDriver, DriverMessageRequest,
 } from "@symphony/protocol";
-import { buildAgentPrompt, buildSymphonyOperatingContract, hasStructuredOutputSchema, isConductor } from "./prompt.js";
+import { buildAgentPrompt, buildSymphonyOperatingContract, coordinationPromptOptions, hasStructuredOutputSchema, isConductor } from "./prompt.js";
 import { HostedJsonLineProcess } from "./hosted-process.js";
 import { JsonLineProcess, asObject, asString, type JsonLineRpcTransport } from "./process.js";
-import { capabilities, emit, makeSession, receipt, record, type Emit } from "./common.js";
+import { canonicalNativeEventId, capabilities, emit, makeSession, messageRequest, record, withMessageIdentity, type Emit } from "./common.js";
 
 type InitialClaudeDispatch = {
   requestId: string;
@@ -26,6 +26,10 @@ type ActiveClaude = {
   running: boolean;
   settled: boolean;
   initialDispatch: InitialClaudeDispatch | null;
+  messageSequence: number;
+  pendingMessage: DriverMessageRequest | null;
+  pendingMessageAccepted: boolean;
+  queuedMessages: Array<{ request: DriverMessageRequest; accepted: boolean }>;
 };
 
 export class ClaudeDriver implements WorkerDriver {
@@ -70,6 +74,10 @@ export class ClaudeDriver implements WorkerDriver {
       running: true,
       settled: false,
       initialDispatch: { requestId: `claude:initial-query:${request.agentId}`, state: "dispatching", sessionId: null },
+      messageSequence: 0,
+      pendingMessage: null,
+      pendingMessageAccepted: false,
+      queuedMessages: [],
     };
     this.active.set(provisionalSessionId, active);
     const abort = () => {
@@ -88,7 +96,7 @@ export class ClaudeDriver implements WorkerDriver {
       const result = asObject(await rpc.requestWithId(
         initialDispatch.requestId,
         "session/start",
-        { prompt: buildAgentPrompt(request.workOrder), options: this.sdkOptions(request) },
+        { prompt: buildAgentPrompt(request.workOrder, coordinationPromptOptions(request)), options: this.sdkOptions(request) },
         0,
         (value) => this.acceptInitialDispatch(active, this.responseSessionId(value), "start-response"),
       ));
@@ -119,6 +127,10 @@ export class ClaudeDriver implements WorkerDriver {
       running: retained.running === true || session.state === "running" || session.state === "starting",
       settled: retained.settled === true,
       initialDispatch,
+      messageSequence: typeof retained.messageSequence === "number" && Number.isSafeInteger(retained.messageSequence) ? retained.messageSequence : 0,
+      pendingMessage: retainedMessageDispatch(retained),
+      pendingMessageAccepted: retained.pendingMessageAccepted === true,
+      queuedMessages: retainedMessageQueue(retained),
     };
     this.active.set(active.sessionId, active);
     const abort = () => {
@@ -132,7 +144,7 @@ export class ClaudeDriver implements WorkerDriver {
           ? rpc.requestWithId(
               initialDispatch.requestId,
               "session/start",
-              { prompt: buildAgentPrompt(request.workOrder), options: this.sdkOptions(request) },
+              { prompt: buildAgentPrompt(request.workOrder, coordinationPromptOptions(request)), options: this.sdkOptions(request) },
               0,
               (value) => this.acceptInitialDispatch(active, this.responseSessionId(value), "replayed-start-response"),
             )
@@ -151,7 +163,7 @@ export class ClaudeDriver implements WorkerDriver {
         return {
           ...session,
           nativeSessionId: active.sessionId,
-          state: active.running ? "running" : active.settled ? "completed" : "idle",
+          state: this.recoveryState(active),
           metadata: { ...session.metadata, transportReusable: rpc.isReusable() },
         };
       }
@@ -164,7 +176,7 @@ export class ClaudeDriver implements WorkerDriver {
       active.settled = false;
       this.checkpoint(active);
       emit(onEvent, "session.started", { sessionId: active.sessionId, resumed: true }, `claude-session:${active.sessionId}:started`);
-      return { ...session, nativeSessionId: active.sessionId, state: "idle" };
+      return { ...session, nativeSessionId: active.sessionId, state: this.recoveryState(active) };
     } catch (error) {
       this.removeProcess(rpc);
       if (rpc.mode === "reconnected") await rpc.detach();
@@ -175,20 +187,58 @@ export class ClaudeDriver implements WorkerDriver {
     }
   }
 
-  async sendMessage(session: DriverSession, message: string): Promise<{ receiptId: string; queued: boolean; terminalBoundary?: boolean }> {
+  async sendMessage(session: DriverSession, message: string, request?: DriverMessageRequest): Promise<{ receiptId: string; queued: boolean; terminalBoundary?: boolean }> {
     const active = this.require(session);
+    const durable = messageRequest(message, request);
+    const pendingMatch = active.pendingMessage?.requestId === durable.requestId && active.pendingMessage.contentHash === durable.contentHash;
+    const queuedMatch = active.queuedMessages.some((entry) => entry.request.requestId === durable.requestId && entry.request.contentHash === durable.contentHash);
+    if (pendingMatch || queuedMatch) {
+      return { receiptId: durable.requestId, queued: pendingMatch ? false : true };
+    }
+    const pendingDifferent = active.pendingMessage && (active.pendingMessage.requestId !== durable.requestId || active.pendingMessage.contentHash !== durable.contentHash);
+    if (pendingDifferent && !active.pendingMessageAccepted) {
+      throw new Error("Claude native message is already pending with a different durable identity.");
+    }
     const wasRunning = active.running;
-    const result = asObject(await active.rpc.request("session/prompt", { prompt: message }, 0));
+    const queuedBehindActiveTurn = Boolean(active.pendingMessage && active.pendingMessageAccepted && active.running);
+    if (queuedBehindActiveTurn) active.queuedMessages.push({ request: durable, accepted: false });
+    else {
+      active.pendingMessage = durable;
+      active.pendingMessageAccepted = false;
+    }
+    this.checkpoint(active);
+    const result = asObject(await active.rpc.requestWithId(durable.requestId, "session/prompt", {
+      prompt: message,
+      requestId: durable.requestId,
+      contentHash: durable.contentHash,
+    }, 0));
     const acceptedSession = this.responseSessionId(result);
     if (acceptedSession !== active.sessionId) throw new Error(`Claude follow-up session identity changed from ${active.sessionId} to ${acceptedSession}.`);
     const terminalBoundary = result.terminalBoundary === true;
-    if (!terminalBoundary) {
+    if (!terminalBoundary && (asString(result.requestId) !== durable.requestId || asString(result.contentHash) !== durable.contentHash)) {
+      throw new Error("Claude host did not echo the durable follow-up identity; acceptance is unknown.");
+    }
+    if (terminalBoundary) {
+      // The host proved this prompt was not appended behind the preceding
+      // result. Let the runtime requeue it with the same durable request id.
+      if (queuedBehindActiveTurn) {
+        active.queuedMessages = active.queuedMessages.filter((entry) => entry.request.requestId !== durable.requestId);
+      } else {
+        active.pendingMessage = null;
+        active.pendingMessageAccepted = false;
+      }
+    } else {
       active.running = true;
       active.settled = false;
+      if (queuedBehindActiveTurn) {
+        const queued = active.queuedMessages.find((entry) => entry.request.requestId === durable.requestId);
+        if (queued) queued.accepted = true;
+      } else active.pendingMessageAccepted = true;
     }
     this.checkpoint(active);
     return {
-      ...receipt(result.queued === true || wasRunning),
+      receiptId: durable.requestId,
+      queued: result.queued === true || wasRunning,
       ...(terminalBoundary ? { terminalBoundary: true } : {}),
     };
   }
@@ -239,7 +289,7 @@ export class ClaudeDriver implements WorkerDriver {
       systemPrompt: {
         type: "preset",
         preset: "claude_code",
-        append: buildSymphonyOperatingContract(request.workOrder, { agentId: request.agentId, canCreate: request.coordination.canCreate }),
+        append: buildSymphonyOperatingContract(request.workOrder, coordinationPromptOptions(request)),
       },
       ...(isConductor(request.workOrder) || !hasStructuredOutputSchema(request.workOrder)
         ? {}
@@ -332,7 +382,13 @@ export class ClaudeDriver implements WorkerDriver {
     if (active && observedSessionId && active.initialDispatch?.state === "dispatching") {
       this.acceptInitialDispatch(active, observedSessionId, "native-message");
     }
-    this.onMessage(sdkMessage, consumer, hostedFrameId ? (suffix) => `${hostedFrameId}:${suffix}` : () => undefined);
+    this.onMessage(
+      sdkMessage,
+      consumer,
+      hostedFrameId ? (suffix) => `${hostedFrameId}:${suffix}` : () => undefined,
+      active?.sessionId ?? asString(sdkMessage.session_id) ?? null,
+      active,
+    );
     if (active) this.checkpoint(active);
     const generation = typeof sdkMessage.__symphonyTurnGeneration === "number" && Number.isSafeInteger(sdkMessage.__symphonyTurnGeneration)
       ? sdkMessage.__symphonyTurnGeneration
@@ -350,10 +406,29 @@ export class ClaudeDriver implements WorkerDriver {
     }
   }
 
-  private onMessage(message: Record<string, unknown>, consumer: Emit, eventId: (suffix: string) => string | undefined): void {
+  private onMessage(
+    message: Record<string, unknown>,
+    consumer: Emit,
+    eventId: (suffix: string) => string | undefined,
+    sessionId: string | null,
+    active: ActiveClaude | undefined,
+  ): void {
+    const eventRecord = record(message.event);
+    const messageId = asString(eventRecord.id)
+      ?? asString(eventRecord.eventId)
+      ?? asString(message.uuid)
+      ?? asString(message.id);
+    const streamSequence = active ? ++active.messageSequence : null;
+    if (active) this.checkpoint(active);
+    const identity = (suffix: string): string | undefined => eventId(suffix)
+      ?? (sessionId && messageId ? `claude:${sessionId}:message:${messageId}:${suffix}` : undefined)
+      ?? (active && sessionId && streamSequence !== null
+        ? canonicalNativeEventId("claude", `${sessionId}:stream:${streamSequence}`, suffix as DriverEvent["kind"], message)
+        : undefined);
     const type = asString(message.type) ?? "unknown";
+    const durableIdentity = active ? this.messageIdentity(active, message) : null;
     if (type === "system" && message.subtype === "init") {
-      emit(consumer, "run.started", { sessionId: message.session_id, model: message.model, tools: message.tools }, eventId("run.started"));
+      emit(consumer, "run.started", { sessionId: message.session_id, model: message.model, tools: message.tools }, identity("run.started"));
       return;
     }
     if (type === "assistant") {
@@ -362,7 +437,7 @@ export class ClaudeDriver implements WorkerDriver {
         const block = record(blockValue);
         if (block.type !== "tool_use") continue;
         const toolCallId = asString(block.id) ?? asString(message.uuid) ?? "native-tool";
-        emit(consumer, "tool.started", { toolCallId, toolName: asString(block.name) ?? "native_tool", args: block.input ?? {}, status: "inProgress" }, toolCallId);
+        emit(consumer, "tool.started", { toolCallId, toolName: asString(block.name) ?? "native_tool", args: block.input ?? {}, status: "inProgress" }, sessionId ? `claude:${sessionId}:tool:${toolCallId}:started` : toolCallId);
       }
       return;
     }
@@ -372,7 +447,7 @@ export class ClaudeDriver implements WorkerDriver {
         const block = record(blockValue);
         const toolCallId = block.type === "tool_result" ? asString(block.tool_use_id) : null;
         if (!toolCallId) continue;
-        emit(consumer, "tool.completed", { toolCallId, result: message.tool_use_result ?? block.content ?? null, status: block.is_error === true ? "failed" : "completed", isError: block.is_error === true }, toolCallId);
+        emit(consumer, "tool.completed", { toolCallId, result: message.tool_use_result ?? block.content ?? null, status: block.is_error === true ? "failed" : "completed", isError: block.is_error === true }, sessionId ? `claude:${sessionId}:tool:${toolCallId}:completed` : toolCallId);
       }
       return;
     }
@@ -382,12 +457,18 @@ export class ClaudeDriver implements WorkerDriver {
         consumer,
         "tool.updated",
         { toolCallId, toolName: message.tool_name, status: "inProgress", elapsedSeconds: message.elapsed_time_seconds },
-        eventId("tool.updated") ?? `${toolCallId}:progress:${++this.toolProgressOrdinal}`,
+        identity("tool.updated") ?? `${toolCallId}:progress:${++this.toolProgressOrdinal}`,
       );
       return;
     }
     if (type === "result") {
-      emit(consumer, "usage.recorded", { costAmount: message.total_cost_usd, usage: message.usage, modelUsage: message.modelUsage, basis: "harness-reported" }, eventId("usage.recorded"));
+      emit(consumer, "usage.recorded", withMessageIdentity({
+        costAmount: message.total_cost_usd,
+        usage: message.usage,
+        modelUsage: message.modelUsage,
+        basis: "harness-reported",
+        ...(sessionId ? { nativeSessionId: sessionId } : {}),
+      }, durableIdentity), identity("usage.recorded"));
       const queuedPrompts = typeof message.__symphonyQueuedPrompts === "number" && Number.isSafeInteger(message.__symphonyQueuedPrompts)
         ? message.__symphonyQueuedPrompts
         : 0;
@@ -395,31 +476,41 @@ export class ClaudeDriver implements WorkerDriver {
       if (active) {
         active.running = queuedPrompts > 0;
         active.settled = queuedPrompts === 0 && message.subtype === "success" && message.is_error !== true;
+        if (durableIdentity && active.pendingMessage?.requestId === durableIdentity.requestId) {
+          active.pendingMessage = null;
+          active.pendingMessageAccepted = false;
+          const next = active.queuedMessages.shift();
+          if (next) {
+            active.pendingMessage = next.request;
+            active.pendingMessageAccepted = next.accepted;
+          }
+        }
       }
       if (queuedPrompts > 0 && message.subtype === "success" && message.is_error !== true) {
-        emit(consumer, "log", {
+        emit(consumer, "log", withMessageIdentity({
           phase: "claude-turn-completed-with-queued-prompts",
           queuedPrompts,
           stopReason: message.stop_reason,
           turns: message.num_turns,
-        }, eventId("turn.queued"));
+        }, durableIdentity), identity("turn.queued"));
         return;
       }
       if (message.subtype === "success" && message.is_error !== true) {
-        emit(consumer, "output.completed", { text: message.result, structuredOutput: message.structured_output ?? null }, eventId("output.completed"));
-        emit(consumer, "run.completed", { stopReason: message.stop_reason, turns: message.num_turns }, eventId("run.completed"));
-      } else emit(consumer, "run.failed", { subtype: message.subtype, errors: message.errors ?? [] }, eventId("run.failed"));
+        emit(consumer, "output.completed", withMessageIdentity({ text: message.result, structuredOutput: message.structured_output ?? null, ...(sessionId ? { nativeSessionId: sessionId } : {}) }, durableIdentity), identity("output.completed"));
+        emit(consumer, "run.completed", withMessageIdentity({ stopReason: message.stop_reason, turns: message.num_turns, ...(sessionId ? { nativeSessionId: sessionId } : {}) }, durableIdentity), identity("run.completed"));
+      } else emit(consumer, "run.failed", withMessageIdentity({ subtype: message.subtype, errors: message.errors ?? [], ...(sessionId ? { nativeSessionId: sessionId } : {}) }, durableIdentity), identity("run.failed"));
+      if (active) this.checkpoint(active);
       return;
     }
     if (type === "stream_event") {
       const streamEvent = record(message.event);
       const delta = record(streamEvent.delta);
       if (streamEvent.type === "content_block_delta" && delta.type === "text_delta" && typeof delta.text === "string") {
-        emit(consumer, "message.delta", { text: delta.text, index: streamEvent.index ?? null }, eventId("message.delta"));
+        emit(consumer, "message.delta", { text: delta.text, index: streamEvent.index ?? null }, identity("message.delta"));
       } else if (streamEvent.type === "content_block_delta" && delta.type === "thinking_delta" && typeof delta.thinking === "string") {
-        emit(consumer, "reasoning.delta", { text: delta.thinking, index: streamEvent.index ?? null }, eventId("reasoning.delta"));
-      } else emit(consumer, "log", message, eventId("log"));
-    } else emit(consumer, "log", message, eventId("log"));
+        emit(consumer, "reasoning.delta", { text: delta.thinking, index: streamEvent.index ?? null }, identity("reasoning.delta"));
+      } else emit(consumer, "log", message, identity("log"));
+    } else emit(consumer, "log", message, identity("log"));
   }
 
   private responseSessionId(value: unknown): string {
@@ -454,7 +545,17 @@ export class ClaudeDriver implements WorkerDriver {
   }
 
   private adapterState(active: ActiveClaude): JsonValue {
-    return { version: 1, sessionId: active.sessionId, running: active.running, settled: active.settled, initialDispatch: active.initialDispatch };
+    return {
+      version: 1,
+      sessionId: active.sessionId,
+      running: active.running,
+      settled: active.settled,
+      initialDispatch: active.initialDispatch,
+      messageSequence: active.messageSequence,
+      pendingMessage: active.pendingMessage as unknown as JsonValue,
+      pendingMessageAccepted: active.pendingMessageAccepted,
+      queuedMessages: active.queuedMessages.map((entry) => ({ request: entry.request, accepted: entry.accepted })) as unknown as JsonValue,
+    };
   }
 
   private retainedInitialDispatch(state: Record<string, unknown>): InitialClaudeDispatch | null {
@@ -468,6 +569,25 @@ export class ClaudeDriver implements WorkerDriver {
     return [...this.active.values()].find((candidate) => candidate.emit === consumer);
   }
 
+  private recoveryState(active: ActiveClaude): DriverSession["state"] {
+    const acceptanceUnknown = (active.pendingMessage !== null && !active.pendingMessageAccepted)
+      || active.queuedMessages.some((entry) => !entry.accepted);
+    if (acceptanceUnknown) return "unknown";
+    if (active.running) return "running";
+    if (active.settled) return "completed";
+    return "idle";
+  }
+
+  private messageIdentity(active: ActiveClaude, message: Record<string, unknown>): DriverMessageRequest | null {
+    const requestId = asString(message.__symphonyMessageRequestId);
+    const contentHash = asString(message.__symphonyMessageContentHash);
+    if (requestId) {
+      if (active.pendingMessage?.requestId === requestId && (!contentHash || active.pendingMessage.contentHash === contentHash)) return active.pendingMessage;
+      return active.queuedMessages.find((entry) => entry.request.requestId === requestId && (!contentHash || entry.request.contentHash === contentHash))?.request ?? null;
+    }
+    return active.pendingMessage;
+  }
+
   private removeProcess(rpc: JsonLineRpcTransport): void {
     for (const [sessionId, active] of this.active.entries()) if (active.rpc === rpc) this.active.delete(sessionId);
   }
@@ -477,4 +597,25 @@ export class ClaudeDriver implements WorkerDriver {
     if (!active) throw new Error(`Claude session is not active: ${session.nativeSessionId}`);
     return active;
   }
+}
+
+function retainedMessageDispatch(state: Record<string, unknown>): DriverMessageRequest | null {
+  const value = record(state.pendingMessage);
+  if (typeof value.attemptId !== "string" || typeof value.requestId !== "string" || typeof value.contentHash !== "string") return null;
+  return { attemptId: value.attemptId, requestId: value.requestId, contentHash: value.contentHash };
+}
+
+function retainedMessageQueue(state: Record<string, unknown>): Array<{ request: DriverMessageRequest; accepted: boolean }> {
+  const values = Array.isArray(state.queuedMessages) ? state.queuedMessages : [];
+  const result: Array<{ request: DriverMessageRequest; accepted: boolean }> = [];
+  for (const value of values) {
+    const entry = record(value);
+    const request = record(entry.request);
+    if (typeof request.attemptId !== "string" || typeof request.requestId !== "string" || typeof request.contentHash !== "string") continue;
+    result.push({
+      request: { attemptId: request.attemptId, requestId: request.requestId, contentHash: request.contentHash },
+      accepted: entry.accepted === true,
+    });
+  }
+  return result;
 }

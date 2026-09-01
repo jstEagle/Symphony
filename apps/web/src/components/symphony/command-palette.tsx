@@ -1,40 +1,73 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState, type ElementType, type ReactNode } from "react";
-import { Archive, Bell, ChartBar, Chats, FolderSimplePlus, Gear, MagnifyingGlass, PencilSimpleLine } from "@phosphor-icons/react";
+import { Archive, Bell, ChartBar, Chats, FolderSimplePlus, Gear, MagnifyingGlass, PencilSimpleLine, Sparkle, Target, UsersThree, Wrench } from "@phosphor-icons/react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, type DialogHandle } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { AgentLoader } from "@/components/symphony/agent-tool";
 import type { ConversationDirectory } from "@/lib/symphony/contracts";
 import { searchChats, type ChatSearchResponse } from "@/lib/symphony/runtime-client";
-import { fuzzyScore, rankFuzzyMatches } from "@/lib/symphony/palette-search";
+import { rankFuzzyMatches, rankPaletteActions, type PaletteSearchAction } from "@/lib/symphony/palette-search";
+import type { StudioMode } from "@/lib/symphony/workspace-tabs";
 
-type PaletteAction = { id: string; label: string; detail: string; icon: ElementType; run: () => void };
+export type CommandPaletteAction = PaletteSearchAction & {
+  detail: string;
+  icon: ElementType;
+  run: () => void;
+};
 
-export function CommandPalette({ open, onOpenChange, handle, directory, defaultGroupId, onSelectConversation, onNewConversation, onCreateGroup, onOpenSettings, onOpenUsage, onOpenInbox }: {
+export type WorkspaceNavigationTarget = "Studio" | "Inbox" | "Graph" | "Trace";
+
+/** The capability command is a Studio deep link, not merely a tab change. */
+export function studioModeForCommand(actionId: "capabilities" | "studio"): StudioMode | undefined {
+  return actionId === "capabilities" ? "capabilities" : undefined;
+}
+
+export function CommandPalette({ open, onOpenChange, handle, directory, defaultGroupId, onSelectConversation, onNewConversation, onCreateGroup, onCreateObjective, onOpenSettings, onOpenUsage, onOpenInbox, onOpenCapabilities, onOpenAgentMessages, onOpenDiagnostics, onNavigate, operatorActions = [] }: {
   open: boolean; onOpenChange: (open: boolean) => void; directory: ConversationDirectory; defaultGroupId?: string;
   handle: DialogHandle;
   onSelectConversation: (id: string) => void; onNewConversation: (groupId: string) => void; onCreateGroup: () => void;
+  onCreateObjective?: () => void;
   onOpenSettings?: () => void; onOpenUsage?: () => void; onOpenInbox?: () => void;
+  /** Live daemon-backed surfaces. Omit a handler when the current principal cannot access it. */
+  onOpenCapabilities?: (mode: StudioMode) => void;
+  onOpenAgentMessages?: () => void;
+  onOpenDiagnostics?: () => void;
+  onNavigate?: (target: WorkspaceNavigationTarget) => void;
+  operatorActions?: readonly CommandPaletteAction[];
 }) {
   const [query, setQuery] = useState("");
   const [search, setSearch] = useState<ChatSearchResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [searchUnavailable, setSearchUnavailable] = useState(false);
   const [activeIndex, setActiveIndex] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
   const searchGeneration = useRef(0);
   const allChats = useMemo(() => directory.groups.flatMap((group) => group.conversations.map((conversation) => ({ conversation, group: group.title }))), [directory.groups]);
   const allChatsById = useMemo(
     () => new Map(allChats.map((item) => [item.conversation.id, item])),
     [allChats],
   );
-  const actions = useMemo<PaletteAction[]>(() => [
+  const actions = useMemo<CommandPaletteAction[]>(() => [
     { id: "new-chat", label: "New chat", detail: "Start a conversation in the current project", icon: PencilSimpleLine, run: () => onNewConversation(defaultGroupId ?? directory.groups[0]?.id ?? "inbox") },
+    ...(onCreateObjective ? [{ id: "new-objective", label: "New objective", detail: "Start a durable run for a project workspace", icon: Target, run: onCreateObjective }] : []),
     { id: "new-group", label: "New group", detail: "Create a sidebar group", icon: FolderSimplePlus, run: onCreateGroup },
     ...(onOpenSettings ? [{ id: "settings", label: "Open settings", detail: "Harnesses, models, access, and limits", icon: Gear, run: onOpenSettings }] : []),
     ...(onOpenUsage ? [{ id: "usage", label: "Open usage", detail: "Costs and activity heatmap", icon: ChartBar, run: onOpenUsage }] : []),
-    ...(onOpenInbox ? [{ id: "inbox", label: "Open inbox", detail: "Notifications and agent attention", icon: Bell, run: onOpenInbox }] : []),
-  ], [defaultGroupId, directory.groups, onCreateGroup, onNewConversation, onOpenInbox, onOpenSettings, onOpenUsage]);
+    ...(onOpenInbox || onNavigate ? [{ id: "inbox", label: "Open inbox", detail: "Notifications and agent attention", icon: Bell, run: onOpenInbox ?? (() => onNavigate?.("Inbox")) }] : []),
+    ...(onOpenCapabilities ? [{ id: "capabilities", label: "Open capability library", detail: "Browse daemon-registered capability versions", icon: Sparkle, run: () => {
+      const mode = studioModeForCommand("capabilities");
+      if (mode) onOpenCapabilities(mode);
+    } }] : []),
+    ...(onOpenAgentMessages ? [{ id: "agent-messages", label: "Open agent messages", detail: "Review typed messages and delivery receipts", icon: UsersThree, run: onOpenAgentMessages }] : []),
+    ...(onOpenDiagnostics ? [{ id: "diagnostics", label: "Open diagnostics", detail: "Inspect daemon-backed health and recovery evidence", icon: Wrench, run: onOpenDiagnostics }] : []),
+    ...(onNavigate ? [
+      { id: "studio", label: "Open Studio", detail: "Design and inspect workflow revisions", icon: Target, run: () => onNavigate("Studio") },
+      { id: "graph", label: "Open Graph", detail: "Inspect the live orchestration graph", icon: UsersThree, run: () => onNavigate("Graph") },
+      { id: "trace", label: "Open Trace", detail: "Inspect event and run evidence", icon: Wrench, run: () => onNavigate("Trace") },
+    ] : []),
+    ...operatorActions,
+  ], [defaultGroupId, directory.groups, onCreateGroup, onCreateObjective, onNewConversation, onOpenAgentMessages, onOpenCapabilities, onOpenDiagnostics, onOpenInbox, onOpenSettings, onOpenUsage, onNavigate, operatorActions]);
 
   useEffect(() => {
     const generation = ++searchGeneration.current;
@@ -67,16 +100,37 @@ export function CommandPalette({ open, onOpenChange, handle, directory, defaultG
   }, [open, query]);
 
   const normalized = query.trim().toLocaleLowerCase();
-  const visibleActions = actions.filter((action) => !normalized || fuzzyScore(normalized, `${action.label} ${action.detail}`) > 0);
+  const visibleActions = rankPaletteActions(actions, normalized);
   const remoteById = new Map(search?.results.map((result) => [result.threadId, result]) ?? []);
-  const visibleChats = (search?.results.length
-    ? search.results.flatMap((result) => { const match = allChatsById.get(result.threadId); return match ? [{ ...match, snippet: result.snippet }] : []; })
+  // A remote search can legitimately return an item that is not in the
+  // bootstrap directory yet (or an item hidden by an archive race). In that
+  // case preserve the local fuzzy result instead of rendering a false empty
+  // state while the daemon projection catches up.
+  const remoteChats = search?.results.flatMap((result) => {
+    const match = allChatsById.get(result.threadId);
+    return match ? [{ ...match, snippet: result.snippet }] : [];
+  }) ?? [];
+  const visibleChats = (remoteChats.length > 0
+    ? remoteChats
     : rankFuzzyMatches(allChats, normalized, (item) => `${item.conversation.title} ${item.group}`)
       .map((item) => ({ ...item, snippet: "" }))).slice(0, 24);
   const items = [
     ...visibleActions.map((action) => ({ run: action.run })),
     ...visibleChats.map((item) => ({ run: () => onSelectConversation(item.conversation.id) })),
   ];
+  useEffect(() => {
+    setActiveIndex((current) => Math.min(Math.max(0, items.length - 1), current));
+  }, [items.length]);
+
+  // Base UI restores focus for trigger-driven opens, but Cmd/Ctrl+K has no
+  // trigger element. Explicitly focus on every open so reopening the palette
+  // never leaves keyboard input in the previous surface.
+  useEffect(() => {
+    if (!open) return;
+    const frame = window.requestAnimationFrame(() => inputRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [open]);
+
   const execute = (run: () => void) => { onOpenChange(false); run(); };
 
   return (
@@ -85,7 +139,7 @@ export function CommandPalette({ open, onOpenChange, handle, directory, defaultG
         <DialogHeader className="sr-only"><DialogTitle>Symphony command palette</DialogTitle></DialogHeader>
         <div className="flex h-12 items-center gap-2 border-b border-border/55 px-3">
           {loading ? <AgentLoader kind="circular" size={15} label="Searching chats" /> : <MagnifyingGlass className="size-4 text-muted-foreground" />}
-          <Input autoFocus value={query} onChange={(event) => { setQuery(event.target.value); setActiveIndex(0); }}
+          <Input ref={inputRef} autoFocus value={query} onChange={(event) => { setQuery(event.target.value); setActiveIndex(0); }}
             onKeyDown={(event) => {
               if (event.key === "ArrowDown") { event.preventDefault(); setActiveIndex((current) => Math.min(Math.max(0, items.length - 1), current + 1)); }
               else if (event.key === "ArrowUp") { event.preventDefault(); setActiveIndex((current) => Math.max(0, current - 1)); }

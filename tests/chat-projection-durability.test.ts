@@ -46,6 +46,10 @@ function thread(root: string, id: string, agentId: string, timestamp: string): C
   };
 }
 
+function unlinkedThread(root: string, id: string, timestamp: string): ChatThreadRecord {
+  return { ...thread(root, id, "placeholder-conductor", timestamp), conductorAgentId: null };
+}
+
 function agent(root: string, id: string, threadId: string, timestamp: string, output: string): AgentRecord {
   return {
     id,
@@ -106,6 +110,96 @@ function saveOutputEvent(store: SymphonyStore, record: AgentRecord, text: string
 }
 
 describe("durable chat projection", () => {
+  it("projects early text, tools, and output before conductor linkage without leaking across chats", () => {
+    const { root, loaded, store } = fixture();
+    // Establish the projector cursor, then stop its listener to model the
+    // create-conductor window where native events are durable but the chat row
+    // has not yet been linked by settleCreatedTurn().
+    service(loaded, store).close();
+    const timestamp = nowIso();
+    const threadId = "early-projection-thread";
+    const otherThreadId = "other-projection-thread";
+    const record = {
+      ...agent(root, "early-projection-agent", threadId, timestamp, "Final answer"),
+      status: "running",
+      output: null,
+      finishedAt: null,
+    } as AgentRecord;
+    const other = {
+      ...agent(root, "other-projection-agent", otherThreadId, timestamp, "Other answer"),
+      status: "running",
+      output: null,
+      finishedAt: null,
+    } as AgentRecord;
+    store.saveThread(unlinkedThread(root, threadId, timestamp));
+    store.saveThread(unlinkedThread(root, otherThreadId, timestamp));
+    store.saveAgent(record);
+    store.saveAgent(other);
+    store.appendEvent({
+      type: "driver.message.delta",
+      workflowId: record.workflowId,
+      runId: record.runId,
+      agentId: record.id,
+      occurredAt: timestamp,
+      payload: { text: "Early response. " },
+      provenance: { source: "driver", driver: "codex", nativeEventId: "early-text" },
+    });
+    store.appendEvent({
+      type: "driver.tool.completed",
+      workflowId: record.workflowId,
+      runId: record.runId,
+      agentId: record.id,
+      occurredAt: timestamp,
+      payload: { toolCallId: "early-tool", toolName: "read_file", args: { path: "README.md" }, result: { ok: true } },
+      provenance: { source: "driver", driver: "codex", nativeEventId: "early-tool" },
+    });
+    store.appendEvent({
+      type: "driver.output.completed",
+      workflowId: record.workflowId,
+      runId: record.runId,
+      agentId: record.id,
+      occurredAt: timestamp,
+      payload: { text: "Final answer" },
+      provenance: { source: "driver", driver: "codex", nativeEventId: "early-output" },
+    });
+    // A similarly shaped event for another chat must remain isolated by the
+    // stable workflow/run identity.
+    store.appendEvent({
+      type: "driver.message.delta",
+      workflowId: other.workflowId,
+      runId: other.runId,
+      agentId: other.id,
+      occurredAt: timestamp,
+      payload: { text: "Other chat" },
+      provenance: { source: "driver", driver: "codex", nativeEventId: "other-text" },
+    });
+    store.close();
+
+    const recoveredStore = createStore(loaded.dataDirectory);
+    const recovered = service(loaded, recoveredStore);
+    recovered.recoverProjectionBacklog();
+    expect(recoveredStore.listConversationMessages(threadId)).toEqual([
+      expect.objectContaining({
+        streaming: false,
+        parts: [
+          { type: "text", text: "Early response. " },
+          expect.objectContaining({ type: "tool-call", toolCallId: "early-tool", toolName: "read_file" }),
+          { type: "text", text: "Final answer" },
+        ],
+      }),
+    ]);
+    expect(recoveredStore.listConversationMessages(otherThreadId)).toEqual([
+      expect.objectContaining({
+        parts: [{ type: "text", text: "Other chat" }],
+      }),
+    ]);
+
+    // Link the conductor after replay, as the live create path does.
+    recoveredStore.saveThread({ ...unlinkedThread(root, threadId, timestamp), conductorAgentId: record.id });
+    recovered.close();
+    recoveredStore.close();
+  });
+
   it("restores in-memory stream state when projection storage rolls back", () => {
     const { root, loaded, store } = fixture();
     const projector = service(loaded, store);

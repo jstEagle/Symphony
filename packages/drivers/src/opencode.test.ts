@@ -1,4 +1,4 @@
-import { createHmac, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -855,6 +855,36 @@ describe("OpenCode driver lifecycle", () => {
     await driver.forceTerminate(recovered);
   });
 
+  it("rejects a previous transcript when a durable follow-up request id is absent", async () => {
+    const stream = new ControlledStream();
+    const client = fakeClient(stream);
+    client.session.messages.mockResolvedValue({ data: completedNativeTranscript() });
+    const driver = externalDriver(client);
+    const events: DriverEvent[] = [];
+    const session = await driver.start(request(), (event) => events.push(event));
+    const content = "A distinct durable follow-up.";
+    const requestIdentity = {
+      attemptId: "follow-up-attempt-1",
+      requestId: "symphony:message:agent-opencode:follow-up-attempt-1",
+      contentHash: createHash("sha256").update(content, "utf8").digest("hex"),
+    };
+    await driver.sendMessage(session, content, requestIdentity);
+    await expect(driver.sendMessage(session, content, requestIdentity)).resolves.toEqual({
+      receiptId: requestIdentity.requestId,
+      queued: false,
+    });
+    expect(client.session.promptAsync).toHaveBeenCalledTimes(2);
+    const active = (driver as unknown as { active: Map<string, unknown> }).active.get(session.nativeSessionId);
+    expect(active).toBeDefined();
+    const recovered = await (driver as unknown as {
+      importPersistedTurn: (sessionId: string, active: unknown) => Promise<string>;
+    }).importPersistedTurn(session.nativeSessionId, active);
+
+    expect(recovered).toBe("unknown");
+    expect(events.some((event) => event.kind === "output.completed" || event.kind === "run.completed")).toBe(false);
+    await driver.forceTerminate(session);
+  });
+
   it("reports an unknown outcome instead of continuing when the persisted transcript is unavailable", async () => {
     const client = fakeClient(new ControlledStream());
     client.session.status.mockResolvedValue({ data: { "native-opencode": { type: "idle" } } });
@@ -944,6 +974,36 @@ describe("OpenCode driver lifecycle", () => {
     expect(accepted.filter((event) => event.kind === "tool.completed")).toHaveLength(1);
 
     await recoveryDriver.forceTerminate(recovered);
+  });
+
+  it("keeps identical live chunks distinct and reuses a provider event id on replay", async () => {
+    const stream = new ControlledStream();
+    const client = fakeClient(stream);
+    client.session.status.mockResolvedValue({ data: { "native-opencode": { type: "busy" } } });
+    const emitted: DriverEvent[] = [];
+    const driver = externalDriver(client);
+    const session = await driver.start(request(), (event) => emitted.push(event));
+    const chunk = {
+      type: "message.part.updated",
+      properties: {
+        sessionID: session.nativeSessionId,
+        part: { id: "part-live", type: "text", text: "same" },
+        delta: "same",
+      },
+    };
+    stream.push(chunk);
+    stream.push(chunk);
+    await vi.waitFor(() => expect(emitted.filter((event) => event.kind === "message.delta")).toHaveLength(2));
+    const deltas = emitted.filter((event) => event.kind === "message.delta");
+    expect(deltas[0]?.nativeEventId).not.toBe(deltas[1]?.nativeEventId);
+
+    const providerReplay = { ...chunk, id: "provider-event-1" };
+    stream.push(providerReplay);
+    stream.push(providerReplay);
+    await vi.waitFor(() => expect(emitted.filter((event) => event.kind === "message.delta")).toHaveLength(4));
+    const replayDeltas = emitted.filter((event) => event.kind === "message.delta").slice(-2);
+    expect(replayDeltas[0]?.nativeEventId).toBe(replayDeltas[1]?.nativeEventId);
+    await driver.forceTerminate(session);
   });
 
   it("coalesces cancellation and closes subscriptions idempotently without owning external infrastructure", async () => {

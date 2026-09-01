@@ -8,14 +8,13 @@ import { CommandPalette } from "@/components/symphony/command-palette";
 import { NewChatDialog } from "@/components/symphony/new-chat-dialog";
 import { SymphonyWelcome } from "@/components/symphony/welcome";
 import { SymphonyProvider } from "@/components/symphony/provider";
-import { AgentConversation } from "@/components/symphony/agent-conversation";
-import { AgentSessionLog } from "@/components/symphony/agent-session-log";
 import { PromptRail } from "@/components/symphony/prompt-rail";
 import { useSymphony, useSymphonyMessages } from "@/components/symphony/context";
 import {
   WorkspaceNavigation,
   type WorkspaceTab,
 } from "@/components/symphony/workspace-navigation";
+import { readStudioMode, readWorkspaceTab, writeStudioMode, writeWorkspaceTab, type StudioMode } from "@/lib/symphony/workspace-tabs";
 import { SidebarInset, SidebarProvider, SidebarTrigger, useSidebar } from "@/components/ui/sidebar";
 import { createDialogHandle } from "@/components/ui/dialog";
 import {
@@ -29,7 +28,7 @@ import {
 } from "@assistant-ui/react";
 import { ArrowSquareOut, ChatsCircle, FolderSimple, ListMagnifyingGlass, Square, X } from "@phosphor-icons/react";
 import gsap from "gsap";
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { lazy, memo, Suspense, useCallback, useDeferredValue, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   buildPreviewMessages,
   extractText,
@@ -37,8 +36,13 @@ import {
   toThreadMessages,
 } from "@/lib/symphony/messages";
 import { isActivelyWorkingAgent, loaderForHarness } from "@/lib/symphony/format";
-import type { AgentDetail, ChatAttachment, JsonValue } from "@/lib/symphony/contracts";
-import { openAgentWindow, useSymphonyWindowRegistry } from "@/lib/symphony/window-layout";
+import type { AgentDetail, AgentSessionLog as AgentSessionLogRecord, ChatAttachment, ConversationMessage, JsonValue, WorkflowRevisionRecord } from "@/lib/symphony/contracts";
+import { openAgentWindow } from "@/lib/symphony/window-layout";
+import {
+  getOrCreateWindowId,
+  useSymphonyWindowRegistry,
+  workspaceWindowLabel,
+} from "@/lib/symphony/window-registry";
 
 const THREAD_COMPONENTS = {
   ToolFallback: AgentToolFallback,
@@ -49,8 +53,13 @@ const InboxDialog = lazy(() => import("@/components/symphony/inbox-dialog").then
 const RunDetails = lazy(() => import("@/components/symphony/run-details").then((module) => ({ default: module.RunDetails })));
 const SettingsDialog = lazy(() => import("@/components/symphony/settings-dialog").then((module) => ({ default: module.SettingsDialog })));
 const UsageDialog = lazy(() => import("@/components/symphony/usage-dialog").then((module) => ({ default: module.UsageDialog })));
+const ObjectiveCreateDialog = lazy(() => import("@/components/symphony/objective-create-dialog").then((module) => ({ default: module.ObjectiveCreateDialog })));
+const ObjectiveControlRoomSurface = lazy(() => import("@/components/symphony/objective-control-room-surface").then((module) => ({ default: module.ObjectiveControlRoomSurface })));
+const WorkflowStudio = lazy(() => import("@/components/symphony/workflow-studio").then((module) => ({ default: module.WorkflowStudio })));
 const SymphonyStructuredDataUI = lazy(() => import("@/components/symphony/structured-data-ui").then((module) => ({ default: module.SymphonyStructuredDataUI })));
 const SymphonyGenerativeDataUI = lazy(() => import("@/components/symphony/generative-data-ui").then((module) => ({ default: module.SymphonyGenerativeDataUI })));
+const AgentConversation = lazy(() => import("@/components/symphony/agent-conversation").then((module) => ({ default: module.AgentConversation })));
+const AgentSessionLog = lazy(() => import("@/components/symphony/agent-session-log").then((module) => ({ default: module.AgentSessionLog })));
 const textAttachmentAdapter = new SimpleTextAttachmentAdapter();
 textAttachmentAdapter.accept = [
   "text/*",
@@ -72,8 +81,12 @@ export function Assistant({
   popoutWindowId?: string;
   conversationId?: string;
 }) {
+  const [mainWindowId] = useState(() => getOrCreateWindowId("main"));
+  const providerWindowId = popoutAgentId
+    ? popoutWindowId ?? `agent:${popoutAgentId}`
+    : mainWindowId;
   return (
-    <SymphonyProvider>
+    <SymphonyProvider windowId={providerWindowId}>
       {popoutAgentId ? (
         <AgentPopout
           agentId={popoutAgentId}
@@ -90,11 +103,15 @@ function SymphonyShell() {
   const active = symphony.activeConversation;
   const [newChatOpen, setNewChatOpen] = useState(false);
   const [newChatProjectId, setNewChatProjectId] = useState<string | undefined>();
+  const [objectiveCreateOpen, setObjectiveCreateOpen] = useState(false);
+  const [objectiveWorkflow, setObjectiveWorkflow] = useState<WorkflowRevisionRecord | null>(null);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [commandPaletteHandle] = useState(createDialogHandle);
   const [paletteGroupOpen, setPaletteGroupOpen] = useState(false);
   const [openAgentIds, setOpenAgentIds] = useState<string[]>([]);
-  const [windowId] = useState(() => `main:${crypto.randomUUID()}`);
+  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>(() => readWorkspaceTab(undefined, symphony.windowId));
+  const [studioMode, setStudioMode] = useState<StudioMode>(() => readStudioMode(undefined, symphony.windowId));
+  const windowId = symphony.windowId;
   const registeredWindows = useSymphonyWindowRegistry({
     windowId,
     kind: "main",
@@ -107,14 +124,7 @@ function SymphonyShell() {
   );
 
   useEffect(() => {
-    const baseTitle = active?.title?.trim() || "Symphony";
-    const matching = registeredWindows
-      .filter((item) => item.kind === "main" && (item.title?.trim() || "Symphony") === baseTitle)
-      .sort((left, right) => left.openedAt - right.openedAt || left.windowId.localeCompare(right.windowId));
-    const index = matching.findIndex((item) => item.windowId === windowId);
-    document.title = matching.length > 1 && index >= 0
-      ? `${baseTitle} (${index + 1})`
-      : baseTitle;
+    document.title = workspaceWindowLabel(windowId, active?.title, registeredWindows);
   }, [active?.title, registeredWindows, windowId]);
 
   useEffect(() => {
@@ -141,6 +151,10 @@ function SymphonyShell() {
     setNewChatProjectId(requested ?? activeProject);
     setNewChatOpen(true);
   }, [active?.groupId, symphony.projects]);
+  const openNewObjective = useCallback((workflow?: WorkflowRevisionRecord) => {
+    setObjectiveWorkflow(workflow ?? null);
+    setObjectiveCreateOpen(true);
+  }, []);
   const moveConversation = useCallback(
     (id: string, groupId: string) => void symphony.moveConversation(id, groupId),
     [symphony.moveConversation],
@@ -156,6 +170,19 @@ function SymphonyShell() {
   const openSettings = useCallback(() => symphony.setSettingsOpen(true), [symphony.setSettingsOpen]);
   const openUsage = useCallback(() => symphony.setUsageOpen(true), [symphony.setUsageOpen]);
   const openInbox = useCallback(() => symphony.setInboxOpen(true), [symphony.setInboxOpen]);
+  const onWorkspaceTabChange = useCallback((tab: WorkspaceTab) => {
+    setWorkspaceTab(tab);
+    writeWorkspaceTab(tab, undefined, symphony.windowId);
+  }, [symphony.windowId]);
+  const onStudioModeChange = useCallback((mode: StudioMode) => {
+    setStudioMode(mode);
+    writeStudioMode(mode, undefined, symphony.windowId);
+  }, [symphony.windowId]);
+  const openStudio = useCallback((mode?: StudioMode) => {
+    if (mode) onStudioModeChange(mode);
+    onWorkspaceTabChange("Studio");
+  }, [onStudioModeChange, onWorkspaceTabChange]);
+  const runtime = symphony.mode === "runtime" && symphony.envelope.mode === "runtime";
 
   useEffect(() => {
     const openPalette = (event: KeyboardEvent) => {
@@ -204,9 +231,18 @@ function SymphonyShell() {
         onSelectConversation={symphony.selectConversation}
         onNewConversation={openNewChat}
         onCreateGroup={() => setPaletteGroupOpen(true)}
+        onCreateObjective={symphony.mode === "runtime" ? openNewObjective : undefined}
         onOpenSettings={openSettings}
         onOpenUsage={openUsage}
         onOpenInbox={openInbox}
+        onOpenCapabilities={runtime ? (mode) => openStudio(mode) : undefined}
+        onOpenAgentMessages={runtime ? () => onWorkspaceTabChange("ControlRoom") : undefined}
+        onOpenDiagnostics={runtime ? () => onWorkspaceTabChange("Trace") : undefined}
+        onNavigate={(target) => {
+          if (target === "Inbox") openInbox();
+          else if (target === "Studio") openStudio();
+          else onWorkspaceTabChange(target);
+        }}
       />
       {active ? (
         <AssistantConversation
@@ -214,6 +250,11 @@ function SymphonyShell() {
           openAgentIds={openAgentIds}
           onCloseAgent={closeAgent}
           externalAgentIds={externalAgentIds}
+          onOpenObjective={openNewObjective}
+          workspaceTab={workspaceTab}
+          onWorkspaceTabChange={onWorkspaceTabChange}
+          studioMode={studioMode}
+          onStudioModeChange={onStudioModeChange}
         />
       ) : (
         <SidebarInset className="grid h-dvh place-items-center bg-background text-sm text-muted-foreground">
@@ -230,6 +271,16 @@ function SymphonyShell() {
         initialProjectId={newChatProjectId}
         onOpenChange={setNewChatOpen}
       />
+      <ObjectiveCreateDialog
+        open={objectiveCreateOpen}
+        initialWorkflow={objectiveWorkflow}
+        initialProjectId={active?.groupId && symphony.projects.some((project) => project.id === active.groupId) ? active.groupId : symphony.projects[0]?.id}
+        initialWorkspacePath={active?.workspacePath}
+        onOpenChange={(open) => {
+          setObjectiveCreateOpen(open);
+          if (!open) setObjectiveWorkflow(null);
+        }}
+      />
     </SidebarProvider>
   );
 }
@@ -238,20 +289,33 @@ function AssistantConversation({
   openAgentIds,
   onCloseAgent,
   externalAgentIds,
+  onOpenObjective,
+  workspaceTab,
+  onWorkspaceTabChange,
+  studioMode,
+  onStudioModeChange,
 }: {
   openAgentIds: string[];
   onCloseAgent: (agentId: string) => void;
   externalAgentIds: ReadonlySet<string>;
+  onOpenObjective: (workflow?: WorkflowRevisionRecord) => void;
+  workspaceTab: WorkspaceTab;
+  onWorkspaceTabChange: (tab: WorkspaceTab) => void;
+  studioMode: StudioMode;
+  onStudioModeChange: (mode: StudioMode) => void;
 }) {
   const symphony = useSymphony();
   const projectedMessages = useSymphonyMessages();
+  // Token/event projections can arrive more frequently than the browser can
+  // paint a full assistant-ui tree. Keep the live state immediate, but let
+  // expensive message conversion and markdown/tool rendering yield to input.
+  const deferredProjectedMessages = useDeferredValue(projectedMessages);
   const conversation = symphony.activeConversation;
   const snapshot = symphony.snapshot;
   const [localMessages, setLocalMessages] = useState<readonly ThreadMessageLike[]>(() =>
     symphony.mode === "preview" ? messagesForConversation(symphony, conversation, projectedMessages) : [],
   );
   const [isRunning, setIsRunning] = useState(conversation?.state === "running");
-  const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>("Chat");
   const workspaceRef = useRef<HTMLDivElement>(null);
   const orchestratorChatRef = useRef<HTMLDivElement>(null);
   const sidebar = useSidebar();
@@ -275,10 +339,10 @@ function AssistantConversation({
   const runtimeMessages = useMemo(() => {
     if (symphony.mode === "preview") return localMessages;
     const fromDaemon = toThreadMessages(
-      projectedMessages.filter((message) => message.threadId === conversation?.id),
+      deferredProjectedMessages.filter((message) => message.threadId === conversation?.id),
     );
     return mergeProjectedThreadMessages(fromDaemon, localMessages);
-  }, [conversation?.id, localMessages, projectedMessages, symphony.mode]);
+  }, [conversation?.id, deferredProjectedMessages, localMessages, symphony.mode]);
 
   const onNew = useCallback(
     async (message: AppendMessage) => {
@@ -444,7 +508,7 @@ function AssistantConversation({
                   ) : null}
                 </div>
                 <div className="flex items-center justify-end gap-0.5">
-                  <WorkspaceNavigation activeTab={workspaceTab} onTabChange={setWorkspaceTab} />
+                  <WorkspaceNavigation activeTab={workspaceTab} onTabChange={onWorkspaceTabChange} />
                   <ConnectionBadge />
                   {live ? (
                     <button
@@ -469,7 +533,11 @@ function AssistantConversation({
               </div>
             ) : null}
 
-            {workspaceTab === "Chat" ? (
+            {workspaceTab === "ControlRoom" ? (
+              <ObjectiveControlRoomSurface onOpenAgent={symphony.openAgent} />
+            ) : workspaceTab === "Studio" ? (
+              <WorkflowStudio onOpenObjective={onOpenObjective} studioMode={studioMode} onStudioModeChange={onStudioModeChange} />
+            ) : workspaceTab === "Chat" ? (
               <div ref={orchestratorChatRef} className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
                 <Thread autoFocus={false} components={THREAD_COMPONENTS} />
                 <PromptRail messages={runtimeMessages} scopeRef={orchestratorChatRef} />
@@ -499,6 +567,10 @@ function AssistantConversation({
               conversationId={conversation.id}
               selected={symphony.selectedAgentId === detail.id}
               external={externalAgentIds.has(detail.id)}
+              loadMessages={symphony.loadAgentMessages}
+              loadLogs={symphony.loadAgentLogs}
+              onSteer={symphony.steer}
+              onCancel={symphony.cancelOne}
               onSelect={() => symphony.openAgent(detail.id)}
               onClose={() => onCloseAgent(detail.id)}
             />
@@ -509,22 +581,31 @@ function AssistantConversation({
   );
 }
 
-function AgentTile({
-  detail,
-  conversationId,
-  selected,
-  external,
-  onSelect,
-  onClose,
-}: {
+type AgentTileProps = {
   detail: AgentDetail;
   conversationId: string;
   selected: boolean;
   external: boolean;
+  loadMessages: (agentId: string) => Promise<ConversationMessage[]>;
+  loadLogs: (agentId: string, after?: number) => Promise<AgentSessionLogRecord>;
+  onSteer: (agentId: string, content: string) => Promise<void>;
+  onCancel: (agentId: string) => Promise<void>;
   onSelect: () => void;
   onClose: () => void;
-}) {
-  const symphony = useSymphony();
+};
+
+const AgentTile = memo(function AgentTile({
+  detail,
+  conversationId,
+  selected,
+  external,
+  loadMessages,
+  loadLogs,
+  onSteer,
+  onCancel,
+  onSelect,
+  onClose,
+}: AgentTileProps) {
   const live = isActivelyWorkingAgent(detail.state);
   const [view, setView] = useState<"chat" | "logs">("chat");
   return (
@@ -596,17 +677,48 @@ function AgentTile({
         </div>
       ) : null}
       {view === "chat" ? (
-        <AgentConversation
-          detail={detail}
-          loadMessages={symphony.loadAgentMessages}
-          onSteer={symphony.steer}
-          onCancel={symphony.cancelOne}
-        />
+        <Suspense fallback={<AgentPaneLoading label={`Loading ${detail.name} chat`} />}>
+          <AgentConversation
+            detail={detail}
+            loadMessages={loadMessages}
+            onSteer={onSteer}
+            onCancel={onCancel}
+          />
+        </Suspense>
       ) : (
-        <AgentSessionLog detail={detail} loadLogs={symphony.loadAgentLogs} />
+        <Suspense fallback={<AgentPaneLoading label={`Loading ${detail.name} logs`} />}>
+          <AgentSessionLog detail={detail} loadLogs={loadLogs} />
+        </Suspense>
       )}
     </section>
   );
+}, areAgentTilePropsEqual);
+
+function areAgentTilePropsEqual(previous: AgentTileProps, next: AgentTileProps): boolean {
+  if (previous.conversationId !== next.conversationId || previous.selected !== next.selected || previous.external !== next.external) return false;
+  if (previous.loadMessages !== next.loadMessages || previous.loadLogs !== next.loadLogs || previous.onSteer !== next.onSteer || previous.onCancel !== next.onCancel) return false;
+  const left = previous.detail;
+  const right = next.detail;
+  return left.id === right.id
+    && left.name === right.name
+    && left.objective === right.objective
+    && left.model === right.model
+    && left.harness === right.harness
+    && left.access === right.access
+    && left.state === right.state
+    && left.nativeStatus === right.nativeStatus
+    && left.elapsed === right.elapsed
+    && left.cost === right.cost
+    && left.lastActivity === right.lastActivity
+    && left.nativeSessionId === right.nativeSessionId
+    && left.nativeRunId === right.nativeRunId
+    && left.workspacePath === right.workspacePath
+    && left.error === right.error
+    && left.runId === right.runId
+    && left.workflowId === right.workflowId
+    && left.startedAt === right.startedAt
+    && left.updatedAt === right.updatedAt
+    && left.finishedAt === right.finishedAt;
 }
 
 function AgentPopout({
@@ -685,14 +797,18 @@ function AgentPopout({
         </div>
       ) : null}
       {view === "chat" ? (
-        <AgentConversation
-          detail={detail}
-          loadMessages={symphony.loadAgentMessages}
-          onSteer={symphony.steer}
-          onCancel={symphony.cancelOne}
-        />
+        <Suspense fallback={<AgentPaneLoading label={`Loading ${detail.name} chat`} />}>
+          <AgentConversation
+            detail={detail}
+            loadMessages={symphony.loadAgentMessages}
+            onSteer={symphony.steer}
+            onCancel={symphony.cancelOne}
+          />
+        </Suspense>
       ) : (
-        <AgentSessionLog detail={detail} loadLogs={symphony.loadAgentLogs} />
+        <Suspense fallback={<AgentPaneLoading label={`Loading ${detail.name} logs`} />}>
+          <AgentSessionLog detail={detail} loadLogs={symphony.loadAgentLogs} />
+        </Suspense>
       )}
     </main>
   );
@@ -703,6 +819,17 @@ function agentTone(detail: Pick<AgentDetail, "state">): "info" | "success" | "da
   if (detail.state === "failed") return "danger";
   if (detail.state === "blocked" || detail.state === "cancelled" || detail.state === "stale" || detail.state === "waiting") return "warning";
   return "info";
+}
+
+function AgentPaneLoading({ label }: { label: string }) {
+  return (
+    <div className="grid min-h-32 flex-1 place-items-center text-[10px] text-muted-foreground">
+      <span className="flex items-center gap-2">
+        <AgentLoader kind="square" size={14} label={label} />
+        {label}
+      </span>
+    </div>
+  );
 }
 
 function serializeAttachments(attachments: AppendMessage["attachments"]): ChatAttachment[] {

@@ -4,9 +4,11 @@ import {
   coalesceConversationTurns,
   conversationTranscriptSignature,
   mergeConversationMessageBatch,
+  mergeConversationMessages,
   mergeProjectedThreadMessages,
   normalizeConversationMessage,
   removeThreadMessage,
+  toThreadMessages,
 } from "../apps/web/src/lib/symphony/messages.js";
 import type { ConversationMessage } from "../apps/web/src/lib/symphony/contracts.js";
 
@@ -167,7 +169,7 @@ describe("web conversation projection", () => {
     expect(merged.at(-1)?.role).toBe("assistant");
   });
 
-  it("renders resumed assistant segments as one logical turn and hides old restart notices", () => {
+  it("keeps distinct assistant turns separate and hides old restart notices", () => {
     const messages: ConversationMessage[] = [
       {
         id: "user-1",
@@ -203,15 +205,70 @@ describe("web conversation projection", () => {
 
     expect(coalesceConversationTurns(messages)).toEqual([
       messages[0],
-      expect.objectContaining({
-        id: "assistant-before-restart",
-        streaming: true,
-        parts: [
-          { type: "text", text: "First segment" },
-          { type: "tool-call", toolCallId: "tool-1", toolName: "list_agents", args: {} },
-        ],
-      }),
+      messages[1],
+      messages[2],
     ]);
+  });
+
+  it("does not duplicate a stable native part when bootstrap and SSE use different envelopes", () => {
+    const bootstrap: ConversationMessage = {
+      id: "assistant-envelope-a",
+      threadId: "thread-1",
+      role: "assistant",
+      streaming: true,
+      createdAt: "2026-08-30T21:13:16.714Z",
+      updatedAt: "2026-08-30T21:13:17.000Z",
+      parts: [{ type: "text", text: "Hello", nativeMessageId: "native-segment-1" }],
+    };
+    const stream: ConversationMessage = {
+      id: "assistant-envelope-b",
+      threadId: "thread-1",
+      role: "assistant",
+      streaming: false,
+      createdAt: "2026-08-30T21:13:16.714Z",
+      updatedAt: "2026-08-30T21:13:18.000Z",
+      parts: [{ type: "text", text: "Hello there", nativeMessageId: "native-segment-1" }],
+    };
+
+    expect(mergeConversationMessages([[bootstrap], [stream]])).toEqual([stream]);
+    expect(coalesceConversationTurns([bootstrap, stream])).toEqual([stream]);
+  });
+
+  it("preserves repeated identity-free assistant prose as separate messages", () => {
+    const first: ConversationMessage = {
+      id: "assistant-a",
+      threadId: "thread-1",
+      role: "assistant",
+      parts: [{ type: "text", text: "Hello! How can I help you today?" }],
+      createdAt: "2026-08-30T21:13:16.714Z",
+    };
+    const second: ConversationMessage = {
+      ...first,
+      id: "assistant-b",
+      createdAt: "2026-08-30T21:13:17.714Z",
+    };
+
+    expect(toThreadMessages([first, second]).map((message) => message.id)).toEqual([
+      "assistant-a",
+      "assistant-b",
+    ]);
+  });
+
+  it("does not treat a reused attachment id as a message identity", () => {
+    const first: ConversationMessage = {
+      id: "user-a",
+      threadId: "thread-1",
+      role: "user",
+      parts: [{ type: "attachment", id: "shared-file", name: "notes.md" }],
+      createdAt: "2026-08-30T21:13:16.714Z",
+    };
+    const second: ConversationMessage = {
+      ...first,
+      id: "user-b",
+      createdAt: "2026-08-30T21:13:17.714Z",
+    };
+
+    expect(mergeConversationMessages([[first, second]])).toHaveLength(2);
   });
 
   it("rolls back only the rejected optimistic agent message", () => {

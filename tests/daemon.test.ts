@@ -311,6 +311,14 @@ describe("local daemon API", () => {
       updatedAt: nowIso(),
       finishedAt: null,
       cancelRequested: false,
+      origin: {
+        kind: "user",
+        threadId: null,
+        parentRunId: null,
+        parentAgentId: null,
+        baseDepth: -1,
+        permissionCeiling: "full-access",
+      },
     });
     seeded.close();
 

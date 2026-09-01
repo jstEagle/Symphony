@@ -34,11 +34,57 @@ function mutation(tool: string, toolCallId: string, body: unknown): RequestInit 
   };
 }
 
+// Pi receives Symphony coordination through this extension rather than the
+// MCP server. Keep these TypeBox shapes aligned with the daemon/MCP boundary;
+// identity and idempotency remain authenticated request metadata, not tool
+// arguments.
+const id = () => Type.String({ minLength: 1 });
+const jsonObject = () => Type.Record(Type.String(), Type.Unknown());
+const objectiveTask = Type.Object({
+  id: id(),
+  objective: Type.String({ minLength: 1 }),
+  dependsOn: Type.Optional(Type.Array(id())),
+  outputSchema: Type.Optional(jsonObject()),
+  model: Type.Optional(Type.String({ minLength: 1 })),
+  harness: Type.Optional(Type.Union([
+    Type.Literal("auto"), Type.Literal("codex"), Type.Literal("claude"),
+    Type.Literal("cursor"), Type.Literal("opencode"), Type.Literal("pi"), Type.Literal("acp"),
+  ])),
+  permissions: Type.Optional(Type.Union([Type.Literal("read-only"), Type.Literal("full-access")])),
+  inputs: Type.Optional(Type.Array(Type.Unknown())),
+  routing: Type.Optional(jsonObject()),
+  workspace: Type.Optional(jsonObject()),
+  requiresApproval: Type.Optional(Type.Boolean()),
+});
+const objectiveSpec = Type.Object({
+  id: id(),
+  statement: Type.String({ minLength: 1 }),
+  criteria: Type.Optional(Type.Array(jsonObject())),
+  approvalPolicy: Type.Optional(Type.Object({
+    mode: Type.Union([Type.Literal("never"), Type.Literal("on-replan"), Type.Literal("before-completion")]),
+    timeoutSeconds: Type.Optional(Type.Number({ minimum: 1 })),
+  })),
+  maxReplans: Type.Optional(Type.Number({ minimum: 0 })),
+});
+const objectiveTaskUpdate = Type.Object({
+  taskId: id(),
+  state: Type.Union([
+    Type.Literal("queued"), Type.Literal("waiting-approval"), Type.Literal("running"),
+    Type.Literal("completed"), Type.Literal("failed"),
+  ]),
+  attemptId: Type.Optional(Type.Union([id(), Type.Null()])),
+  agentId: Type.Optional(Type.Union([id(), Type.Null()])),
+  output: Type.Optional(Type.Union([Type.Unknown(), Type.Null()])),
+  error: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  startedAt: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+  finishedAt: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+});
+
 export default function symphonyPiExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "list_agents",
     label: "List Symphony agents",
-    description: "List durable agents in the Symphony graph with objectives, parents, models, and states. Native Pi subagents may not appear here.",
+    description: "List durable agents in the Symphony graph with objectives, parents, models, and states. This is the cross-harness Symphony projection; ephemeral native Pi subagents may not appear here.",
     parameters: Type.Object({ activeOnly: Type.Optional(Type.Boolean({ default: false })) }),
     async execute(_id, params) { return response(await api(`/v1/agents?active=${String(params.activeOnly ?? false)}`)); },
   });
@@ -46,7 +92,7 @@ export default function symphonyPiExtension(pi: ExtensionAPI): void {
   if (canCreate) pi.registerTool({
     name: "create_agent",
     label: "Create Symphony agent",
-    description: "Create a durable, observable Symphony child for parallel, cross-harness, specialized, or structured work. Mission, depth, and parent are injected by Symphony.",
+    description: "Create a durable, observable Symphony child for parallel, cross-harness, specialized, or structured work. Mission, depth, parent, and permission ceilings are injected by Symphony; use native Pi subagents only for ephemeral, tightly coupled local tactics.",
     parameters: Type.Object({
       objective: Type.String(),
       harness: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("codex"), Type.Literal("claude"), Type.Literal("cursor"), Type.Literal("opencode"), Type.Literal("pi"), Type.Literal("acp")], { default: "auto" })),
@@ -56,6 +102,123 @@ export default function symphonyPiExtension(pi: ExtensionAPI): void {
     }),
     async execute(id, params) { return response(await api("/v1/agents", mutation("create-agent", id, params))); },
   });
+
+  pi.registerTool({
+    name: "list_objectives",
+    label: "List Symphony objectives",
+    description: "Inspect durable Symphony objectives across native harnesses before deciding how to orchestrate. This is read-only durable state; ephemeral native Pi subagents remain harness-local assistance and may not appear in this projection.",
+    parameters: Type.Object({
+      limit: Type.Optional(Type.Number({ minimum: 1, maximum: 200, default: 50 })),
+      state: Type.Optional(Type.Array(Type.Union([
+        Type.Literal("planning"), Type.Literal("executing"), Type.Literal("evaluating"),
+        Type.Literal("awaiting-approval"), Type.Literal("replanning"), Type.Literal("succeeded"),
+        Type.Literal("failed"), Type.Literal("cancelled"), Type.Literal("interrupted"),
+      ]))),
+      runId: Type.Optional(id()),
+      workflowId: Type.Optional(id()),
+    }),
+    async execute(_id, params) {
+      const query = new URLSearchParams({ limit: String(params.limit ?? 50) });
+      if (params.state?.length) query.set("state", params.state.join(","));
+      if (params.runId) query.set("runId", params.runId);
+      if (params.workflowId) query.set("workflowId", params.workflowId);
+      return response(await api(`/v1/objectives?${query.toString()}`));
+    },
+  });
+
+  pi.registerTool({
+    name: "get_objective",
+    label: "Get Symphony objective",
+    description: "Inspect one durable Symphony objective's plan revisions, frontier, checkpoints, approvals, and event history. Use this to recover cross-harness context; native Pi subagents do not replace the durable objective record or its authority boundary.",
+    parameters: Type.Object({
+      runId: id(),
+      limit: Type.Optional(Type.Number({ minimum: 1, maximum: 2_000, default: 500 })),
+      after: Type.Optional(Type.Number({ minimum: 0, default: 0 })),
+    }),
+    async execute(_id, params) {
+      const query = new URLSearchParams({ limit: String(params.limit ?? 500) });
+      if (params.after !== undefined) query.set("after", String(params.after));
+      return response(await api(`/v1/objectives/${encodeURIComponent(params.runId)}?${query.toString()}`));
+    },
+  });
+
+  if (canCreate) {
+    pi.registerTool({
+      name: "create_objective",
+      label: "Create Symphony objective",
+      description: "Start a durable Symphony objective with immutable intent and optional initial tasks. Use for long-lived cross-harness work that needs a plan, recovery checkpoints, evaluation evidence, or approvals; native Pi subagents are local implementation tactics, not substitutes for this record.",
+      parameters: Type.Object({
+        runId: Type.Optional(id()),
+        objectiveId: Type.Optional(id()),
+        workflowId: id(),
+        workflowRevision: Type.Number({ minimum: 1 }),
+        workflowHash: Type.String({ minLength: 8 }),
+        conductorAgentId: Type.Optional(Type.Union([id(), Type.Null()])),
+        spec: objectiveSpec,
+        tasks: Type.Optional(Type.Array(objectiveTask)),
+        context: Type.Optional(jsonObject()),
+      }),
+      async execute(toolCallId, params) {
+        return response(await api("/v1/objectives", mutation("create-objective", toolCallId, params)));
+      },
+    });
+
+    pi.registerTool({
+      name: "commit_objective_plan",
+      label: "Commit Symphony objective plan",
+      description: "Append a revision to a durable Symphony objective plan using compare-and-swap. Use for a durable strategy change; native Pi subagents may help with one local tactic but do not own the shared objective plan.",
+      parameters: Type.Object({
+        runId: id(),
+        expectedPlanRevision: Type.Number({ minimum: 0 }),
+        tasks: Type.Array(objectiveTask, { minItems: 1, maxItems: 128 }),
+        reason: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
+      }),
+      async execute(toolCallId, params) {
+        const { runId, ...body } = params;
+        return response(await api(`/v1/objectives/${encodeURIComponent(runId)}/plans`, mutation("commit-objective-plan", toolCallId, body)));
+      },
+    });
+
+    pi.registerTool({
+      name: "checkpoint_objective",
+      label: "Checkpoint Symphony objective",
+      description: "Commit durable Symphony objective progress, task state, context, and evidence cursor. Checkpoints are recovery boundaries across native harnesses; they do not rewind an opaque native subagent process.",
+      parameters: Type.Object({
+        runId: id(),
+        eventCursor: Type.Number({ minimum: 0 }),
+        context: Type.Optional(jsonObject()),
+        taskUpdates: Type.Optional(Type.Array(objectiveTaskUpdate, { maxItems: 128 })),
+        reason: Type.String({ minLength: 1, maxLength: 2_000 }),
+      }),
+      async execute(toolCallId, params) {
+        const { runId, ...body } = params;
+        return response(await api(`/v1/objectives/${encodeURIComponent(runId)}/checkpoints`, mutation("checkpoint-objective", toolCallId, body)));
+      },
+    });
+
+    pi.registerTool({
+      name: "request_objective_approval",
+      label: "Request Symphony objective approval",
+      description: "Create a durable approval request for a Symphony objective plan, task, or completion boundary. This requests attention but does not resolve approval; use the shared cross-harness decision record rather than a native Pi subagent conversation.",
+      parameters: Type.Object({
+        runId: id(),
+        kind: Type.Union([Type.Literal("plan"), Type.Literal("task"), Type.Literal("completion")]),
+        taskId: Type.Optional(Type.Union([id(), Type.Null()])),
+        question: Type.String({ minLength: 1, maxLength: 2_000 }),
+        scope: Type.Optional(jsonObject()),
+        operationId: id(),
+        requestHash: Type.String({ minLength: 8, maxLength: 256 }),
+        policyHash: Type.String({ minLength: 8, maxLength: 256 }),
+        sideEffectClass: Type.Union([Type.Literal("read"), Type.Literal("local"), Type.Literal("external"), Type.Literal("irreversible")]),
+        canonicalTarget: Type.String({ minLength: 1, maxLength: 2_000 }),
+        expiresAt: Type.Optional(Type.Union([Type.String(), Type.Null()])),
+      }),
+      async execute(toolCallId, params) {
+        const { runId, ...body } = params;
+        return response(await api(`/v1/objectives/${encodeURIComponent(runId)}/approvals`, mutation("request-objective-approval", toolCallId, body)));
+      },
+    });
+  }
 
   pi.registerTool({
     name: "present_ui",
@@ -71,7 +234,7 @@ export default function symphonyPiExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "send_message",
     label: "Message Symphony agent",
-    description: "Steer or follow up with an existing Symphony agent.",
+    description: "Steer or follow up with an existing durable Symphony agent. This message crosses native-harness boundaries only through the authenticated Symphony graph; it does not make an ephemeral Pi subagent durable.",
     parameters: Type.Object({ targetAgentId: Type.String(), content: Type.String() }),
     async execute(id, params) {
       return response(await api(
@@ -84,7 +247,7 @@ export default function symphonyPiExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: "observe_agent",
     label: "Observe Symphony agent",
-    description: "Passively summarize another agent without interrupting its native harness.",
+    description: "Passively summarize another durable Symphony agent without interrupting its native harness. Native Pi subagent context is not silently promoted into the Symphony graph.",
     parameters: Type.Object({
       targetAgentId: Type.String(),
       level: Type.Optional(Type.Union([Type.Literal("tldr"), Type.Literal("paragraph"), Type.Literal("full")], { default: "tldr" })),

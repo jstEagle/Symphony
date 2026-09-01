@@ -29,3 +29,37 @@ export function rankFuzzyMatches<T>(
     .slice(0, limit)
     .map(({ item }) => item);
 }
+
+/**
+ * Describes a command-palette entry without coupling the ranking layer to
+ * React or an icon library. The caller owns availability and execution; this
+ * helper only decides which available entries match the user's query.
+ */
+export type PaletteSearchAction = Readonly<{
+  id: string;
+  label: string;
+  detail?: string;
+  keywords?: readonly string[];
+  available?: boolean;
+}>;
+
+export function actionSearchText(action: PaletteSearchAction): string {
+  return [action.id, action.label, action.detail, ...(action.keywords ?? [])].filter(Boolean).join(" ");
+}
+
+/**
+ * Keep command ranking deterministic and fuzzy. Unavailable actions never
+ * become executable results, which is important for daemon permission gates.
+ */
+export function rankPaletteActions<T extends PaletteSearchAction>(
+  actions: readonly T[],
+  query: string,
+  limit = 48,
+): T[] {
+  return rankFuzzyMatches(
+    actions.filter((action) => action.available !== false),
+    query,
+    actionSearchText,
+    limit,
+  );
+}

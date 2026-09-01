@@ -25,6 +25,7 @@ type EffectiveModel = {
 type QueuedPrompt = {
   prompt: string;
   requestId: string;
+  contentHash: string;
   effectiveModel: EffectiveModel;
   sendOptions: SendOptions;
   resolve: (value: JsonObject) => void;
@@ -41,6 +42,7 @@ type ActiveRun = {
   run: Run;
   runId: string;
   requestId: string;
+  contentHash: string;
   generation: number;
   completion: Promise<RunResult>;
   resolveCompletion: (result: RunResult) => void;
@@ -204,7 +206,7 @@ class CursorHost {
   private initialRequestId: string | null = null;
   private initialResult: JsonObject | null = null;
   private initialPromise: Promise<JsonObject> | null = null;
-  private readonly promptRequests = new Map<string, Promise<JsonObject>>();
+  private readonly promptRequests = new Map<string, { contentHash: string; promise: Promise<JsonObject> }>();
   private readonly acknowledgedResults = new Set<string>();
   private queuedDispatch: QueuedDispatch | null = null;
   private closed = false;
@@ -246,7 +248,7 @@ class CursorHost {
           if (nativeRunId) {
             const run = await sdk.Agent.getRun(nativeRunId, object(params.runOptions));
             if (run.status === "running") {
-              this.watch(run, integer(params.generation) ?? 1, string(params.requestId) ?? nativeRunId);
+              this.watch(run, integer(params.generation) ?? 1, string(params.requestId) ?? nativeRunId, string(params.contentHash) ?? "");
             }
           }
         }
@@ -262,13 +264,18 @@ class CursorHost {
         if (!this.agent || !this.agentId) throw new Error("Cursor host session is not initialized.");
         const prompt = string(params.prompt);
         const requestId = string(params.requestId) ?? String(id);
+        const contentHash = string(params.contentHash) ?? "";
         if (!prompt) throw new Error("Cursor follow-up prompt is required.");
         let delivery = this.promptRequests.get(requestId);
+        if (delivery && delivery.contentHash !== contentHash) {
+          throw new Error("Cursor host rejected a reused request id with different content.");
+        }
         if (!delivery) {
-          delivery = this.dispatchPrompt(prompt, requestId, object(params.effectiveModel) as EffectiveModel);
+          const promise = this.dispatchPrompt(prompt, requestId, contentHash, object(params.effectiveModel) as EffectiveModel);
+          delivery = { contentHash, promise };
           this.promptRequests.set(requestId, delivery);
         }
-        response(id, await delivery);
+        response(id, await delivery.promise);
         return;
       }
       if (method === "session/result-ack") {
@@ -417,12 +424,12 @@ class CursorHost {
       method: "cursor/session-created",
       params: { agentId: this.agentId, requestId, effectiveModel },
     });
-    const run = await this.dispatch(prompt, requestId, this.sendOptions(effectiveModel));
+    const run = await this.dispatch(prompt, requestId, this.sendOptions(effectiveModel), "");
     this.initialResult = { agentId: this.agentId, runId: run.runId, generation: run.generation };
     return this.initialResult;
   }
 
-  private async dispatchPrompt(prompt: string, requestId: string, effectiveModel: EffectiveModel): Promise<JsonObject> {
+  private async dispatchPrompt(prompt: string, requestId: string, contentHash: string, effectiveModel: EffectiveModel): Promise<JsonObject> {
     const sendOptions = this.sendOptions(effectiveModel);
     if (this.active?.resultFence?.terminal) {
       const terminal = this.active;
@@ -431,12 +438,12 @@ class CursorHost {
     }
     if (this.active?.run.status === "running" || this.active?.resultFence) {
       return await new Promise<JsonObject>((resolve, reject) => {
-        this.queued.push({ prompt, requestId, effectiveModel, sendOptions, resolve, reject });
+        this.queued.push({ prompt, requestId, contentHash, effectiveModel, sendOptions, resolve, reject });
       });
     }
     this.effectiveModel = effectiveModel;
-    const run = await this.dispatch(prompt, requestId, sendOptions);
-    return { agentId: this.agentId, runId: run.runId, generation: run.generation, queued: false };
+    const run = await this.dispatch(prompt, requestId, sendOptions, contentHash);
+    return { agentId: this.agentId, runId: run.runId, requestId, contentHash, generation: run.generation, queued: false };
   }
 
   private status(): JsonObject {
@@ -452,15 +459,15 @@ class CursorHost {
     };
   }
 
-  private async dispatch(prompt: string, requestId: string, sendOptions: SendOptions): Promise<ActiveRun> {
+  private async dispatch(prompt: string, requestId: string, sendOptions: SendOptions, contentHash: string): Promise<ActiveRun> {
     if (!this.agent || !this.agentId) throw new Error("Cursor agent is unavailable.");
     if (this.active?.run.status === "running" || this.active?.resultFence) throw new Error("Cursor host cannot dispatch concurrent runs.");
     const run = await this.agent.send(prompt, { ...sendOptions, idempotencyKey: requestId });
     this.generation += 1;
-    return this.watch(run, this.generation, requestId);
+    return this.watch(run, this.generation, requestId, contentHash);
   }
 
-  private watch(run: Run, generation: number, requestId: string): ActiveRun {
+  private watch(run: Run, generation: number, requestId: string, contentHash: string): ActiveRun {
     let resolveCompletion!: (result: RunResult) => void;
     let rejectCompletion!: (error: Error) => void;
     const completion = new Promise<RunResult>((resolve, reject) => {
@@ -471,6 +478,7 @@ class CursorHost {
       run,
       runId: run.id,
       requestId,
+      contentHash,
       generation,
       completion,
       resolveCompletion,
@@ -478,7 +486,7 @@ class CursorHost {
       resultFence: null,
     };
     this.active = active;
-    send({ jsonrpc: "2.0", method: "cursor/run-started", params: { agentId: this.agentId, runId: run.id, requestId, generation } });
+    send({ jsonrpc: "2.0", method: "cursor/run-started", params: { agentId: this.agentId, runId: run.id, requestId, contentHash, generation } });
     void this.consume(active);
     return active;
   }
@@ -487,7 +495,7 @@ class CursorHost {
     try {
       for await (const message of active.run.stream()) {
         if (this.active !== active || this.closed) continue;
-        send({ jsonrpc: "2.0", method: "cursor/message", params: { agentId: this.agentId, runId: active.runId, generation: active.generation, message } });
+        send({ jsonrpc: "2.0", method: "cursor/message", params: { agentId: this.agentId, runId: active.runId, requestId: active.requestId, contentHash: active.contentHash, generation: active.generation, message } });
       }
       const result = await active.run.wait();
       active.resolveCompletion(result);
@@ -512,6 +520,7 @@ class CursorHost {
           agentId: this.agentId,
           runId: active.runId,
           requestId: active.requestId,
+          contentHash: active.contentHash,
           generation: active.generation,
           queuedPrompts: this.queued.length,
           result,
@@ -532,11 +541,11 @@ class CursorHost {
     let queuedDispatch: QueuedDispatch | null = null;
     try {
       this.effectiveModel = next.effectiveModel;
-      const acceptance = this.dispatch(next.prompt, next.requestId, next.sendOptions);
+      const acceptance = this.dispatch(next.prompt, next.requestId, next.sendOptions, next.contentHash);
       queuedDispatch = { acceptance };
       this.queuedDispatch = queuedDispatch;
       const run = await acceptance;
-      next.resolve({ agentId: this.agentId, runId: run.runId, generation: run.generation, queued: true });
+      next.resolve({ agentId: this.agentId, runId: run.runId, requestId: next.requestId, contentHash: next.contentHash, generation: run.generation, queued: true });
     } catch (error) {
       next.reject(error instanceof Error ? error : new Error(String(error)));
     } finally {

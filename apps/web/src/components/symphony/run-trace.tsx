@@ -8,11 +8,13 @@ import type { Agent, EventEnvelope, JsonValue, RunSnapshot } from "../../lib/sym
 import { isSettledAgent } from "../../lib/symphony/format";
 
 const TICK_COUNT = 5;
+const MAX_VISIBLE_IDLE_GAP_MS = 1_000;
 
 export type TraceModel = {
   spans: SpanData[];
   agentBySpan: Map<string, string>;
   range: { min: number; max: number };
+  collapsedIdleMs: number;
 };
 
 export function RunTrace({ snapshot, onSelectAgent }: { snapshot: RunSnapshot; onSelectAgent: (id: string) => void }) {
@@ -90,6 +92,7 @@ export function RunTrace({ snapshot, onSelectAgent }: { snapshot: RunSnapshot; o
         <Legend color="bg-success" label="Completed" />
         <Legend color="bg-destructive" label="Failed" />
         <Legend color="bg-warning" label="Waiting or cancelled" />
+        {model.collapsedIdleMs > 0 ? <span>Long idle gaps collapsed</span> : null}
         <span className="ml-auto">Scroll horizontally for long traces</span>
       </div>
     </AuiProvider>
@@ -118,7 +121,7 @@ function Legend({ color, label }: { color: string; label: string }) {
  */
 export function buildTraceModel(snapshot: RunSnapshot, observedAt = Date.now()): TraceModel {
   if (snapshot.agents.length === 0) {
-    return { spans: [], agentBySpan: new Map(), range: { min: 0, max: 100 } };
+    return { spans: [], agentBySpan: new Map(), range: { min: 0, max: 100 }, collapsedIdleMs: 0 };
   }
 
   const traceEvents = [...(snapshot.traceEvents ?? [])].sort((a, b) => a.cursor - b.cursor);
@@ -131,10 +134,12 @@ export function buildTraceModel(snapshot: RunSnapshot, observedAt = Date.now()):
   const allTimes = [
     ...snapshot.agents.flatMap((agent) => [
       toTime(agent.startedAt),
-      toTime(agent.finishedAt),
-      idleBoundaries.get(agent.id) ?? toTime(agent.updatedAt),
+      toTime(agent.finishedAt) ?? idleBoundaries.get(agent.id) ?? toTime(agent.updatedAt),
     ]),
-    ...traceEvents.filter((event) => event.type.startsWith("driver.")).flatMap(eventTimes),
+    // Only tool lifecycle events become visible spans. Session/output/recovery
+    // events can arrive much later (for example after daemon adoption) and
+    // must not stretch the waterfall with an invisible empty tail.
+    ...traceEvents.filter((event) => event.type.startsWith("driver.tool.")).flatMap(eventTimes),
   ].filter((value): value is number => value !== null);
   const hasObservedTime = allTimes.length > 0;
   const startedAt = hasObservedTime ? Math.min(...allTimes) : 0;
@@ -158,7 +163,80 @@ export function buildTraceModel(snapshot: RunSnapshot, observedAt = Date.now()):
   const toolSpans = toolSpansForEvents(traceEvents, snapshot.agents, rootId, range);
   spans.push(...toolSpans.spans);
   for (const [spanId, agentId] of toolSpans.agentBySpan) agentBySpan.set(spanId, agentId);
-  return { spans, agentBySpan, range };
+  return compactReusableChatGaps(snapshot, { spans, agentBySpan, range, collapsedIdleMs: 0 });
+}
+
+/**
+ * A chat can contain conductor turns separated by hours or days. Showing that
+ * wall-clock silence at full scale makes the actual work unreadable. Chrome's
+ * trace viewer solves the same problem with navigation and zoom; Symphony's
+ * compact workspace instead collapses only gaps where no agent was active.
+ * Span latency remains the real duration, while display timestamps move onto
+ * a dense execution axis. Non-chat workflow runs keep their wall-clock axis.
+ */
+function compactReusableChatGaps(snapshot: RunSnapshot, model: TraceModel): TraceModel {
+  const reusableChat = snapshot.runId.startsWith("chat-run:") || snapshot.workflowId?.startsWith("chat:") === true;
+  if (!reusableChat || snapshot.agents.length < 2) return model;
+
+  const agentIds = new Set(snapshot.agents.map((agent) => agent.id));
+  const intervals = model.spans
+    .filter((span) => agentIds.has(span.id))
+    .map((span) => ({ start: span.startedAt, end: span.endedAt ?? model.range.max }))
+    .filter((interval) => interval.end >= interval.start)
+    .sort((left, right) => left.start - right.start);
+  if (intervals.length < 2) return model;
+
+  const occupied: Array<{ start: number; end: number }> = [];
+  for (const interval of intervals) {
+    const previous = occupied.at(-1);
+    if (!previous || interval.start > previous.end) occupied.push({ ...interval });
+    else previous.end = Math.max(previous.end, interval.end);
+  }
+
+  const gaps: Array<{ start: number; end: number; removed: number }> = [];
+  for (let index = 1; index < occupied.length; index += 1) {
+    const start = occupied[index - 1]!.end;
+    const end = occupied[index]!.start;
+    if (end - start > MAX_VISIBLE_IDLE_GAP_MS) {
+      gaps.push({ start, end, removed: end - start - MAX_VISIBLE_IDLE_GAP_MS });
+    }
+  }
+  if (gaps.length === 0) return model;
+
+  const project = (time: number): number => {
+    let removed = 0;
+    for (const gap of gaps) {
+      if (time >= gap.end) {
+        removed += gap.removed;
+        continue;
+      }
+      if (time > gap.start) {
+        const ratio = (time - gap.start) / (gap.end - gap.start);
+        return gap.start - removed + ratio * MAX_VISIBLE_IDLE_GAP_MS;
+      }
+      break;
+    }
+    return time - removed;
+  };
+
+  const rootId = `run:${snapshot.runId}`;
+  const spans = model.spans.map((span) => {
+    const startedAt = project(span.startedAt);
+    const endedAt = span.endedAt === null ? null : project(span.endedAt);
+    if (span.id !== rootId) return { ...span, startedAt, endedAt };
+    return {
+      ...span,
+      startedAt,
+      endedAt,
+      latencyMs: endedAt === null ? null : Math.max(0, endedAt - startedAt),
+    };
+  });
+  return {
+    ...model,
+    spans,
+    range: { min: project(model.range.min), max: project(model.range.max) },
+    collapsedIdleMs: gaps.reduce((sum, gap) => sum + gap.removed, 0),
+  };
 }
 
 function eventTimes(event: EventEnvelope): Array<number | null> {

@@ -6,16 +6,18 @@ import type {
   DriverDoctorResult,
   DriverEvent,
   DriverLifecycleOptions,
+  DriverMessageRequest,
   DriverSession,
   DriverStartRequest,
+  JsonValue,
   ModelDescriptor,
   WorkerDriver,
   DriverProcessSupervisor,
 } from "@symphony/protocol";
-import { buildAgentPrompt } from "./prompt.js";
+import { buildAgentPrompt, coordinationPromptOptions } from "./prompt.js";
 import { JsonLineProcess } from "./process.js";
 import { captureProcessIdentity } from "./process-identity.js";
-import { capabilities, emit, makeSession, receipt, stringifyError, type Emit } from "./common.js";
+import { capabilities, emit, makeSession, messageRequest, stringifyError, withMessageIdentity, type Emit } from "./common.js";
 
 type AcpConfig = SymphonyConfig["harnesses"]["acp"][number];
 type ActiveAcp = {
@@ -28,14 +30,19 @@ type ActiveAcp = {
   closed: boolean;
   runSequence: number;
   activeRun: number | null;
+  updateSequence: number;
   processLeaseId: string | null;
   processSupervisor: DriverProcessSupervisor | undefined;
   processReleased: boolean;
+  pendingMessage: DriverMessageRequest | null;
 };
 
 export class AcpDriver implements WorkerDriver {
   readonly id = "acp" as const;
-  readonly capabilities = capabilities({ cloud: false });
+  // ACP session.prompt starts a new native run immediately and does not offer
+  // an ordered in-flight steering primitive. The runtime must queue a message
+  // behind the active turn instead of invoking prompt concurrently.
+  readonly capabilities = capabilities({ steer: false, cloud: false });
   private readonly active = new Map<string, ActiveAcp>();
 
   constructor(private readonly agents: AcpConfig[]) {}
@@ -91,7 +98,7 @@ export class AcpDriver implements WorkerDriver {
       });
       this.active.set(response.sessionId, active);
       emit(onEvent, "session.started", { sessionId: response.sessionId, adapter: adapter.id });
-      this.prompt(active, buildAgentPrompt(request.workOrder));
+      void this.prompt(active, buildAgentPrompt(request.workOrder, coordinationPromptOptions(request))).catch(() => undefined);
       return makeSession(this.id, response.sessionId, { adapterId: adapter.id, agentId: request.agentId });
     } catch (error) {
       this.closeActive(active, "SIGTERM", error);
@@ -138,9 +145,17 @@ export class AcpDriver implements WorkerDriver {
     }
   }
 
-  async sendMessage(session: DriverSession, message: string): Promise<{ receiptId: string; queued: boolean }> {
-    this.prompt(this.require(session), message);
-    return receipt(false);
+  async sendMessage(session: DriverSession, message: string, request?: DriverMessageRequest): Promise<{ receiptId: string; queued: boolean }> {
+    const active = this.require(session);
+    const durable = messageRequest(message, request);
+    if (active.pendingMessage) {
+      if (active.pendingMessage.requestId !== durable.requestId || active.pendingMessage.contentHash !== durable.contentHash) {
+        throw new Error("ACP native message is already pending with a different durable identity.");
+      }
+      return { receiptId: durable.requestId, queued: false };
+    }
+    await this.prompt(active, message, durable);
+    return { receiptId: durable.requestId, queued: false };
   }
 
   async cancel(session: DriverSession): Promise<void> {
@@ -251,7 +266,10 @@ export class AcpDriver implements WorkerDriver {
             ? { outcome: { outcome: "selected" as const, optionId: choice.optionId } }
             : { outcome: { outcome: "cancelled" as const } };
         })
-        .onNotification(acp.methods.client.session.update, ({ params }) => this.onUpdate(params.update, consumer, output));
+        .onNotification(acp.methods.client.session.update, ({ params }) => {
+          if (active) this.onUpdate(params.update, active);
+          else emit(consumer, "log", params.update);
+        });
       const stream = acp.ndJsonStream(
         Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
         Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
@@ -261,6 +279,10 @@ export class AcpDriver implements WorkerDriver {
       this.terminateProcess(child, "SIGTERM");
       throw error;
     }
+    const retainedState = processLease?.adapterState;
+    const retainedRecord = retainedState !== null && typeof retainedState === "object" && !Array.isArray(retainedState)
+      ? retainedState as Record<string, JsonValue>
+      : {};
     const connected: ActiveAcp = {
       process: child,
       connection,
@@ -269,11 +291,17 @@ export class AcpDriver implements WorkerDriver {
       output,
       failure: failurePromise,
       closed: false,
-      runSequence: 0,
+      runSequence: typeof retainedRecord.runSequence === "number" && Number.isSafeInteger(retainedRecord.runSequence)
+        ? retainedRecord.runSequence
+        : 0,
       activeRun: null,
+      updateSequence: typeof retainedRecord.updateSequence === "number" && Number.isSafeInteger(retainedRecord.updateSequence)
+        ? retainedRecord.updateSequence
+        : 0,
       processLeaseId: processLease?.id ?? null,
       processSupervisor,
       processReleased,
+      pendingMessage: retainedMessageDispatch(retainedRecord),
     };
     active = connected;
     const abort = () => this.closeActive(connected, "SIGKILL", signal?.reason);
@@ -298,25 +326,34 @@ export class AcpDriver implements WorkerDriver {
     }
   }
 
-  private prompt(active: ActiveAcp, text: string): void {
+  private async prompt(active: ActiveAcp, text: string, request?: DriverMessageRequest): Promise<void> {
     active.output.text = "";
+    if (request) active.pendingMessage = request;
     const run = ++active.runSequence;
     active.activeRun = run;
-    emit(active.emit, "run.started", { sessionId: active.sessionId });
-    void this.withFailure(active, active.connection.agent.request(acp.methods.agent.session.prompt, {
-      sessionId: active.sessionId,
-      prompt: [{ type: "text", text }],
-    })).then((response) => {
+    const nativeTurnId = `acp:${active.sessionId}:turn:${run}`;
+    this.persistState(active);
+    emit(active.emit, "run.started", withMessageIdentity({ sessionId: active.sessionId, nativeTurnId }, active.pendingMessage), `${nativeTurnId}:started`);
+    try {
+      const response = await this.withFailure(active, active.connection.agent.request(acp.methods.agent.session.prompt, {
+        sessionId: active.sessionId,
+        prompt: [{ type: "text", text }],
+      }));
       if (!this.settleRun(active, run)) return;
-      if (response.usage) emit(active.emit, "usage.recorded", { usage: response.usage, basis: "harness-reported" });
-      if (response.stopReason === "cancelled") emit(active.emit, "run.cancelled", response);
+      if (response.usage) emit(active.emit, "usage.recorded", { usage: response.usage, basis: "harness-reported", nativeTurnId }, `${nativeTurnId}:usage`);
+      if (response.stopReason === "cancelled") emit(active.emit, "run.cancelled", { ...response, nativeTurnId }, `${nativeTurnId}:cancelled`);
       else {
-        emit(active.emit, "output.completed", { text: active.output.text });
-        emit(active.emit, "run.completed", response);
+        emit(active.emit, "output.completed", { text: active.output.text, nativeTurnId }, `${nativeTurnId}:output`);
+        emit(active.emit, "run.completed", { ...response, nativeTurnId }, `${nativeTurnId}:completed`);
       }
-    }).catch((error) => {
-      if (this.settleRun(active, run)) emit(active.emit, "run.failed", { error: stringifyError(error) });
-    });
+      if (request && active.pendingMessage?.requestId === request.requestId) {
+        active.pendingMessage = null;
+        this.persistState(active);
+      }
+    } catch (error) {
+      if (this.settleRun(active, run)) emit(active.emit, "run.failed", withMessageIdentity({ error: stringifyError(error), nativeTurnId }, active.pendingMessage), `${nativeTurnId}:failed`);
+      throw error;
+    }
   }
 
   private async withFailure<T>(active: ActiveAcp, operation: Promise<T>): Promise<T> {
@@ -338,7 +375,8 @@ export class AcpDriver implements WorkerDriver {
     if (active.closed) return;
     const run = active.activeRun;
     if (run !== null && this.settleRun(active, run)) {
-      emit(active.emit, "run.failed", { error: stringifyError(error) });
+      const nativeTurnId = `acp:${active.sessionId}:turn:${run}`;
+      emit(active.emit, "run.failed", withMessageIdentity({ error: stringifyError(error), nativeTurnId }, active.pendingMessage), `${nativeTurnId}:failed`);
     }
     this.closeActive(active, "SIGTERM", error);
   }
@@ -365,16 +403,49 @@ export class AcpDriver implements WorkerDriver {
     }
   }
 
-  private onUpdate(update: acp.SessionUpdate, consumer: Emit, output: { text: string }): void {
+  private onUpdate(update: acp.SessionUpdate, active: ActiveAcp): void {
+    const consumer = active.emit;
+    const run = active.activeRun ?? active.runSequence;
+    const nativeTurnId = `acp:${active.sessionId}:turn:${run}`;
+    const updateRecord = update as unknown as Record<string, unknown>;
+    const providerId = ["eventId", "event_id", "messageId", "message_id", "toolCallId", "tool_call_id", "sequence", "seq"]
+      .map((key) => updateRecord[key])
+      .find((value): value is string | number => typeof value === "string" || (typeof value === "number" && Number.isSafeInteger(value)));
+    const streamSequence = ++active.updateSequence;
+    this.persistState(active);
+    const nativeEventId = providerId !== undefined
+      ? `acp:${active.sessionId}:turn:${run}:event:${String(providerId)}`
+      : `${nativeTurnId}:event:${streamSequence}`;
+    const streamPayload = (payload: unknown): unknown => payload !== null && typeof payload === "object" && !Array.isArray(payload)
+      ? withMessageIdentity({ ...(payload as Record<string, unknown>), nativeSequence: streamSequence }, active.pendingMessage)
+      : payload;
+    const output = active.output;
     if (update.sessionUpdate === "agent_message_chunk") {
       if (update.content.type === "text") output.text += update.content.text;
-      if (update.content.type === "text") emit(consumer, "message.delta", { text: update.content.text });
+      if (update.content.type === "text") emit(consumer, "message.delta", streamPayload({ text: update.content.text, nativeTurnId }), nativeEventId);
     }
-    else if (update.sessionUpdate === "agent_thought_chunk" && update.content.type === "text") emit(consumer, "reasoning.delta", { text: update.content.text });
-    else if (update.sessionUpdate === "tool_call") emit(consumer, "tool.started", update);
-    else if (update.sessionUpdate === "tool_call_update") emit(consumer, "tool.updated", update);
-    else if (update.sessionUpdate === "usage_update") emit(consumer, "usage.recorded", { usage: update, basis: "harness-reported" });
+    else if (update.sessionUpdate === "agent_thought_chunk" && update.content.type === "text") emit(consumer, "reasoning.delta", streamPayload({ text: update.content.text, nativeTurnId }), nativeEventId);
+    else if (update.sessionUpdate === "tool_call") emit(consumer, "tool.started", streamPayload({ ...update, nativeTurnId }), nativeEventId);
+    else if (update.sessionUpdate === "tool_call_update") emit(consumer, "tool.updated", streamPayload({ ...update, nativeTurnId }), nativeEventId);
+    else if (update.sessionUpdate === "usage_update") emit(consumer, "usage.recorded", streamPayload({ usage: update, basis: "harness-reported", nativeTurnId }), nativeEventId);
     else emit(consumer, "log", update);
+  }
+
+  private persistState(active: ActiveAcp): void {
+    if (!active.processSupervisor || !active.processLeaseId) return;
+    try {
+      active.processSupervisor.updateProcess(active.processLeaseId, {
+        adapterState: {
+          runSequence: active.runSequence,
+          updateSequence: active.updateSequence,
+          activeRun: active.activeRun,
+          pendingMessage: active.pendingMessage as unknown as JsonValue,
+        },
+      });
+    } catch {
+      // The runtime owns lease retirement; a late adapter callback must not
+      // turn a terminal native result into an unhandled exception.
+    }
   }
 
   private mcp(request: DriverStartRequest): acp.McpServer {
@@ -403,4 +474,14 @@ export class AcpDriver implements WorkerDriver {
     if (!active) throw new Error(`ACP session is not active: ${session.nativeSessionId}`);
     return active;
   }
+}
+
+function retainedMessageDispatch(state: Record<string, JsonValue>): DriverMessageRequest | null {
+  const value = state.pendingMessage;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+  const attemptId = typeof value.attemptId === "string" ? value.attemptId : null;
+  const requestId = typeof value.requestId === "string" ? value.requestId : null;
+  const contentHash = typeof value.contentHash === "string" ? value.contentHash : null;
+  if (!attemptId || !requestId || !contentHash) return null;
+  return { attemptId, requestId, contentHash };
 }

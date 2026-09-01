@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "suite": "durability-chaos-matrix",
+  "driver": "DurabilityChaosDriver (deterministic native boundary)",
+  "transport": ["HTTP", "SSE", "SQLite"],
+  "externalModels": false,
+  "scenarios": [
+    {
+      "id": "control-disconnect-restart",
+      "claims": [
+        "an SSE/browser projection disconnect does not stop daemon-owned work",
+        "a timer suspension is re-armed after daemon restart",
+        "signal delivery is rejected out of order and for a wrong subscription",
+        "an exact signal retry replays its durable delivery receipt",
+        "a conflicting delivery payload is rejected",
+        "objective create replay and conflict survive a daemon restart"
+      ]
+    },
+    {
+      "id": "signal-expiry-cancellation",
+      "claims": [
+        "signal expiry is persisted and emitted once",
+        "signal cancellation uses the objective control reducer and persists terminal state"
+      ]
+    },
+    {
+      "id": "native-boundary-and-follow-up-recovery",
+      "claims": [
+        "accepted-but-unproven native startup becomes interrupted instead of being retried",
+        "a queued follow-up is recovered and delivered exactly once to a retained session"
+      ]
+    },
+    {
+      "id": "attention-evidence-cursor-fence",
+      "claims": [
+        "attention resolution is idempotent and conflicting replay is rejected",
+        "artifact publication and checkpoint commit replay by request key",
+        "artifact evidence and aggregate events remain fenced by one event cursor"
+      ]
+    }
+  ],
+  "known_gaps": [
+    "The fixture cannot prove that a real provider accepted an unknown native request; that boundary requires provider-specific crash injection.",
+    "A process SIGKILL is not safe inside Vitest, so daemon.close() is used at explicit command boundaries and exercises the same SQLite recovery path.",
+    "Cross-machine SQLite locking and browser multi-window reconnect are outside this local acceptance gate."
+  ]
+}

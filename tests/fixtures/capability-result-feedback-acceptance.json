@@ -1,0 +1,96 @@
+{
+  "version": 1,
+  "suite": "capability-result-feedback",
+  "status": "wired",
+  "purpose": "Bounded acceptance contract for feeding one capability result into durable evaluation and optional replanning.",
+  "adapter": {
+    "status": "wired",
+    "wiringNote": "The harness invokes the production ObjectiveFeedbackReducer and CapabilityResultFeedbackRepository directly. A future daemon route can reuse these assertions without adding a test-only reducer.",
+    "requiredOperations": [
+      "submitFeedback",
+      "evaluateFeedback",
+      "commitReplan",
+      "restart",
+      "listEvidence",
+      "listAttentions"
+    ]
+  },
+  "identity": {
+    "objectiveId": "feedback-objective",
+    "runId": "feedback-run",
+    "workflowId": "feedback-workflow",
+    "workflowRevision": 3,
+    "workflowHash": "feedback-workflow-hash-0001",
+    "nodeId": "capability-node",
+    "attemptId": "attempt-feedback-1",
+    "admissionId": "capability-execution:feedback-run:capability-node:v1",
+    "capabilityId": "acceptance.feedback",
+    "capabilityVersion": 1,
+    "capabilityContentHash": "8e308c35616ddfd84377351556754c1ab1c5e9835eebc23e388877fa80ca1a0e",
+    "eventCursor": 42,
+    "eventIds": ["feedback-event-41", "feedback-event-42"],
+    "charterRevision": 2,
+    "charterHash": "f0573fa1b9600cc6151f1b2b6944f4fedc937fc350489c494d79c28ba4877c84"
+  },
+  "scenarios": [
+    {
+      "id": "exactly-once-feedback-evaluation",
+      "status": "verified",
+      "requiredEvidence": [
+        "First feedback submission commits one durable receipt.",
+        "An identical retry replays the same receipt without another evaluation.",
+        "Exactly one evaluation is linked to the feedback identity."
+      ]
+    },
+    {
+      "id": "duplicate-replay-and-conflict",
+      "status": "verified",
+      "requiredEvidence": [
+        "Same request key and same payload return replay.",
+        "Same request key with changed result/evidence returns conflict.",
+        "A conflicting retry creates no feedback, evaluation, replan, or attention side effect."
+      ]
+    },
+    {
+      "id": "restart-survival",
+      "status": "verified",
+      "requiredEvidence": [
+        "Feedback and evaluation remain readable after reducer/store restart.",
+        "Retry after restart replays the original receipt.",
+        "The durable identity and evidence cursor do not change across restart."
+      ]
+    },
+    {
+      "id": "evidence-and-charter-identity",
+      "status": "verified",
+      "requiredEvidence": [
+        "Accepted feedback carries objective, run, workflow revision/hash, node, attempt, and admission identity.",
+        "Evidence references stay within the admitted run and event high-water mark.",
+        "Charter revision/hash is preserved and mismatched identity is rejected fail-closed."
+      ]
+    },
+    {
+      "id": "at-most-one-cas-replan",
+      "status": "verified",
+      "requiredEvidence": [
+        "A failed evaluation can produce at most one next plan revision for its expected CAS head.",
+        "Concurrent/retried replan requests yield one commit and one replay or stale conflict.",
+        "A stale plan revision cannot dispatch a second replacement branch."
+      ]
+    },
+    {
+      "id": "fail-closed-attention",
+      "status": "verified",
+      "requiredEvidence": [
+        "Missing, stale, or ambiguous result evidence opens attention or remains unknown.",
+        "The objective never reports success from an unproven result.",
+        "No automated replan occurs without the required durable evidence/authority."
+      ]
+    }
+  ],
+  "nonClaims": [
+    "This fixture does not claim provider/model correctness.",
+    "This fixture does not claim that an evaluation itself is a human-quality judgement.",
+    "This gate must use the production protocol/reducer and durable store once they are available; it must not ship a test-only reducer."
+  ]
+}

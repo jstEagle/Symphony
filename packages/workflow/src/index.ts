@@ -8,13 +8,16 @@ import { ulid } from "ulid";
 import { z } from "zod";
 import type { LoadedConfig } from "@symphony/config";
 import {
+  CapabilityExecutionBindingSchema,
   JsonValueSchema,
   PermissionSchema,
   RoutingIntentSchema,
   WorkspaceSpecSchema,
   isTerminalAgentStatus,
   nowIso,
+  resolveChildPermission,
   type AgentRecord,
+  type CapabilityExecutionBinding,
   type JsonValue,
   type WorkflowMission,
 } from "@symphony/protocol";
@@ -24,8 +27,26 @@ import type {
   SymphonyStore,
   TriggerOccurrenceRecord,
   WorkflowRevisionRecord,
+  WorkflowRunOrigin,
   WorkflowRunRecord,
 } from "@symphony/storage";
+
+export * from "./objective-runtime.js";
+export * from "./objective-values.js";
+export * from "./objective-store-repository.js";
+export * from "./objective-control-plan.js";
+export * from "./objective-frontier.js";
+export * from "./objective-supervisor.js";
+export * from "./objective-supervision-runner.js";
+export * from "./objective-approval-expiry.js";
+export * from "./objective-handoff.js";
+export * from "./workspace-containment.js";
+export * from "./capability-library.js";
+export * from "./capability-execution.js";
+export * from "./workspace-manifest.js";
+export * from "./agent-message-bus.js";
+export * from "./objective-feedback.js";
+export * from "./objective-feedback-runtime.js";
 
 const OutputSchema = z.record(z.string(), JsonValueSchema);
 const CommonStepSchema = z.object({ id: z.string().min(1).regex(/^[a-zA-Z0-9_.-]+$/u) });
@@ -39,6 +60,7 @@ export type AgentStep = z.infer<typeof CommonStepSchema> & {
   outputSchema: Record<string, JsonValue>;
   routing?: z.infer<typeof RoutingIntentSchema> | undefined;
   workspace?: z.infer<typeof WorkspaceSpecSchema> | undefined;
+  capabilityExecution?: CapabilityExecutionBinding | undefined;
 };
 export type SequenceStep = z.infer<typeof CommonStepSchema> & { type: "sequence"; steps: WorkflowStep[] };
 export type ParallelStep = z.infer<typeof CommonStepSchema> & { type: "parallel"; steps: WorkflowStep[] };
@@ -50,7 +72,28 @@ export type WhileStep = z.infer<typeof CommonStepSchema> & {
 };
 export type IfStep = z.infer<typeof CommonStepSchema> & { type: "if"; condition: Condition; then: WorkflowStep[]; else?: WorkflowStep[] | undefined };
 export type SetStep = z.infer<typeof CommonStepSchema> & { type: "set"; value: JsonValue };
-export type WorkflowStep = AgentStep | SequenceStep | ParallelStep | WhileStep | IfStep | SetStep;
+export type EvaluationOperator = "exists" | "eq" | "neq" | "gt" | "gte" | "lt" | "lte";
+export type EvaluateStep = z.infer<typeof CommonStepSchema> & {
+  type: "evaluate";
+  metric?: string | undefined;
+  path: string;
+  operator?: EvaluationOperator | undefined;
+  op?: EvaluationOperator | undefined;
+  target?: JsonValue | undefined;
+  default?: JsonValue | undefined;
+};
+export type TimerStep = z.infer<typeof CommonStepSchema> & {
+  type: "timer";
+  durationMs: number;
+  expiresAfterMs?: number | null | undefined;
+};
+export type SignalStep = z.infer<typeof CommonStepSchema> & {
+  type: "signal";
+  signalKey: string;
+  expiresAfterMs?: number | null | undefined;
+  payloadSchema?: Record<string, JsonValue> | undefined;
+};
+export type WorkflowStep = AgentStep | SequenceStep | ParallelStep | WhileStep | IfStep | SetStep | EvaluateStep | TimerStep | SignalStep;
 
 export type Condition = {
   path: string;
@@ -72,12 +115,44 @@ const WorkflowStepSchema: z.ZodType<WorkflowStep> = z.lazy(() => z.discriminated
     harness: z.enum(["auto", "codex", "claude", "cursor", "opencode", "pi", "acp"]).optional(),
     permissions: PermissionSchema.optional(), outputSchema: OutputSchema,
     routing: RoutingIntentSchema.optional(), workspace: WorkspaceSpecSchema.optional(),
+    capabilityExecution: CapabilityExecutionBindingSchema.optional(),
   }),
   CommonStepSchema.extend({ type: z.literal("sequence"), steps: z.array(WorkflowStepSchema).min(1) }),
   CommonStepSchema.extend({ type: z.literal("parallel"), steps: z.array(WorkflowStepSchema).min(1) }),
   CommonStepSchema.extend({ type: z.literal("while"), condition: ConditionSchema, steps: z.array(WorkflowStepSchema).min(1), maxIterations: z.number().int().positive().optional() }),
   CommonStepSchema.extend({ type: z.literal("if"), condition: ConditionSchema, then: z.array(WorkflowStepSchema).min(1), else: z.array(WorkflowStepSchema).optional() }),
   CommonStepSchema.extend({ type: z.literal("set"), value: JsonValueSchema }),
+  CommonStepSchema.extend({
+    type: z.literal("evaluate"),
+    metric: z.string().min(1).max(500).optional(),
+    path: z.string().min(1).max(1_000),
+    operator: z.enum(["exists", "eq", "neq", "gt", "gte", "lt", "lte"]).optional(),
+    op: z.enum(["exists", "eq", "neq", "gt", "gte", "lt", "lte"]).optional(),
+    target: JsonValueSchema.optional(),
+    default: JsonValueSchema.optional(),
+  }).strict().superRefine((step, context) => {
+    if (step.operator === undefined && step.op === undefined) {
+      context.addIssue({ code: "custom", path: ["operator"], message: "Evaluation step requires an operator." });
+    }
+    if (step.operator !== undefined && step.op !== undefined && step.operator !== step.op) {
+      context.addIssue({ code: "custom", path: ["operator"], message: "Evaluation step operator and op must agree." });
+    }
+  }),
+  CommonStepSchema.extend({
+    type: z.literal("timer"),
+    durationMs: z.number().int().positive().max(31_536_000_000),
+    expiresAfterMs: z.number().int().positive().max(31_536_000_000).nullable().optional(),
+  }).strict().superRefine((step, context) => {
+    if (step.expiresAfterMs !== undefined && step.expiresAfterMs !== null && step.expiresAfterMs < step.durationMs) {
+      context.addIssue({ code: "custom", path: ["expiresAfterMs"], message: "Timer expiry must be at or after due time." });
+    }
+  }),
+  CommonStepSchema.extend({
+    type: z.literal("signal"),
+    signalKey: z.string().min(1).max(256).regex(/^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$/u),
+    expiresAfterMs: z.number().int().positive().max(31_536_000_000).nullable().optional(),
+    payloadSchema: z.record(z.string(), JsonValueSchema).optional(),
+  }).strict(),
 ]));
 
 export const WorkflowDefinitionSchema = z.object({
@@ -121,6 +196,32 @@ export function parallel(id: string, ...steps: WorkflowStep[]): ParallelStep {
 
 export function whileLoop(id: string, condition: Condition, steps: WorkflowStep[], maxIterations?: number): WhileStep {
   return { id, type: "while", condition, steps, ...(maxIterations ? { maxIterations } : {}) };
+}
+
+/** Construct a strict, data-only evaluation step. */
+export function evaluate(
+  id: string,
+  path: string,
+  operator: EvaluationOperator,
+  target?: JsonValue,
+  metric?: string,
+): EvaluateStep {
+  return {
+    id,
+    type: "evaluate",
+    path,
+    operator,
+    ...(target === undefined ? {} : { target }),
+    ...(metric === undefined ? {} : { metric }),
+  };
+}
+
+export function timer(id: string, durationMs: number, expiresAfterMs?: number | null): TimerStep {
+  return { id, type: "timer", durationMs, ...(expiresAfterMs === undefined ? {} : { expiresAfterMs }) };
+}
+
+export function signal(id: string, signalKey: string, options: Pick<SignalStep, "expiresAfterMs" | "payloadSchema"> = {}): SignalStep {
+  return { id, type: "signal", signalKey, ...(options.expiresAfterMs === undefined ? {} : { expiresAfterMs: options.expiresAfterMs }), ...(options.payloadSchema === undefined ? {} : { payloadSchema: options.payloadSchema }) };
 }
 
 export class WorkflowCompiler {
@@ -186,6 +287,54 @@ export class WorkflowLoader {
 
 type ExecutionContext = { input: JsonValue; steps: Record<string, JsonValue>; iteration: Record<string, number> };
 
+export type WorkflowRunStartOptions = {
+  runId?: string;
+  workflowRevision?: number;
+  workflowHash?: string;
+  /** Trusted daemon-owned authority context. Never accept this from workflow input. */
+  origin?: WorkflowRunOrigin;
+};
+
+/**
+ * Validate the authority receipt at the workflow boundary as well as at API
+ * boundaries. Workflow runs are persisted as JSON, so a TypeScript-only type
+ * cannot protect recovery from a malformed or forged origin.
+ */
+export const WorkflowRunOriginSchema = z.object({
+  kind: z.enum(["user", "agent", "cron"]),
+  threadId: z.string().min(1).nullable(),
+  parentRunId: z.string().min(1).nullable(),
+  parentAgentId: z.string().min(1).nullable(),
+  baseDepth: z.number().int().min(-1).max(1_000_000),
+  permissionCeiling: PermissionSchema,
+}).strict().superRefine((origin, context) => {
+  if (origin.kind === "agent") {
+    if (origin.parentRunId === null || origin.parentAgentId === null || origin.baseDepth < 0) {
+      context.addIssue({ code: "custom", message: "Agent workflow origins require a parent run, parent agent, and non-negative base depth." });
+    }
+    return;
+  }
+  if (origin.threadId !== null || origin.parentRunId !== null || origin.parentAgentId !== null || origin.baseDepth !== -1) {
+    context.addIssue({ code: "custom", message: `${origin.kind} workflow origins must be root origins.` });
+  }
+  if (origin.permissionCeiling !== "full-access") {
+    context.addIssue({ code: "custom", message: `${origin.kind} workflow origins must retain full-access as their root ceiling.` });
+  }
+});
+
+export function parseWorkflowRunOrigin(value: unknown): WorkflowRunOrigin {
+  return WorkflowRunOriginSchema.parse(value) as WorkflowRunOrigin;
+}
+
+const DEFAULT_USER_ORIGIN: WorkflowRunOrigin = {
+  kind: "user",
+  threadId: null,
+  parentRunId: null,
+  parentAgentId: null,
+  baseDepth: -1,
+  permissionCeiling: "full-access",
+};
+
 export class WorkflowEngine {
   private readonly running = new Map<string, Promise<WorkflowRunRecord>>();
   private readonly cancelling = new Map<string, Promise<void>>();
@@ -209,7 +358,7 @@ export class WorkflowEngine {
   async run(
     workflowId: string,
     input: JsonValue = {},
-    options: { runId?: string; workflowRevision?: number; workflowHash?: string } = {},
+    options: WorkflowRunStartOptions = {},
   ): Promise<WorkflowRunRecord> {
     const record = this.start(workflowId, input, options);
     return this.running.get(record.id) ?? Promise.resolve(record);
@@ -218,7 +367,7 @@ export class WorkflowEngine {
   start(
     workflowId: string,
     input: JsonValue = {},
-    options: { runId?: string; workflowRevision?: number; workflowHash?: string } = {},
+    options: WorkflowRunStartOptions = {},
   ): WorkflowRunRecord {
     const runId = options.runId ?? ulid();
     const existing = this.store.getRun(runId);
@@ -227,6 +376,14 @@ export class WorkflowEngine {
     }
     if (existing && options.workflowRevision !== undefined && existing.workflowRevision !== options.workflowRevision) {
       throw new Error(`Workflow run ${runId} is pinned to ${workflowId}@${existing.workflowRevision}, not revision ${options.workflowRevision}.`);
+    }
+    const requestedOrigin = options.origin === undefined ? undefined : parseWorkflowRunOrigin(options.origin);
+    const existingOrigin = existing?.origin === undefined ? undefined : parseWorkflowRunOrigin(existing.origin);
+    if (existing && existingOrigin === undefined && requestedOrigin === undefined) {
+      throw new Error(`Workflow run ${runId} has no immutable authority origin; explicit trusted recovery backfill is required.`);
+    }
+    if (existingOrigin !== undefined && requestedOrigin !== undefined && stableStringify(existingOrigin) !== stableStringify(requestedOrigin)) {
+      throw new Error(`Workflow run ${runId} is already bound to a different authority origin.`);
     }
     // A run is authorized against one immutable workflow revision. Recovery
     // must never fall forward to a newer definition just because the workflow
@@ -263,10 +420,18 @@ export class WorkflowEngine {
     // occurrence to an unrelated terminal receipt.
     if (existing && ["completed", "failed", "cancelled"].includes(existing.status)) return existing;
     const now = nowIso();
-    const record: WorkflowRunRecord = existing ?? {
-      id: runId, workflowId, workflowRevision: saved.revision, status: "queued", input, output: null,
-      error: null, startedAt: null, updatedAt: now, finishedAt: null, cancelRequested: false,
-    };
+    const record: WorkflowRunRecord = existing
+      ? existingOrigin === undefined && requestedOrigin !== undefined
+        // Legacy records predate the origin receipt. Permit exactly one trusted
+        // recovery-time backfill, after which the mismatch fence above makes
+        // the captured authority immutable.
+        ? { ...existing, origin: requestedOrigin }
+        : existing
+      : {
+          id: runId, workflowId, workflowRevision: saved.revision, status: "queued", input, output: null,
+          error: null, startedAt: null, updatedAt: now, finishedAt: null, cancelRequested: false,
+          origin: requestedOrigin ?? DEFAULT_USER_ORIGIN,
+        };
     this.store.saveRun(record);
     if (!this.running.has(runId)) {
       const execution = this.execute(record, ir).finally(() => this.running.delete(runId));
@@ -428,7 +593,17 @@ export class WorkflowEngine {
       idempotencyKey: idempotencyKey(run.id, step.id, iterationKey, String(attemptNumber)),
       startedAt: nowIso(), updatedAt: nowIso(), finishedAt: null,
     };
-    this.store.saveStepAttempt(attempt);
+    if (replay?.status !== "running") {
+      this.store.durableTransaction(() => {
+        this.store.saveStepAttempt(attempt);
+        this.event(run, "workflow.step.started", {
+          stepId: step.id,
+          stepType: step.type,
+          iterationKey,
+          attempt: attempt.attempt,
+        });
+      });
+    }
     try {
       let output: JsonValue = null;
       if (step.type === "agent") output = await this.executeAgent(step, run, ir, context, attempt);
@@ -440,13 +615,17 @@ export class WorkflowEngine {
         await Promise.all(step.steps.map((child) => this.executeStep(child, run, ir, context, `${scope}/${step.id}`)));
         output = Object.fromEntries(step.steps.map((child) => [child.id, context.steps[child.id] ?? null]));
       } else if (step.type === "if") {
-        const branch = evaluate(step.condition, context) ? step.then : step.else ?? [];
+        const branch = evaluateCondition(step.condition, context) ? step.then : step.else ?? [];
         await this.executeSteps(branch, run, ir, context, `${scope}/${step.id}`);
         output = { branch: branch === step.then ? "then" : "else" };
+      } else if (step.type === "evaluate") {
+        output = evaluateStep(step, context);
+      } else if (step.type === "timer" || step.type === "signal") {
+        throw new Error(`Workflow ${step.type} step ${step.id} requires an objective control plan runtime.`);
       } else {
         const limit = Math.min(step.maxIterations ?? this.loaded.config.workflows.maxLoopIterations, this.loaded.config.workflows.maxLoopIterations);
         let count = context.iteration[step.id] ?? 0;
-        while (evaluate(step.condition, context)) {
+        while (evaluateCondition(step.condition, context)) {
           if (count >= limit) throw new Error(`Workflow loop ${step.id} exceeded ${limit} iterations.`);
           count += 1;
           context.iteration[step.id] = count;
@@ -456,10 +635,31 @@ export class WorkflowEngine {
       }
       context.steps[step.id] = output;
       const persistedAttempt = this.store.getLatestStepAttempt(run.id, step.id, iterationKey) ?? attempt;
-      this.store.saveStepAttempt({ ...persistedAttempt, status: "completed", output, updatedAt: nowIso(), finishedAt: nowIso() });
-      this.event(run, "workflow.step.completed", { stepId: step.id, iterationKey, output });
+      this.store.durableTransaction(() => {
+        this.store.saveStepAttempt({ ...persistedAttempt, status: "completed", output, updatedAt: nowIso(), finishedAt: nowIso() });
+        this.event(run, "workflow.step.completed", {
+          stepId: step.id,
+          stepType: step.type,
+          iterationKey,
+          attempt: persistedAttempt.attempt,
+          output,
+        });
+      });
     } catch (error) {
-      this.store.saveStepAttempt({ ...attempt, status: "failed", error: error instanceof Error ? error.message : String(error), updatedAt: nowIso(), finishedAt: nowIso() });
+      const persistedAttempt = this.store.getLatestStepAttempt(run.id, step.id, iterationKey) ?? attempt;
+      const message = error instanceof Error ? error.message : String(error);
+      const agentId = stepAttemptAgentId(persistedAttempt);
+      this.store.durableTransaction(() => {
+        this.store.saveStepAttempt({ ...persistedAttempt, status: "failed", error: message, updatedAt: nowIso(), finishedAt: nowIso() });
+        this.event(run, "workflow.step.failed", {
+          stepId: step.id,
+          stepType: step.type,
+          iterationKey,
+          attempt: persistedAttempt.attempt,
+          ...(agentId ? { agentId } : {}),
+          error: message,
+        });
+      });
       throw error;
     }
   }
@@ -469,17 +669,25 @@ export class WorkflowEngine {
     let agentRecord: AgentRecord;
     if (previousAgentId) agentRecord = this.agents.get(previousAgentId);
     else {
+      if (run.origin === undefined) {
+        throw new Error(`Workflow run ${run.id} cannot create an agent without an immutable authority origin.`);
+      }
+      const origin = parseWorkflowRunOrigin(run.origin);
+      const permissions = resolveChildPermission(
+        origin.permissionCeiling,
+        step.permissions ?? this.loaded.config.agents.defaultPermissions,
+      );
       agentRecord = await this.agents.create({
         id: attempt.idempotencyKey,
         workflowId: run.workflowId,
         runId: run.id,
-        parentAgentId: null,
-        depth: 0,
+        parentAgentId: origin.parentAgentId,
+        depth: origin.baseDepth + 1,
         mission: ir.mission,
         objective: interpolate(step.objective, context),
         model: step.model ?? "auto",
         harness: step.harness ?? "auto",
-        permissions: step.permissions ?? this.loaded.config.agents.defaultPermissions,
+        permissions,
         outputSchema: step.outputSchema,
         routing: step.routing,
         workspace: step.workspace ?? ir.definition.workspace,
@@ -530,6 +738,13 @@ export class WorkflowEngine {
 
 export class TriggerManager {
   private readonly jobs = new Map<string, Cron[]>();
+  /**
+   * Agent-authored schedules are retained as proposals until a trusted user
+   * or policy explicitly activates them. Keeping these out of `jobs` is
+   * intentional: `activate()` during daemon recovery must never turn a newly
+   * registered agent schedule into a privileged recurring execution.
+   */
+  private readonly pending = new Map<string, WorkflowIr>();
   private active: boolean;
 
   constructor(
@@ -540,8 +755,14 @@ export class TriggerManager {
     this.active = options.paused !== true;
   }
 
-  register(ir: WorkflowIr): void {
+  register(ir: WorkflowIr, options: { mode?: "active" | "pending" } = {}): void {
     for (const job of this.jobs.get(ir.definition.id) ?? []) job.stop();
+    this.jobs.delete(ir.definition.id);
+    this.pending.delete(ir.definition.id);
+    if (options.mode === "pending") {
+      this.pending.set(ir.definition.id, ir);
+      return;
+    }
     const registered: Cron[] = [];
     for (const trigger of ir.definition.triggers) {
       if (trigger.type !== "cron") continue;
@@ -561,6 +782,27 @@ export class TriggerManager {
       registered.push(job);
     }
     this.jobs.set(ir.definition.id, registered);
+  }
+
+  /** Number of agent-authored schedules waiting for explicit activation. */
+  pendingTriggerCount(workflowId?: string): number {
+    return workflowId === undefined ? this.pending.size : this.pending.has(workflowId) ? 1 : 0;
+  }
+
+  isPending(workflowId: string): boolean {
+    return this.pending.has(workflowId);
+  }
+
+  /**
+   * Promote one previously proposed schedule. This is deliberately a
+   * separate operation from `register()` so registration cannot be mistaken
+   * for permission to create recurring runs.
+   */
+  approve(workflowId: string): boolean {
+    const ir = this.pending.get(workflowId);
+    if (!ir) return false;
+    this.register(ir, { mode: "active" });
+    return true;
   }
 
   activeTriggerCount(workflowId?: string): number {
@@ -588,6 +830,7 @@ export class TriggerManager {
   stop(): void {
     for (const jobs of this.jobs.values()) for (const job of jobs) job.stop();
     this.jobs.clear();
+    this.pending.clear();
     this.active = false;
   }
 
@@ -650,6 +893,14 @@ export class TriggerManager {
         runId: occurrence.runId,
         workflowRevision: occurrence.workflowRevision,
         workflowHash: occurrence.workflowHash,
+        origin: {
+          kind: "cron",
+          threadId: null,
+          parentRunId: null,
+          parentAgentId: null,
+          baseDepth: -1,
+          permissionCeiling: "full-access",
+        },
       });
       const settledAt = nowIso();
       this.store.durableTransaction(() => {
@@ -724,6 +975,12 @@ function isChatContainerRun(run: WorkflowRunRecord): boolean {
   return run.id === `chat-run:${run.workflowId.slice("chat:".length)}`;
 }
 
+function stepAttemptAgentId(attempt: StepAttemptRecord): string | null {
+  if (!attempt.input || typeof attempt.input !== "object" || Array.isArray(attempt.input)) return null;
+  const agentId = (attempt.input as Record<string, JsonValue>).agentId;
+  return typeof agentId === "string" ? agentId : null;
+}
+
 function interpolate(template: string, context: ExecutionContext): string {
   return template.replace(/\{\{\s*([^}]+?)\s*\}\}/gu, (_match, path: string) => {
     const value = getPath(context as unknown as JsonValue, path);
@@ -749,7 +1006,7 @@ function getPath(root: JsonValue, rawPath: string): JsonValue | undefined {
   return current;
 }
 
-function evaluate(condition: Condition, context: ExecutionContext): boolean {
+function evaluateCondition(condition: Condition, context: ExecutionContext): boolean {
   const actual = getPath(context as unknown as JsonValue, condition.path) ?? condition.default;
   if (condition.op === "exists") return actual !== undefined && actual !== null;
   if (condition.op === "eq") return stableStringify(actual) === stableStringify(condition.value);
@@ -759,4 +1016,24 @@ function evaluate(condition: Condition, context: ExecutionContext): boolean {
   if (condition.op === "gte") return actual >= condition.value;
   if (condition.op === "lt") return actual < condition.value;
   return actual <= condition.value;
+}
+
+function evaluateStep(step: EvaluateStep, context: ExecutionContext): JsonValue {
+  const actual = getPath(context as unknown as JsonValue, step.path) ?? step.default;
+  const target = step.target ?? null;
+  const operator = step.operator ?? step.op;
+  if (!operator) throw new Error(`Evaluation step ${step.id} requires an operator.`);
+  const pass = operator === "exists"
+    ? actual !== undefined && actual !== null
+    : operator === "eq"
+      ? stableStringify(actual) === stableStringify(target)
+      : operator === "neq"
+        ? stableStringify(actual) !== stableStringify(target)
+        : typeof actual === "number" && typeof target === "number"
+          ? operator === "gt" ? actual > target
+            : operator === "gte" ? actual >= target
+              : operator === "lt" ? actual < target
+                : actual <= target
+          : false;
+  return { actual: actual ?? null, target, operator, pass };
 }

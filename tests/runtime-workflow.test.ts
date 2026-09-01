@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,11 +6,19 @@ import { loadConfig, SecretStore, writeDefaultConfig } from "../packages/config/
 import { DriverRegistry } from "../packages/drivers/src/registry.js";
 import { capabilities, emit, makeSession } from "../packages/drivers/src/common.js";
 import { AgentRecordSchema, AgentWorkOrderSchema, type AgentStatus, type DriverDoctorResult, type DriverEvent, type DriverSession, type DriverStartRequest, type ModelDescriptor, type WorkerDriver } from "../packages/protocol/src/index.js";
-import { AgentCoordinator, ModelRouter, PassiveObserver } from "../packages/runtime/src/index.js";
+import { AgentCoordinator, ModelRouter, PassiveObserver, WorkspaceGuard } from "../packages/runtime/src/index.js";
 import { createStore, type TriggerOccurrenceRecord } from "../packages/storage/src/index.js";
 import { TriggerManager, WorkflowCompiler, WorkflowEngine } from "../packages/workflow/src/index.js";
 
 const temporary: string[] = [];
+const userRunOrigin = {
+  kind: "user" as const,
+  threadId: null,
+  parentRunId: null,
+  parentAgentId: null,
+  baseDepth: -1,
+  permissionCeiling: "full-access" as const,
+};
 afterEach(() => {
   for (const path of temporary.splice(0)) rmSync(path, { recursive: true, force: true });
 });
@@ -73,6 +81,19 @@ class ReplayingNativeEventDriver extends FakeDriver {
       };
       replay();
       replay();
+    }, 2);
+    return makeSession(this.id, `native-${request.agentId}`);
+  }
+}
+
+class IdenticalUnscopedNativeEventDriver extends FakeDriver {
+  override async start(request: DriverStartRequest, onEvent: (event: DriverEvent) => void): Promise<DriverSession> {
+    setTimeout(() => {
+      // These frames intentionally have no provider/session identity. The
+      // runtime must scope its durable fallback to the receiving agent rather
+      // than letting the shared adapter hash collapse two agents together.
+      emit(onEvent, "usage.recorded", { costAmount: 0.5, basis: "provider-reported" });
+      emit(onEvent, "run.failed", { error: "identical native failure" });
     }, 2);
     return makeSession(this.id, `native-${request.agentId}`);
   }
@@ -319,7 +340,7 @@ function seedRecoverableAgent(
     status,
     nativeSessionId: agentId === "durable-agent" ? "native-durable-agent" : `native-${agentId}`,
     nativeRunId: agentId === "durable-agent" ? "native-durable-run" : `native-run-${agentId}`,
-    workspacePath: root,
+    workspacePath: realpathSync.native(root),
     output: null,
     error: null,
     createdAt: now,
@@ -394,6 +415,7 @@ describe("agent graph and workflow execution", () => {
       updatedAt: now,
       finishedAt: null,
       cancelRequested: false,
+      origin: userRunOrigin,
     });
     engine.register(compiler.compile(definition("v2"), 2));
 
@@ -464,6 +486,7 @@ describe("agent graph and workflow execution", () => {
       updatedAt: now,
       finishedAt: null,
       cancelRequested: false,
+      origin: userRunOrigin,
     });
 
     const recoveryResult = await Promise.race([
@@ -546,6 +569,16 @@ describe("agent graph and workflow execution", () => {
     });
     expect(store.listStepAttempts(run.id)).toEqual([
       expect.objectContaining({ status: "failed", error: expect.stringContaining("ended with interrupted") }),
+    ]);
+    expect(store.recentEvents({ runId: run.id, types: ["workflow.step.failed"], limit: 10 })).toEqual([
+      expect.objectContaining({
+        payload: expect.objectContaining({
+          stepId: "work",
+          stepType: "agent",
+          agentId: agent!.id,
+          error: expect.stringContaining("ended with interrupted"),
+        }),
+      }),
     ]);
     expect(store.recentEvents({ runId: run.id, types: ["workflow.run.failed"], limit: 10 })).toHaveLength(1);
     expect(store.recentEvents({ agentId: agent!.id, types: ["driver.run.failed", "driver.run.cancelled", "driver.run.completed"], limit: 10 })).toHaveLength(0);
@@ -654,6 +687,7 @@ describe("agent graph and workflow execution", () => {
       updatedAt: now,
       finishedAt: null,
       cancelRequested: false,
+      origin: userRunOrigin,
     });
 
     await engine.recover();
@@ -974,6 +1008,14 @@ describe("agent graph and workflow execution", () => {
         updatedAt: startedAt,
         finishedAt: null,
         cancelRequested: false,
+        origin: {
+          kind: "cron",
+          threadId: null,
+          parentRunId: null,
+          parentAgentId: null,
+          baseDepth: -1,
+          permissionCeiling: "full-access",
+        },
       });
       store.appendEvent({
         type: "workflow.run.started",
@@ -1051,6 +1093,106 @@ describe("agent graph and workflow execution", () => {
       .toThrow("Workflow run shared-run-id belongs to workflow-a, not workflow-b.");
     expect(store.getRun("shared-run-id")).toMatchObject({ workflowId: "workflow-a", workflowRevision: 1 });
     store.close();
+  });
+
+  it("preserves immutable run authority and applies it to workflow-created agents", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-workflow-run-origin-"));
+    temporary.push(root);
+    writeDefaultConfig(root);
+    const loaded = loadConfig({ rootDirectory: root });
+    loaded.config.router.provider = "neutral-lexical";
+    loaded.config.observer.provider = "deterministic";
+    const store = createStore(loaded.dataDirectory);
+    const drivers = new DriverRegistry();
+    drivers.register(new FakeDriver());
+    const secrets = new SecretStore("dev.symphony.tests");
+    const coordinator = new AgentCoordinator(
+      loaded,
+      store,
+      drivers,
+      new ModelRouter(loaded, secrets, drivers, store),
+      new PassiveObserver(loaded, secrets, store),
+    );
+    const engine = new WorkflowEngine(loaded, store, coordinator);
+    const ir = new WorkflowCompiler().compile({
+      id: "origin-authority",
+      name: "Origin authority",
+      mission: { statement: "Preserve delegated authority across a dynamic workflow.", keyResults: [] },
+      workspace: { path: root, dirtyPolicy: "local-only" },
+      output: "steps.work",
+      steps: [{
+        id: "work",
+        type: "agent",
+        objective: "Complete the delegated work without exceeding inherited authority.",
+        harness: "codex",
+        model: "fixture",
+        permissions: "full-access",
+        outputSchema: {
+          type: "object",
+          properties: { changed: { type: "boolean" } },
+          required: ["changed"],
+          additionalProperties: false,
+        },
+      }],
+    }, 1);
+    engine.register(ir);
+    const now = new Date().toISOString();
+    store.saveAgent(AgentRecordSchema.parse({
+      id: "origin-parent",
+      logicalAgentId: "origin-parent-logical",
+      workflowId: "chat:origin-thread",
+      runId: "chat-run:origin-thread",
+      parentAgentId: null,
+      depth: 1,
+      objective: "Delegate a bounded dynamic workflow.",
+      missionHash: "12345678",
+      requestedHarness: "codex",
+      requestedModel: "fixture",
+      harness: "codex",
+      model: "fixture",
+      permissions: "read-only",
+      status: "completed",
+      nativeSessionId: "native-origin-parent",
+      nativeRunId: "native-run-origin-parent",
+      workspacePath: root,
+      output: {},
+      error: null,
+      createdAt: now,
+      updatedAt: now,
+      startedAt: now,
+      finishedAt: now,
+    }));
+    const origin = {
+      kind: "agent" as const,
+      threadId: "origin-thread",
+      parentRunId: "chat-run:origin-thread",
+      parentAgentId: "origin-parent",
+      baseDepth: 1,
+      permissionCeiling: "read-only" as const,
+    };
+
+    const run = await engine.run(ir.definition.id, {}, { runId: "origin-authority-run", origin });
+
+    expect(run).toMatchObject({ status: "completed", origin });
+    expect(coordinator.list({ runId: run.id })).toEqual([
+      expect.objectContaining({
+        parentAgentId: "origin-parent",
+        depth: 2,
+        permissions: "read-only",
+      }),
+    ]);
+    expect(store.recentEvents({ runId: run.id, types: ["workflow.step.started"], limit: 10 })).toHaveLength(1);
+    expect(store.recentEvents({ runId: run.id, types: ["workflow.step.completed"], limit: 10 })).toHaveLength(1);
+    expect(engine.start(ir.definition.id, {}, { runId: run.id, origin })).toMatchObject({ origin });
+    expect(() => engine.start(ir.definition.id, {}, {
+      runId: run.id,
+      origin: { ...origin, parentAgentId: "different-parent" },
+    })).toThrow("already bound to a different authority origin");
+    store.close();
+
+    const reopened = createStore(loaded.dataDirectory);
+    expect(reopened.getRun(run.id)).toMatchObject({ origin });
+    reopened.close();
   });
 
   it("attributes OpenRouter observer usage to the observed agent and global totals", async () => {
@@ -1222,6 +1364,50 @@ describe("agent graph and workflow execution", () => {
       unknownEvents: 0,
       eventCount: 1,
     });
+    store.close();
+  });
+
+  it("scopes identical unscoped terminal and usage frames per agent", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-unscoped-native-event-scope-"));
+    temporary.push(root);
+    writeDefaultConfig(root);
+    const loaded = loadConfig({ rootDirectory: root });
+    loaded.config.router.provider = "neutral-lexical";
+    loaded.config.observer.provider = "deterministic";
+    const store = createStore(loaded.dataDirectory);
+    const drivers = new DriverRegistry();
+    drivers.register(new IdenticalUnscopedNativeEventDriver());
+    const secrets = new SecretStore("dev.symphony.tests");
+    const coordinator = new AgentCoordinator(
+      loaded,
+      store,
+      drivers,
+      new ModelRouter(loaded, secrets, drivers, store),
+      new PassiveObserver(loaded, secrets, store),
+    );
+    const makeOrder = (id: string) => ({
+      workflowId: `unscoped-${id}`,
+      runId: `unscoped-run-${id}`,
+      parentAgentId: null,
+      depth: 0,
+      mission: { id: `unscoped-${id}`, revision: 1, hash: "12345678", statement: "Keep native identities agent-scoped.", keyResults: [] },
+      objective: "Report the identical native failure.",
+      harness: "codex" as const,
+      model: "fixture",
+      outputSchema: {},
+      workspace: { path: root },
+    });
+    const first = await coordinator.create(makeOrder("one"));
+    const second = await coordinator.create(makeOrder("two"));
+    await expect.poll(() => coordinator.get(first.id).status).toBe("failed");
+    await expect.poll(() => coordinator.get(second.id).status).toBe("failed");
+    for (const agent of [first, second]) {
+      expect(store.recentEvents({ agentId: agent.id, types: ["driver.usage.recorded"], limit: 10 })).toHaveLength(1);
+      expect(store.recentEvents({ agentId: agent.id, types: ["driver.run.failed"], limit: 10 })).toHaveLength(1);
+      expect(store.aggregateCost({ agentId: agent.id })).toMatchObject({ knownTotal: 0.5, eventCount: 1 });
+    }
+    expect(store.listUsage({ runId: "unscoped-run-one" })).toHaveLength(1);
+    expect(store.listUsage({ runId: "unscoped-run-two" })).toHaveLength(1);
     store.close();
   });
 
@@ -1443,6 +1629,123 @@ describe("agent graph and workflow execution", () => {
     await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
     expect(driver.startCount).toBe(1);
     store.close();
+  });
+
+  it("settles a persisted queued cancellation after a daemon restart", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-cancel-restart-"));
+    temporary.push(root);
+    writeDefaultConfig(root);
+    const loaded = loadConfig({ rootDirectory: root });
+    loaded.config.agents.maxConcurrent = 1;
+    loaded.config.router.provider = "neutral-lexical";
+    loaded.config.observer.provider = "deterministic";
+    const store = createStore(loaded.dataDirectory);
+    const driver = new RecoveryDriver("running");
+    const drivers = new DriverRegistry();
+    drivers.register(driver);
+    const secrets = new SecretStore("dev.symphony.cancel-restart-tests");
+    const makeCoordinator = () => new AgentCoordinator(
+      loaded,
+      store,
+      drivers,
+      new ModelRouter(loaded, secrets, drivers, store),
+      new PassiveObserver(loaded, secrets, store),
+    );
+    const coordinator = makeCoordinator();
+    const active = await coordinator.create(testWorkOrder(root, "cancel-restart-active"));
+    await vi.waitFor(() => expect(coordinator.get(active.id).status).toBe("running"));
+    const queued = await coordinator.create(testWorkOrder(root, "cancel-restart-queued"));
+    expect(coordinator.get(queued.id).status).toBe("queued");
+
+    // This is the durable state observed if the daemon stops after writing
+    // cancel-requested but before its in-memory queue splice completes. Keep
+    // the old coordinator alive so the test also proves a stale queue entry
+    // cannot launch after the restarted coordinator settles the record.
+    store.saveAgent({ ...queued, status: "cancel-requested" });
+    const restarted = makeCoordinator();
+    await restarted.recover();
+
+    expect(restarted.get(queued.id)).toMatchObject({
+      status: "cancelled",
+      nativeSessionId: null,
+      nativeRunId: null,
+      error: null,
+    });
+    expect(store.recentEvents({ agentId: queued.id, limit: 10 })).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        type: "agent.cancelled",
+        payload: expect.objectContaining({ continuity: "cancelled-before-native-session" }),
+      }),
+      expect.objectContaining({
+        type: "agent.recovered",
+        payload: expect.objectContaining({ continuity: "cancellation-settled-before-native-session" }),
+      }),
+    ]));
+
+    driver.complete(active.id);
+    await vi.waitFor(() => expect(coordinator.get(active.id).status).toBe("completed"));
+    await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 10));
+    expect(driver.startCount).toBe(1);
+    store.close();
+  });
+
+  it("refuses a native launch when a workspace symlink changes after admission", async () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-workspace-symlink-race-"));
+    temporary.push(root);
+    const admitted = join(root, "admitted");
+    const replacement = join(root, "replacement");
+    const alias = join(root, "workspace-alias");
+    mkdirSync(admitted);
+    mkdirSync(replacement);
+    symlinkSync(admitted, alias, "dir");
+    writeDefaultConfig(root);
+    const loaded = loadConfig({ rootDirectory: root });
+    loaded.config.agents.maxConcurrent = 1;
+    loaded.config.router.provider = "neutral-lexical";
+    loaded.config.observer.provider = "deterministic";
+    const store = createStore(loaded.dataDirectory);
+    const driver = new RecoveryDriver("running");
+    const drivers = new DriverRegistry();
+    drivers.register(driver);
+    const secrets = new SecretStore("dev.symphony.workspace-symlink-tests");
+    const coordinator = new AgentCoordinator(
+      loaded,
+      store,
+      drivers,
+      new ModelRouter(loaded, secrets, drivers, store),
+      new PassiveObserver(loaded, secrets, store),
+    );
+    const active = await coordinator.create(testWorkOrder(root, "workspace-race-active"));
+    await vi.waitFor(() => expect(coordinator.get(active.id).status).toBe("running"));
+    const queuedOrder = AgentWorkOrderSchema.parse({
+      ...testWorkOrder(root, "workspace-race-queued"),
+      workspace: { path: alias, dirtyPolicy: "local-only" },
+    });
+    const queued = await coordinator.create(queuedOrder);
+    expect(coordinator.get(queued.id).status).toBe("queued");
+
+    // Change the alias while the work is durably admitted but still waiting
+    // for a scheduler slot. The pre-launch realpath check must fail closed.
+    rmSync(alias);
+    symlinkSync(replacement, alias, "dir");
+    driver.complete(active.id);
+
+    await vi.waitFor(() => expect(coordinator.get(queued.id).status).toBe("failed"));
+    expect(coordinator.get(queued.id).error).toContain("Workspace changed after admission");
+    expect(driver.startCount).toBe(1);
+    store.close();
+  });
+
+  it("accepts a legacy workspace alias when it still resolves to the granted target", () => {
+    const root = mkdtempSync(join(tmpdir(), "symphony-workspace-alias-"));
+    temporary.push(root);
+    const guard = new WorkspaceGuard();
+    const canonical = realpathSync.native(root);
+
+    // Historical records may contain the lexical path (for example macOS's
+    // /var alias) while new records persist the canonical target.
+    expect(guard.verifyLaunch(root, canonical)).toBe(canonical);
+    expect(guard.verifyLaunch(canonical, root)).toBe(canonical);
   });
 
   it("cancels routing work before the native harness can start", async () => {

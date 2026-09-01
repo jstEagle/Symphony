@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { rankFuzzyMatches } from "../apps/web/src/lib/symphony/palette-search.js";
+import { studioModeForCommand } from "../apps/web/src/components/symphony/command-palette.js";
+import { rankFuzzyMatches, rankPaletteActions } from "../apps/web/src/lib/symphony/palette-search.js";
 import {
   currentConversationOrder,
   moveIdBefore,
@@ -40,6 +41,21 @@ describe("command palette local fallback", () => {
       { id: "two", text: "Theme settings" },
     ];
     expect(rankFuzzyMatches(chats, "dwr", (item) => item.text).map((item) => item.id)).toEqual(["one"]);
+  });
+
+  it("ranks available operator actions and never exposes permission-denied actions", () => {
+    const actions = [
+      { id: "trace", label: "Open Trace", detail: "Inspect event evidence" },
+      { id: "diagnostics", label: "Open diagnostics", detail: "Inspect daemon health" },
+      { id: "admin", label: "Reset daemon", detail: "Requires full access", available: false },
+    ];
+    expect(rankPaletteActions(actions, "diag").map((action) => action.id)).toEqual(["diagnostics"]);
+    expect(rankPaletteActions(actions, "").map((action) => action.id)).toEqual(["trace", "diagnostics"]);
+  });
+
+  it("deep-links the capability command into Studio capabilities without changing generic Studio navigation", () => {
+    expect(studioModeForCommand("capabilities")).toBe("capabilities");
+    expect(studioModeForCommand("studio")).toBeUndefined();
   });
 });
 

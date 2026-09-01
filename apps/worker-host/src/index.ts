@@ -20,6 +20,14 @@ import { createConnection, createServer, type Server, type Socket } from "node:n
 import { dirname } from "node:path";
 import { Readable, Writable } from "node:stream";
 import { pathToFileURL } from "node:url";
+import {
+  normalizeWorkerEvent,
+  projectWorkerEventPayload,
+  type WorkerEventContext,
+  type WorkerEventEnvelope,
+} from "@symphony/protocol";
+
+export type WorkerHostEventContext = WorkerEventContext;
 
 export type WorkerHostBootstrap = {
   version: 1;
@@ -32,6 +40,8 @@ export type WorkerHostBootstrap = {
   spoolPath: string;
   maxSpoolBytes: number;
   maxSpoolFrames: number;
+  /** Optional durable-recovery grace supplied by the controlling daemon. */
+  controllerGraceMs?: number;
   command: string;
   args: string[];
   cwd: string | null;
@@ -47,6 +57,50 @@ export type WorkerHostFrame = {
   payload: Record<string, unknown>;
   occurredAt: string;
 };
+
+/**
+ * Translate one durable host frame without parsing or changing native stdout.
+ * The native line remains in raw provenance; drivers can continue to apply
+ * their own protocol semantics on top of the frame.
+ */
+export function normalizeWorkerHostFrame(
+  frame: WorkerHostFrame,
+  context: WorkerHostEventContext,
+): WorkerEventEnvelope {
+  const kind = frame.stream === "stdout"
+    ? "worker-host.stdout"
+    : frame.stream === "stderr"
+      ? "worker-host.stderr"
+      : frame.stream === "exit"
+        ? "worker-host.exit"
+        : "worker-host.control";
+  const controlType = typeof frame.payload.type === "string" ? frame.payload.type : null;
+  const eventClass = frame.stream === "exit"
+    ? (frame.payload.code === 0 && frame.payload.signal === null ? "lifecycle" : "error")
+    : frame.stream === "control" && controlType === "spool-overflow"
+      ? "error"
+      : frame.stream === "stderr"
+        ? "error"
+        : undefined;
+  return normalizeWorkerEvent({
+    source: "worker-host",
+    stream: frame.stream,
+    kind,
+    payload: frame.payload,
+    cursor: frame.seq,
+    timestamp: frame.occurredAt,
+    ...(eventClass ? { eventClass } : {}),
+    replayKey: `worker-host:${context.leaseId ?? "unleased"}:${frame.seq}`,
+    context,
+    rawProvenance: {
+      source: "worker-host",
+      stream: frame.stream,
+      kind,
+      cursor: frame.seq,
+      payload: frame.payload,
+    },
+  });
+}
 
 type CommandResult = {
   type: "command.result";
@@ -66,6 +120,17 @@ type ControllerState = { socket: Socket; ownerId: string; ownerEpoch: number };
 
 const MAX_CONTROL_LINE_BYTES = 1024 * 1024;
 const DAEMON_SECRET_ENVIRONMENT_VARIABLE = "SYMPHONY_DAEMON_SECRET";
+// A detached worker host must not retain a privileged native worker forever
+// after its controller disappears. Keep this aligned with the driver's
+// reconnect window; a successor that arrives in time clears the timer.
+const CONTROLLER_GRACE_MS = 5_000;
+
+function controllerGraceMs(bootstrap: WorkerHostBootstrap): number {
+  const configured = bootstrap.controllerGraceMs;
+  return typeof configured === "number" && Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : CONTROLLER_GRACE_MS;
+}
 
 function environmentWithoutDaemonSecret(environment: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const childEnvironment = { ...environment };
@@ -155,6 +220,7 @@ export class WorkerHost {
   private stdoutBuffer = "";
   private stderrBuffer = "";
   private closing = false;
+  private controllerGraceTimer: NodeJS.Timeout | null = null;
 
   constructor(readonly bootstrap: WorkerHostBootstrap) {
     this.ownerId = bootstrap.ownerId;
@@ -186,6 +252,7 @@ export class WorkerHost {
   async close(terminateWorker = true): Promise<void> {
     if (this.closing) return;
     this.closing = true;
+    this.clearControllerGraceTimer();
     if (terminateWorker && this.child && this.child.exitCode === null && this.child.signalCode === null) {
       this.signalWorker("SIGTERM");
       await new Promise<void>((resolve) => {
@@ -281,6 +348,27 @@ export class WorkerHost {
     return Boolean(this.nativeWorkerPid && this.child && this.child.exitCode === null && this.child.signalCode === null);
   }
 
+  private clearControllerGraceTimer(): void {
+    if (!this.controllerGraceTimer) return;
+    clearTimeout(this.controllerGraceTimer);
+    this.controllerGraceTimer = null;
+  }
+
+  private armControllerGraceTimer(): void {
+    this.clearControllerGraceTimer();
+    if (this.closing || this.controller) return;
+    const timer = setTimeout(() => {
+      this.controllerGraceTimer = null;
+      if (this.closing || this.controller) return;
+      // There is no authenticated authority left to issue a signal. The host
+      // therefore owns the final retirement decision and terminates its
+      // process group after the same bounded grace used by controller retry.
+      void this.close(true).then(() => process.exit(0), () => process.exit(1));
+    }, controllerGraceMs(this.bootstrap));
+    timer.unref();
+    this.controllerGraceTimer = timer;
+  }
+
   private consumeWorkerOutput(stream: "stdout" | "stderr", chunk: string): void {
     if (this.spoolState === "overflow") return;
     const key = stream === "stdout" ? "stdoutBuffer" : "stderrBuffer";
@@ -362,6 +450,7 @@ export class WorkerHost {
     const release = () => {
       if (this.controller?.socket === socket) {
         this.controller = null;
+        this.armControllerGraceTimer();
         for (const wake of this.acknowledgementWaiters) wake();
       }
     };
@@ -402,6 +491,7 @@ export class WorkerHost {
     // Permit that proven successor to fence an old socket immediately instead
     // of waiting for the kernel to deliver the dead daemon's close event.
     if (replacesStaleController) activeController?.socket.destroy();
+    this.clearControllerGraceTimer();
     this.ownerId = ownerId;
     this.ownerEpoch = ownerEpoch;
     this.controller = { socket, ownerId, ownerEpoch };
@@ -525,7 +615,13 @@ export class WorkerHost {
 
   private appendFrame(stream: WorkerHostFrame["stream"], payload: Record<string, unknown>, terminal = false): void {
     if (this.closing && !terminal) return;
-    const frame: WorkerHostFrame = { seq: this.sequence + 1, stream, payload, occurredAt: new Date().toISOString() };
+    // The native line is transient; the spool is durable across controller
+    // reconnects and therefore receives only the bounded/redacted projection.
+    const persistedPayload = projectWorkerEventPayload(payload);
+    const framePayload = persistedPayload !== null && typeof persistedPayload === "object" && !Array.isArray(persistedPayload)
+      ? persistedPayload as Record<string, unknown>
+      : { value: persistedPayload };
+    const frame: WorkerHostFrame = { seq: this.sequence + 1, stream, payload: framePayload, occurredAt: new Date().toISOString() };
     const line = jsonLine(frame);
     const bytes = Buffer.byteLength(line);
     if (!terminal && this.spoolState === "healthy" && (this.frames.length + 1 > this.bootstrap.maxSpoolFrames || this.spoolBytes + bytes > this.bootstrap.maxSpoolBytes)) {

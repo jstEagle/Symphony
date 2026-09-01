@@ -120,6 +120,38 @@
   background-size: 22px 22px;
 }
 
+/* Graph-specific hooks keep the interaction surface inspectable without
+   coupling the graph to utility-class implementation details. */
+.symphony-graph-viewport:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--ring) 72%, transparent);
+  outline-offset: -2px;
+}
+.symphony-graph-node {
+  will-change: transform;
+}
+.symphony-graph-status[data-state="queued"],
+.symphony-graph-status[data-state="running"] {
+  background-color: var(--info);
+}
+.symphony-graph-status[data-state="waiting"],
+.symphony-graph-status[data-state="blocked"],
+.symphony-graph-status[data-state="cancelled"],
+.symphony-graph-status[data-state="stale"] {
+  background-color: var(--warning);
+}
+.symphony-graph-status[data-state="succeeded"] {
+  background-color: var(--success);
+}
+.symphony-graph-status[data-state="failed"] {
+  background-color: var(--destructive);
+}
+.symphony-graph-edge--dependency {
+  stroke-dasharray: 5 5;
+}
+.symphony-graph-help {
+  max-width: min(32rem, calc(100% - 1.5rem));
+}
+
 @custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
 
 @custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));
@@ -796,4 +828,63 @@
   [data-aui="badge"][data-aui-variant="danger"] {
     background-color: color-mix(in oklab, var(--destructive) 15%, transparent);
     color: var(--destructive);
+}
+
+/* Objective operator controls stay quiet until interacted with, preserving
+   the runline's signal-to-noise ratio on dense long-running sessions. */
+.operator-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  height: 1.75rem;
+  border: 1px solid color-mix(in oklab, var(--border) 65%, transparent);
+  border-radius: 0.5rem;
+  padding: 0 0.625rem;
+  background: color-mix(in oklab, var(--card) 40%, transparent);
+  color: color-mix(in oklab, var(--foreground) 72%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.5625rem;
+  transition: background-color 150ms ease-out, color 150ms ease-out, border-color 150ms ease-out;
+}
+.operator-button:hover:not(:disabled) {
+  border-color: color-mix(in oklab, var(--foreground) 24%, transparent);
+  background: color-mix(in oklab, var(--muted) 45%, transparent);
+  color: var(--foreground);
+}
+.operator-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.operator-button:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.operator-input {
+  height: 1.75rem;
+  border: 1px solid color-mix(in oklab, var(--border) 60%, transparent);
+  border-radius: 0.5rem;
+  background: color-mix(in oklab, var(--card) 30%, transparent);
+  color: color-mix(in oklab, var(--foreground) 86%, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.625rem;
+  outline: none;
+  transition: border-color 150ms ease-out, background-color 150ms ease-out;
+}
+.operator-input::placeholder {
+  color: color-mix(in oklab, var(--muted-foreground) 72%, transparent);
+}
+.operator-input:focus {
+  border-color: color-mix(in oklab, var(--ring) 70%, transparent);
+  background: color-mix(in oklab, var(--card) 48%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--ring) 18%, transparent);
+}
+.operator-runline {
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in oklab, var(--muted-foreground) 35%, transparent) transparent;
+}
+@media (prefers-reduced-motion: reduce) {
+  .operator-button,
+  .operator-input {
+    transition: none;
+  }
 }

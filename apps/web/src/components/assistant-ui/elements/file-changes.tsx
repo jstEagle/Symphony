@@ -9,7 +9,7 @@ export type FileChange = {
   kind?: string;
 };
 
-export function FileChanges({ files, additions, deletions }: { files: FileChange[]; additions?: number; deletions?: number }) {
+export function FileChanges({ files, additions, deletions, onFileSelect }: { files: FileChange[]; additions?: number; deletions?: number; onFileSelect?: (file: FileChange) => void }) {
   const groups = groupFiles(files);
   const totalAdditions = additions ?? files.reduce((sum, file) => sum + (file.additions ?? 0), 0);
   const totalDeletions = deletions ?? files.reduce((sum, file) => sum + (file.deletions ?? 0), 0);
@@ -29,13 +29,14 @@ export function FileChanges({ files, additions, deletions }: { files: FileChange
                 <span className="min-w-0 flex-1 truncate font-mono">{group.directory}</span>
               </div>
             ) : null}
-            {group.files.map((file) => (
-              <div key={file.path} className={`flex h-8 items-center gap-2 rounded-md px-2 text-[11px] hover:bg-muted/40 ${group.directory ? "pl-9" : "pl-3"}`} title={file.path}>
+            {group.files.map((file) => {
+              const content = <>
                 <File className="size-3.5 shrink-0 text-muted-foreground" />
                 <span className="min-w-0 flex-1 truncate font-mono text-foreground/90">{basename(file.path)}</span>
                 <ChangeCount additions={file.additions ?? 0} deletions={file.deletions ?? 0} />
-              </div>
-            ))}
+              </>;
+              return onFileSelect ? <button key={file.path} type="button" onClick={() => onFileSelect(file)} className={`flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-[11px] hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 ${group.directory ? "pl-9" : "pl-3"}`} title={`Preview ${file.path}`}>{content}</button> : <div key={file.path} className={`flex h-8 items-center gap-2 rounded-md px-2 text-[11px] hover:bg-muted/40 ${group.directory ? "pl-9" : "pl-3"}`} title={file.path}>{content}</div>;
+            })}
           </div>
         ))}
       </div>

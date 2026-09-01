@@ -12,7 +12,7 @@ import { pathToFileURL } from "node:url";
 import { createInterface } from "node:readline";
 
 type JsonObject = Record<string, unknown>;
-type PromptRequest = { id: string | number; prompt: string };
+type PromptRequest = { id: string | number; prompt: string; requestId: string; contentHash: string };
 type ResultFence = {
   generation: number;
   terminal: boolean;
@@ -63,6 +63,7 @@ type ActiveQuery = {
   resolveCompletion: () => void;
   cancelRequested: boolean;
   turnGeneration: number;
+  currentRequest: { requestId: string; contentHash: string } | null;
   resultFence: ResultFence | null;
 };
 
@@ -147,7 +148,12 @@ function protocolProtection(value: unknown): JsonProtection {
   markFields(protection.valueFields, envelope, ["id", "jsonrpc", "method"]);
   if (envelope.result && typeof envelope.result === "object" && !Array.isArray(envelope.result)) {
     markFields(protection.keyFields, envelope.result, Object.keys(envelope.result));
-    markFields(protection.valueFields, envelope.result, ["sessionId"]);
+    // Durable dispatch identity is protocol metadata, not user/provider
+    // content. Preserve it verbatim through the host's credential scrubber so
+    // the controller can prove native acceptance after a crash. In particular,
+    // a one-character credential such as `p` must not turn `symphony:...` into
+    // a different request id on the way back to the driver.
+    markFields(protection.valueFields, envelope.result, ["contentHash", "requestId", "sessionId"]);
   }
   if (envelope.error && typeof envelope.error === "object" && !Array.isArray(envelope.error)) {
     markFields(protection.keyFields, envelope.error, ["code", "data", "message"]);
@@ -177,6 +183,10 @@ function protocolProtection(value: unknown): JsonProtection {
     "permission_denials",
     "plugins",
     "request_id",
+    "requestId",
+    "contentHash",
+    "__symphonyMessageRequestId",
+    "__symphonyMessageContentHash",
     "result",
     "session_id",
     "skills",
@@ -194,8 +204,12 @@ function protocolProtection(value: unknown): JsonProtection {
     "uuid",
   ]);
   markFields(protection.valueFields, params, [
+    "__symphonyMessageContentHash",
+    "__symphonyMessageRequestId",
+    "contentHash",
     "parent_tool_use_id",
     "request_id",
+    "requestId",
     "session_id",
     "subtype",
     "tool_use_id",
@@ -347,7 +361,10 @@ export class ClaudeSdkHost {
         const prompt = string(params.prompt);
         if (!prompt) throw new Error("Claude SDK host start requires a prompt.");
         this.options = this.sdkOptions(object(params.options) as Options);
-        const accepted = await this.startQuery(prompt);
+        const accepted = await this.startQuery(prompt, {
+          requestId: string(params.requestId) ?? `claude:initial:${String(id)}`,
+          contentHash: string(params.contentHash) ?? "",
+        });
         response(id, { sessionId: accepted, queued: false });
         return;
       }
@@ -363,9 +380,13 @@ export class ClaudeSdkHost {
       if (method === "session/prompt") {
         const prompt = string(params.prompt);
         if (!prompt || !this.options || !this.sessionId) throw new Error("Claude SDK host session is not initialized.");
+        const request = {
+          requestId: string(params.requestId) ?? `claude:prompt:${String(id)}`,
+          contentHash: string(params.contentHash) ?? "",
+        };
         if (!this.active) {
-          const accepted = await this.startQuery(prompt);
-          response(id, { sessionId: accepted, queued: false });
+          const accepted = await this.startQuery(prompt, request);
+          response(id, { sessionId: accepted, queued: false, requestId: request.requestId, contentHash: request.contentHash });
           return;
         }
         if (this.active.cancelRequested) throw new Error("Claude SDK host session is being cancelled.");
@@ -380,17 +401,17 @@ export class ClaudeSdkHost {
           return;
         }
         if (fence) {
-          this.active.queued.push({ id, prompt });
-          response(id, { sessionId: this.sessionId, queued: true });
+          this.active.queued.push({ id, prompt, ...request });
+          response(id, { sessionId: this.sessionId, queued: true, requestId: request.requestId, contentHash: request.contentHash });
           return;
         }
         if (this.active.turnActive) {
-          this.active.queued.push({ id, prompt });
-          response(id, { sessionId: this.sessionId, queued: true });
+          this.active.queued.push({ id, prompt, ...request });
+          response(id, { sessionId: this.sessionId, queued: true, requestId: request.requestId, contentHash: request.contentHash });
           return;
         }
-        this.dispatch(this.active, prompt);
-        response(id, { sessionId: this.sessionId, queued: false });
+        this.dispatch(this.active, prompt, request);
+        response(id, { sessionId: this.sessionId, queued: false, requestId: request.requestId, contentHash: request.contentHash });
         return;
       }
       if (method === "session/cancel") {
@@ -443,7 +464,7 @@ export class ClaudeSdkHost {
         fence.acknowledge();
         if (!fence.terminal && !active.cancelRequested) {
           const next = active.queued.shift();
-          if (next) this.dispatch(active, next.prompt);
+          if (next) this.dispatch(active, next.prompt, next);
         }
         response(id, { sessionId: this.sessionId, generation, acknowledged: true });
         return;
@@ -475,7 +496,7 @@ export class ClaudeSdkHost {
     this.nativeStderr?.end();
   }
 
-  private startQuery(prompt: string): Promise<string> {
+  private startQuery(prompt: string, request: { requestId: string; contentHash: string }): Promise<string> {
     if (!this.options) return Promise.reject(new Error("Claude SDK host options are unavailable."));
     if (this.active) return Promise.reject(new Error("Claude SDK host query is already running."));
     let resolveAcceptance!: (sessionId: string) => void;
@@ -504,19 +525,21 @@ export class ClaudeSdkHost {
       resolveCompletion,
       cancelRequested: false,
       turnGeneration: 0,
+      currentRequest: null,
       resultFence: null,
     };
     this.active = active;
-    this.dispatch(active, prompt);
+    this.dispatch(active, prompt, request);
     void this.consume(active);
     return acceptance;
   }
 
-  private dispatch(active: ActiveQuery, prompt: string): void {
+  private dispatch(active: ActiveQuery, prompt: string, request: { requestId: string; contentHash: string }): void {
     if (active.turnActive) throw new Error("Claude SDK host cannot dispatch concurrent turns.");
     if (active.resultFence) throw new Error("Claude SDK host cannot dispatch before the previous result is acknowledged.");
     active.turnActive = true;
     active.turnGeneration += 1;
+    active.currentRequest = request;
     active.mailbox.push({
       type: "user",
       message: { role: "user", content: prompt },
@@ -564,6 +587,8 @@ export class ClaudeSdkHost {
             ...message,
             __symphonyQueuedPrompts: queuedPrompts,
             __symphonyTurnGeneration: active.turnGeneration,
+            __symphonyMessageRequestId: active.currentRequest?.requestId ?? null,
+            __symphonyMessageContentHash: active.currentRequest?.contentHash ?? null,
           },
         });
       }

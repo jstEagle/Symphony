@@ -12,6 +12,9 @@ import {
 } from "@symphony/config";
 import { startDaemon, SymphonyDaemon } from "@symphony/daemon";
 import { parseSecretInputSource, readSecretInput, SECRET_SET_USAGE } from "./secret-input.js";
+import { CliClient } from "./client.js";
+import { ObjectiveClient, runObjectiveCommand } from "./objective-cli.js";
+import { OperatorClient, operatorHelp, runOperatorCommand } from "./operator-cli.js";
 
 const args = process.argv.slice(2);
 while (args[0] === "--") args.shift();
@@ -19,11 +22,11 @@ const command = args[0] && !args[0].startsWith("-") ? args.shift() as string : "
 
 async function request(path: string, options: RequestInit = {}): Promise<unknown> {
   const loaded = loadConfig();
-  const url = `http://${loaded.config.server.host}:${loaded.config.server.port}${path}`;
-  const response = await fetch(url, { ...options, headers: { "content-type": "application/json", ...options.headers } });
-  const text = await response.text();
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}: ${text}`);
-  return text ? JSON.parse(text) as unknown : null;
+  // Legacy read commands still pass RequestInit for compatibility with this
+  // small dispatcher; mutations below use CliClient.mutate so their retry key
+  // and unknown outcome handling are centralized.
+  if (options.method && options.method !== "GET") throw new Error("Mutations must use the CLI client.");
+  return new CliClient({ config: loaded }).get(path, options.signal ?? undefined);
 }
 
 function print(value: unknown): void {
@@ -33,6 +36,28 @@ function print(value: unknown): void {
 function option(name: string): string | undefined {
   const index = args.indexOf(name);
   return index >= 0 ? args[index + 1] : undefined;
+}
+
+function mutationKey(prefix: string): string {
+  const explicit = option("--idempotency-key") ?? option("--key");
+  if (explicit) return explicit;
+  if (args.includes("--idempotency-key") || args.includes("--key")) {
+    throw new Error("--idempotency-key requires a value.");
+  }
+  return `cli:${prefix}:${randomUUID()}`;
+}
+
+function withoutMutationKey(values: readonly string[]): string[] {
+  const positional: string[] = [];
+  for (let index = 0; index < values.length; index += 1) {
+    const value = values[index];
+    if (value === "--idempotency-key" || value === "--key") {
+      index += 1;
+      continue;
+    }
+    positional.push(value as string);
+  }
+  return positional;
 }
 
 async function main(): Promise<void> {
@@ -80,6 +105,20 @@ async function main(): Promise<void> {
     return;
   }
   if (command === "status") return print(await request("/health"));
+  if (command === "objective") {
+    const configPath = option("--config");
+    const loaded = loadConfig(configPath ? { configPath } : {});
+    return runObjectiveCommand(args, new ObjectiveClient({ config: loaded }));
+  }
+  if (command === "capability" || command === "capabilities" || command === "messages" || command === "agent-messages" || command === "diagnostics" || command === "session") {
+    const configPath = option("--config");
+    const loaded = loadConfig(configPath ? { configPath } : {});
+    if ((command === "diagnostics" || command === "session") && args[0] === "help") {
+      print(operatorHelp());
+      return;
+    }
+    return runOperatorCommand([command, ...args], new OperatorClient({ config: loaded }));
+  }
   if (command === "models") return print(await request("/v1/models"));
   if (command === "plugins") return print(await request("/v1/plugins"));
   if (command === "costs") return print(await request("/v1/costs"));
@@ -96,22 +135,16 @@ async function main(): Promise<void> {
     return print(await request(`/v1/agents/${encodeURIComponent(id)}/logs?${search}`));
   }
   if (command === "message") {
-    const [id, ...content] = args;
+    const [id, ...content] = withoutMutationKey(args);
     if (!id || !content.length) throw new Error("Usage: symphony message <agent-id> <message>");
-    return print(await request(`/v1/agents/${encodeURIComponent(id)}/messages`, {
-      method: "POST",
-      headers: { "idempotency-key": `cli:message:${randomUUID()}` },
-      body: JSON.stringify({ content: content.join(" ") }),
-    }));
+    const client = new CliClient({ config: loadConfig() });
+    return print(await client.mutate(`/v1/agents/${encodeURIComponent(id)}/messages`, { content: content.join(" ") }, mutationKey("message")));
   }
   if (command === "cancel") {
     const id = args[0];
     if (!id) throw new Error("Usage: symphony cancel <agent-id>");
-    return print(await request(`/v1/agents/${encodeURIComponent(id)}/cancel`, {
-      method: "POST",
-      headers: { "idempotency-key": `cli:cancel-agent:${randomUUID()}` },
-      body: "{}",
-    }));
+    const client = new CliClient({ config: loadConfig() });
+    return print(await client.mutate(`/v1/agents/${encodeURIComponent(id)}/cancel`, {}, mutationKey("cancel-agent")));
   }
   if (command === "workflows") return print(await request("/v1/workflows"));
   if (command === "run") {
@@ -119,11 +152,8 @@ async function main(): Promise<void> {
     if (!id) throw new Error("Usage: symphony run <workflow-id> [--input JSON | --input-file path]");
     const inputFile = option("--input-file");
     const input = inputFile ? JSON.parse(readFileSync(resolve(inputFile), "utf8")) : JSON.parse(option("--input") ?? "{}");
-    return print(await request(`/v1/workflows/${encodeURIComponent(id)}/runs`, {
-      method: "POST",
-      headers: { "idempotency-key": `cli:run-workflow:${randomUUID()}` },
-      body: JSON.stringify(input),
-    }));
+    const client = new CliClient({ config: loadConfig() });
+    return print(await client.mutate(`/v1/workflows/${encodeURIComponent(id)}/runs`, input, mutationKey("run-workflow")));
   }
   if (command === "secret") {
     const [operation, key, ...operationArgs] = args;
@@ -147,13 +177,18 @@ async function main(): Promise<void> {
   print(`Symphony commands:
   symphony [start] [--no-open] [--no-plugins]
   symphony doctor | status | models | plugins | costs
+  symphony objective <list|snapshot|frontier|runline|attentions|artifacts|checkpoints|strategy|follow|...> [--json]
+  symphony capability <list|show|create|activate|deprecate|prepare> [--json]
+  symphony messages <send|list|show|receipts|cancel|expire> [--json]
+  symphony diagnostics export <agent-id> [--json]
+  symphony session diagnostics <agent-id> [--json]
   symphony agents [--active]
   symphony observe <agent-id> [--level tldr|paragraph|full]
   symphony logs <agent-id> [--after cursor] [--limit count]
-  symphony message <agent-id> <message>
-  symphony cancel <agent-id>
+  symphony message <agent-id> <message> [--idempotency-key KEY]
+  symphony cancel <agent-id> [--idempotency-key KEY]
   symphony workflows
-  symphony run <workflow-id> [--input JSON | --input-file path]
+  symphony run <workflow-id> [--input JSON | --input-file path] [--idempotency-key KEY]
   ${SECRET_SET_USAGE}
   symphony secret <delete|status> <key>`);
 }

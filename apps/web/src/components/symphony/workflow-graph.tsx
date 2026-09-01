@@ -1,11 +1,10 @@
 "use client";
 
 import { ArrowsOutSimple, Minus, Plus } from "@phosphor-icons/react";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent, type ReactNode } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type PointerEvent, type ReactNode } from "react";
 import type { AgentState, WorkEdge, WorkNode } from "../../lib/symphony/contracts";
+import { GRAPH_NODE_HEIGHT, GRAPH_NODE_WIDTH } from "../../lib/symphony/graph-projection";
 
-const NODE_WIDTH = 206;
-const NODE_HEIGHT = 64;
 const PADDING = 76;
 const MIN_SCALE = 0.001;
 const MAX_SCALE = 2.5;
@@ -31,7 +30,8 @@ export const WorkflowGraph = memo(function WorkflowGraph({ nodes, edges, selecte
   const [viewport, setViewport] = useState({ width: 0, height: 0 });
   const [transform, setTransform] = useState<ViewTransform>({ x: 0, y: 0, scale: 1 });
   const geometryKey = nodes.map((node) => `${node.id}:${node.x}:${node.y}`).join("|");
-  const bounds = useMemo(() => graphBounds(nodes), [geometryKey]);
+  const edgeKey = edges.map((edge) => `${edge.from}:${edge.to}:${edge.kind}`).join("|");
+  const bounds = useMemo(() => graphBounds(nodes, edges), [edgeKey, geometryKey]);
   const byId = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
 
   const scheduleTransform = useCallback((next: ViewTransform) => {
@@ -93,7 +93,7 @@ export const WorkflowGraph = memo(function WorkflowGraph({ nodes, edges, selecte
   useEffect(() => () => {
     if (transformFrameRef.current !== null) window.cancelAnimationFrame(transformFrameRef.current);
   }, []);
-  useEffect(() => fitToView(), [fitToView, geometryKey]);
+  useEffect(() => fitToView(), [edgeKey, fitToView, geometryKey]);
 
   const pointerDown = (event: PointerEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
@@ -108,40 +108,73 @@ export const WorkflowGraph = memo(function WorkflowGraph({ nodes, edges, selecte
   const pointerUp = (event: PointerEvent<HTMLDivElement>) => {
     if (dragRef.current?.pointerId === event.pointerId) dragRef.current = null;
   };
+  const keyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.altKey || event.ctrlKey || event.metaKey) return;
+    const current = transformRef.current;
+    const pan = (x: number, y: number) => {
+      event.preventDefault();
+      scheduleTransform({ ...current, x: current.x + x, y: current.y + y });
+    };
+    switch (event.key) {
+      case "ArrowLeft": pan(48, 0); break;
+      case "ArrowRight": pan(-48, 0); break;
+      case "ArrowUp": pan(0, 48); break;
+      case "ArrowDown": pan(0, -48); break;
+      case "PageUp": pan(0, viewport.height * 0.7); break;
+      case "PageDown": pan(0, -viewport.height * 0.7); break;
+      case "+":
+      case "=": event.preventDefault(); zoomAt(current.scale * 1.2); break;
+      case "-":
+      case "_": event.preventDefault(); zoomAt(current.scale / 1.2); break;
+      case "0":
+      case "Home": event.preventDefault(); fitToView(); break;
+      default: break;
+    }
+  };
   if (nodes.length === 0) return <p className="text-xs text-muted-foreground">No workflow graph for this conversation yet.</p>;
 
   return (
     <div
       ref={containerRef}
-      className="relative h-full min-h-[30rem] w-full cursor-grab touch-none select-none overflow-hidden bg-card/28 active:cursor-grabbing"
+      className="symphony-graph-viewport relative h-full min-h-[30rem] w-full cursor-grab touch-none select-none overflow-hidden bg-card/28 active:cursor-grabbing"
       role="application"
       aria-label="Scrollable workflow graph"
+      aria-describedby="symphony-graph-keyboard-help"
       onPointerDown={pointerDown}
       onPointerMove={pointerMove}
       onPointerUp={pointerUp}
       onPointerCancel={pointerUp}
+      onKeyDown={keyDown}
       tabIndex={0}
     >
       <div className="pointer-events-none absolute inset-0 symphony-graph-surface" />
       <div
-        className="absolute left-0 top-0 overflow-visible [transform-origin:0_0]"
+        className="symphony-graph-canvas absolute left-0 top-0 overflow-visible [transform-origin:0_0]"
         style={{ transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})` }}
       >
-        <svg className="pointer-events-none absolute left-0 top-0 overflow-visible" width={Math.max(1, bounds.maxX)} height={Math.max(1, bounds.maxY)} aria-hidden="true">
+        <svg
+          className="symphony-graph-edges pointer-events-none absolute overflow-visible"
+          style={{ left: bounds.minX, top: bounds.minY }}
+          width={Math.max(1, bounds.maxX - bounds.minX)}
+          height={Math.max(1, bounds.maxY - bounds.minY)}
+          viewBox={`${bounds.minX} ${bounds.minY} ${Math.max(1, bounds.maxX - bounds.minX)} ${Math.max(1, bounds.maxY - bounds.minY)}`}
+          aria-hidden="true"
+        >
           {edges.map((edge) => {
             const from = byId.get(edge.from);
             const to = byId.get(edge.to);
             if (!from || !to) return null;
-            const x1 = from.x + NODE_WIDTH;
-            const y1 = from.y + NODE_HEIGHT / 2;
+            const x1 = from.x + GRAPH_NODE_WIDTH;
+            const y1 = from.y + GRAPH_NODE_HEIGHT / 2;
             const x2 = to.x;
-            const y2 = to.y + NODE_HEIGHT / 2;
+            const y2 = to.y + GRAPH_NODE_HEIGHT / 2;
             const curve = Math.max(54, Math.abs(x2 - x1) * 0.46);
             return (
               <path
                 key={`${edge.from}-${edge.to}-${edge.kind}`}
                 d={`M ${x1} ${y1} C ${x1 + curve} ${y1}, ${x2 - curve} ${y2}, ${x2} ${y2}`}
                 fill="none"
+                className={`symphony-graph-edge symphony-graph-edge--${edge.kind}`}
                 stroke="var(--color-foreground)"
                 strokeOpacity={edge.kind === "delegation" ? 0.28 : 0.17}
                 strokeWidth={1.25 / transform.scale}
@@ -160,11 +193,14 @@ export const WorkflowGraph = memo(function WorkflowGraph({ nodes, edges, selecte
               disabled={!node.agentId || !onSelect}
               onPointerDown={(event) => event.stopPropagation()}
               onClick={() => onSelect?.(node)}
-              className={`absolute flex cursor-pointer items-center gap-3 rounded-xl border bg-card/96 px-4 text-left shadow-sm backdrop-blur-xl transition-[border-color,background-color,box-shadow] hover:bg-muted/85 disabled:cursor-default ${selected ? "border-foreground/85 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_12%,transparent)]" : "border-border/85"}`}
-              style={{ left: node.x, top: node.y, width: NODE_WIDTH, height: NODE_HEIGHT }}
-              aria-label={`${node.label} ${node.detail}`}
+              className={`symphony-graph-node absolute flex cursor-pointer items-center gap-3 rounded-xl border bg-card/96 px-4 text-left shadow-sm backdrop-blur-xl transition-[border-color,background-color,box-shadow] hover:bg-muted/85 disabled:cursor-default ${selected ? "border-foreground/85 shadow-[0_0_0_1px_color-mix(in_oklab,var(--color-foreground)_12%,transparent)]" : "border-border/85"}`}
+              style={{ left: node.x, top: node.y, width: GRAPH_NODE_WIDTH, height: GRAPH_NODE_HEIGHT }}
+              data-agent-id={node.agentId}
+              data-ledger-id={node.ledgerId ?? node.id}
+              data-state={node.state}
+              aria-label={`${node.label} · ${node.state} · ${node.detail}`}
             >
-              <span className={`size-2 shrink-0 rounded-full ${stateClass[node.state]}`} />
+              <span className={`symphony-graph-status size-2 shrink-0 rounded-full ${stateClass[node.state]}`} data-state={node.state} aria-hidden="true" />
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-[12px] font-medium text-foreground/95" title={node.label}>{node.label}</span>
                 <span className="mt-1 block truncate text-[9px] text-muted-foreground" title={node.detail}>{node.detail}</span>
@@ -185,7 +221,7 @@ export const WorkflowGraph = memo(function WorkflowGraph({ nodes, edges, selecte
         <span className="inline-flex items-center gap-1.5"><span className="w-4 border-t border-foreground/30" />Delegation</span>
         <span className="inline-flex items-center gap-1.5"><span className="w-4 border-t border-dashed border-foreground/25" />Dependency</span>
       </div>
-      <p className="pointer-events-none absolute bottom-3 right-3 rounded-md bg-background/70 px-2 py-1 text-[8px] text-muted-foreground backdrop-blur-xl">Drag or two-finger scroll to pan · Trackpad pinch to zoom</p>
+      <p id="symphony-graph-keyboard-help" className="symphony-graph-help pointer-events-none absolute bottom-3 right-3 rounded-md bg-background/70 px-2 py-1 text-[8px] text-muted-foreground backdrop-blur-xl">Drag or two-finger scroll to pan · Trackpad pinch to zoom · Arrows pan · +/- zoom · 0 fits</p>
     </div>
   );
 }, graphPropsEqual);
@@ -199,7 +235,7 @@ function graphPropsEqual(
   for (let index = 0; index < previous.nodes.length; index += 1) {
     const left = previous.nodes[index];
     const right = next.nodes[index];
-    if (!left || !right || left.id !== right.id || left.agentId !== right.agentId || left.label !== right.label || left.detail !== right.detail || left.state !== right.state || left.x !== right.x || left.y !== right.y) return false;
+    if (!left || !right || left.id !== right.id || left.agentId !== right.agentId || left.ledgerId !== right.ledgerId || left.runId !== right.runId || left.rootId !== right.rootId || left.turn !== right.turn || left.label !== right.label || left.detail !== right.detail || left.state !== right.state || left.x !== right.x || left.y !== right.y) return false;
   }
   for (let index = 0; index < previous.edges.length; index += 1) {
     const left = previous.edges[index];
@@ -213,9 +249,26 @@ function GraphButton({ label, onClick, children }: { label: string; onClick: () 
   return <button type="button" onClick={onClick} className="grid size-7 cursor-pointer place-items-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={label} title={label}>{children}</button>;
 }
 function Legend({ color, label }: { color: string; label: string }) { return <span className="inline-flex items-center gap-1.5"><span className={`size-1.5 rounded-full ${color}`} />{label}</span>; }
-export function graphBounds(nodes: WorkNode[]): GraphBounds {
+export function graphBounds(nodes: WorkNode[], edges: WorkEdge[] = []): GraphBounds {
   if (nodes.length === 0) return { minX: 0, minY: 0, maxX: 1, maxY: 1 };
-  return { minX: Math.min(...nodes.map((node) => node.x)), minY: Math.min(...nodes.map((node) => node.y)), maxX: Math.max(...nodes.map((node) => node.x + NODE_WIDTH)), maxY: Math.max(...nodes.map((node) => node.y + NODE_HEIGHT)) };
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  let minX = Math.min(...nodes.map((node) => node.x));
+  let minY = Math.min(...nodes.map((node) => node.y));
+  let maxX = Math.max(...nodes.map((node) => node.x + GRAPH_NODE_WIDTH));
+  let maxY = Math.max(...nodes.map((node) => node.y + GRAPH_NODE_HEIGHT));
+  for (const edge of edges) {
+    const from = byId.get(edge.from);
+    const to = byId.get(edge.to);
+    if (!from || !to) continue;
+    const x1 = from.x + GRAPH_NODE_WIDTH;
+    const x2 = to.x;
+    const curve = Math.max(54, Math.abs(x2 - x1) * 0.46);
+    minX = Math.min(minX, x1 + curve - 2, x2 - curve - 2);
+    maxX = Math.max(maxX, x1 + curve + 2, x2 - curve + 2);
+    minY = Math.min(minY, from.y + GRAPH_NODE_HEIGHT / 2, to.y + GRAPH_NODE_HEIGHT / 2);
+    maxY = Math.max(maxY, from.y + GRAPH_NODE_HEIGHT / 2, to.y + GRAPH_NODE_HEIGHT / 2);
+  }
+  return { minX, minY, maxX, maxY };
 }
 
 export function fitGraphTransform(bounds: GraphBounds, viewport: { width: number; height: number }, padding = PADDING): ViewTransform {
