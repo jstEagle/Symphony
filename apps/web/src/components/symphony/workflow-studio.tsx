@@ -33,7 +33,9 @@ import {
   deprecateCapability,
   fetchCapabilities,
   newIdempotencyKey,
+  previewWorkflow,
   registerWorkflow,
+  type WorkflowPreview,
 } from "@/lib/symphony/runtime-client";
 import type { CapabilityParameterValues, CapabilityTrigger, CapabilityVersionRecord as RenderCapabilityVersionRecord } from "@/lib/symphony/capability-library";
 import { adaptCapabilityVersionRecord } from "@/lib/symphony/capability-library";
@@ -67,6 +69,8 @@ export function WorkflowStudio({ onOpenObjective, studioMode: controlledStudioMo
   const [draft, setDraft] = useState("");
   const [registrationKey, setRegistrationKey] = useState<string | null>(null);
   const [registering, setRegistering] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
+  const [previewResult, setPreviewResult] = useState<WorkflowPreview | null>(null);
   const [activating, setActivating] = useState(false);
   const [registrationError, setRegistrationError] = useState<string | null>(null);
   const [registrationSuccess, setRegistrationSuccess] = useState<string | null>(null);
@@ -101,13 +105,32 @@ export function WorkflowStudio({ onOpenObjective, studioMode: controlledStudioMo
     setRegistrationSuccess(null);
     setDraft("");
     setRegistrationKey(newIdempotencyKey());
+    setPreviewResult(null);
   };
 
   const updateDraft = (value: string) => {
     setDraft(value);
+    setPreviewResult(null);
     // Editing changes the logical registration intent; retries without edits
     // retain the same key so a lost response cannot create another revision.
     setRegistrationKey(newIdempotencyKey());
+  };
+
+  const submitPreview = async () => {
+    if (!runtime || previewing || !validation.valid || validation.value === undefined) return;
+    setPreviewing(true);
+    setRegistrationError(null);
+    setRegistrationSuccess(null);
+    try {
+      const result = await previewWorkflow(validation.value);
+      setPreviewResult(result);
+      setRegistrationSuccess(`${result.workflowId} is valid in the daemon compiler · ${result.stepIds.length} step${result.stepIds.length === 1 ? "" : "s"} · revision ${result.revision} previewed.`);
+    } catch (error) {
+      setPreviewResult(null);
+      setRegistrationError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setPreviewing(false);
+    }
   };
 
   const submitRegistration = async () => {
@@ -212,7 +235,10 @@ export function WorkflowStudio({ onOpenObjective, studioMode: controlledStudioMo
           draft={draft}
           validation={validation}
           busy={registering}
+          preview={previewResult}
+          previewBusy={previewing}
           onDraftChange={updateDraft}
+          onPreview={() => void submitPreview()}
           onSubmit={() => void submitRegistration()}
           onClose={() => setEditorOpen(false)}
         />
@@ -327,8 +353,8 @@ function SourceView({ record }: { record: WorkflowRevisionRecord }) {
   return <div className="mt-5 grid gap-4 xl:grid-cols-[minmax(0,1fr)_18rem]"><section className="min-w-0 rounded-xl border border-border/80 bg-card/28 p-4 md:p-5"><div className="flex items-center justify-between gap-3"><div><h4 className="text-[11px] font-medium uppercase tracking-[0.12em] text-foreground/80">Daemon source</h4><p className="mt-1 text-[10px] text-muted-foreground">The exact definition used for this immutable revision.</p></div><BracketsCurly className="size-4 text-muted-foreground" /></div><pre className="mt-4 max-h-[34rem] overflow-auto rounded-lg border border-border/70 bg-background/70 p-4 font-mono text-[10px] leading-5 text-foreground/80"><code>{source}</code></pre></section><aside className="space-y-3"><div className="rounded-xl border border-success/25 bg-success/6 p-4"><div className="flex items-center gap-2 text-success"><CheckCircle className="size-4" /><p className="text-xs font-medium">Validated at registration</p></div><p className="mt-2 text-[10px] leading-5 text-muted-foreground">The daemon compiler accepted this source and pinned its content hash.</p></div><div className="rounded-xl border border-border/80 bg-card/28 p-4"><p className="font-mono text-[9px] uppercase tracking-[0.13em] text-muted-foreground">Content hash</p><p className="mt-2 break-all font-mono text-[10px] leading-5 text-foreground/75">{record.hash}</p></div></aside></div>;
 }
 
-function RegistrationEditor({ draft, validation, busy, onDraftChange, onSubmit, onClose }: { draft: string; validation: WorkflowJsonValidation; busy: boolean; onDraftChange: (value: string) => void; onSubmit: () => void; onClose: () => void }) {
-  return <section className="shrink-0 border-b border-info/20 bg-info/5 px-5 py-4 md:px-8" aria-labelledby="register-workflow-title"><div className="mx-auto max-w-[100rem]"><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="flex items-center gap-2"><Code className="size-4 text-info" /><h3 id="register-workflow-title" className="text-sm font-medium text-foreground/95">Register a workflow revision</h3></div><p className="mt-1 text-[10px] leading-5 text-muted-foreground">Paste a complete workflow definition. Registration is idempotent and creates a new immutable revision only when its content changes.</p></div><button type="button" onClick={onClose} className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">Close editor</button></div><Textarea value={draft} onChange={(event) => onDraftChange(event.target.value)} placeholder="Paste JSON workflow definition…" aria-label="Workflow JSON definition" spellCheck={false} className="mt-3 min-h-48 resize-y rounded-lg border-border/80 bg-background/70 font-mono text-[10px] leading-5" /><p className="mt-2 font-mono text-[9px] leading-4 text-muted-foreground">Any step may declare <code className="rounded bg-background/70 px-1 text-info">&quot;dependsOn&quot;: [&quot;step-id&quot;]</code>. Dependencies are validated by the daemon and scheduled as ready frontiers inside parallel containers.</p>{validation.valid ? <div className="mt-3 flex flex-wrap items-center gap-2 text-[10px] text-success"><CheckCircle className="size-3.5" /> Definition passes strict client checks. The daemon will assign its revision.</div> : <div className="mt-3 rounded-lg border border-destructive/20 bg-destructive/7 px-3 py-2 text-[10px] text-destructive"><div className="flex items-center gap-2 font-medium"><WarningCircle className="size-3.5" /> Fix {validation.errors.length} validation issue{validation.errors.length === 1 ? "" : "s"}</div><ul className="mt-2 space-y-1 font-mono leading-4">{validation.errors.slice(0, 8).map((error) => <li key={error}>{error}</li>)}</ul>{validation.errors.length > 8 ? <p className="mt-1 text-destructive/70">+ {validation.errors.length - 8} more</p> : null}</div>}<div className="mt-3 flex flex-wrap items-center justify-between gap-3"><span className="font-mono text-[9px] text-muted-foreground">POST /v1/workflows · Idempotency-Key per submit</span><div className="flex items-center gap-2"><Button variant="ghost" size="sm" onClick={onClose}>Cancel</Button><Button size="sm" onClick={onSubmit} disabled={!validation.valid || busy}>{busy ? <AgentLoader kind="square" size={13} label="Registering workflow" /> : <Plus className="size-3.5" />}{busy ? "Registering…" : "Register revision"}</Button></div></div></div></section>;
+function RegistrationEditor({ draft, validation, busy, preview, previewBusy, onDraftChange, onPreview, onSubmit, onClose }: { draft: string; validation: WorkflowJsonValidation; busy: boolean; preview: WorkflowPreview | null; previewBusy: boolean; onDraftChange: (value: string) => void; onPreview: () => void; onSubmit: () => void; onClose: () => void }) {
+  return <section className="shrink-0 border-b border-info/20 bg-info/5 px-5 py-4 md:px-8" aria-labelledby="register-workflow-title"><div className="mx-auto max-w-[100rem]"><div className="flex flex-wrap items-start justify-between gap-3"><div><div className="flex items-center gap-2"><Code className="size-4 text-info" /><h3 id="register-workflow-title" className="text-sm font-medium text-foreground/95">Register a workflow revision</h3></div><p className="mt-1 text-[10px] leading-5 text-muted-foreground">Paste a complete workflow definition. Preview it against the daemon compiler before registration; registration remains idempotent and creates a new immutable revision only when its content changes.</p></div><button type="button" onClick={onClose} className="text-[10px] text-muted-foreground underline-offset-2 hover:text-foreground hover:underline">Close editor</button></div><Textarea value={draft} onChange={(event) => onDraftChange(event.target.value)} placeholder="Paste JSON workflow definition…" aria-label="Workflow JSON definition" spellCheck={false} className="mt-3 min-h-48 resize-y rounded-lg border-border/80 bg-background/70 font-mono text-[10px] leading-5" /><p className="mt-2 font-mono text-[9px] leading-4 text-muted-foreground">Any step may declare <code className="rounded bg-background/70 px-1 text-info">&quot;dependsOn&quot;: [&quot;step-id&quot;]</code>. Dependencies are validated by the daemon and scheduled as ready frontiers inside parallel containers.</p>{validation.valid ? <div className="mt-3 flex flex-wrap items-center gap-2 text-[10px] text-success"><CheckCircle className="size-3.5" /> Definition passes strict client checks. Preview will run the authoritative daemon compiler before registration.</div> : <div className="mt-3 rounded-lg border border-destructive/20 bg-destructive/7 px-3 py-2 text-[10px] text-destructive"><div className="flex items-center gap-2 font-medium"><WarningCircle className="size-3.5" /> Fix {validation.errors.length} validation issue{validation.errors.length === 1 ? "" : "s"}</div><ul className="mt-2 space-y-1 font-mono leading-4">{validation.errors.slice(0, 8).map((error) => <li key={error}>{error}</li>)}</ul>{validation.errors.length > 8 ? <p className="mt-1 text-destructive/70">+ {validation.errors.length - 8} more</p> : null}</div>}{preview ? <div className="mt-3 rounded-lg border border-success/20 bg-success/6 px-3 py-2.5 text-[10px] text-foreground/85"><div className="flex flex-wrap items-center gap-x-2 gap-y-1"><CheckCircle className="size-3.5 text-success" /><span className="font-medium text-success">Daemon preview ready</span><span className="font-mono text-muted-foreground">{preview.workflowId} · r{preview.revision} · {preview.stepIds.length} step{preview.stepIds.length === 1 ? "" : "s"}</span>{preview.unchanged ? <span className="rounded border border-border/70 px-1.5 py-0.5 font-mono text-[9px] text-muted-foreground">unchanged</span> : null}</div><p className="mt-1 break-all font-mono text-[9px] text-muted-foreground">sha256:{preview.hash}</p></div> : null}<div className="mt-3 flex flex-wrap items-center justify-between gap-3"><span className="font-mono text-[9px] text-muted-foreground">POST /v1/workflows/preview → /v1/workflows</span><div className="flex items-center gap-2"><Button variant="ghost" size="sm" onClick={onClose}>Cancel</Button><Button variant="outline" size="sm" onClick={onPreview} disabled={!validation.valid || previewBusy || busy}>{previewBusy ? <AgentLoader kind="square" size={13} label="Previewing workflow" /> : <Gauge className="size-3.5" />}{previewBusy ? "Previewing…" : "Preview"}</Button><Button size="sm" onClick={onSubmit} disabled={!validation.valid || busy}>{busy ? <AgentLoader kind="square" size={13} label="Registering workflow" /> : <Plus className="size-3.5" />}{busy ? "Registering…" : "Register revision"}</Button></div></div></div></section>;
 }
 
 function StudioTab({ active, onClick, icon, label }: { active: boolean; onClick: () => void; icon: React.ReactNode; label: string }) {
