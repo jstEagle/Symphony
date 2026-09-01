@@ -1509,14 +1509,17 @@ function assertObjectiveControlSnapshotReferences(
   // Dynamic fan-out children use ids from the item template. They are not
   // static executions, but they are still valid durable snapshot keys once
   // the fan-out receipt has materialized them.
-  const nodeIds = new Set(
-    walkObjectiveControlNodes(revision.plan.root, { includeFanoutTemplates: true }).map((visit) => visit.node.id),
-  );
+  const visits = walkObjectiveControlNodes(revision.plan.root, { includeFanoutTemplates: true });
+  const nodeIds = new Set(visits.map((visit) => visit.node.id));
+  const staticNodeIds = new Set(visits.filter((visit) => !visit.isFanoutTemplate).map((visit) => visit.node.id));
 
   const executionIds = new Set<string>();
   for (const execution of snapshot.executions) {
     if (!nodeIds.has(execution.key.nodeId)) {
       throw new Error(`Objective control snapshot references unknown execution node ${execution.key.nodeId}`);
+    }
+    if (!staticNodeIds.has(execution.key.nodeId) && !execution.fanoutScope) {
+      throw new Error(`Objective control snapshot template execution ${execution.key.nodeId} is missing fan-out scope`);
     }
     const executionId = `${execution.key.nodeId}@${execution.key.iterationKey}`;
     executionIds.add(executionId);
