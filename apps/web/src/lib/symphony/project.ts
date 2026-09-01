@@ -37,6 +37,7 @@ const ACTIVITY_EVENT_TYPES = new Set([
   "agent.queued",
   "agent.routed",
   "agent.message.sent",
+  "agent.cancel.requested",
   "agent.cancelled",
   "agent.failed",
   "agent.recovered",
@@ -372,6 +373,7 @@ function activityTitle(event: EventEnvelope, agent: Agent | undefined): string {
     case "agent.queued": return `${name} queued`;
     case "agent.routed": return `${name} routed`;
     case "agent.message.sent": return "Follow-up delivered";
+    case "agent.cancel.requested": return `${name} cancellation requested`;
     case "agent.cancelled": return `${name} cancelled`;
     case "agent.recovered": return `${name} recovered`;
     case "agent.recovery.continued": return `${name} recovery continued`;
@@ -399,6 +401,8 @@ function activityDetail(event: EventEnvelope): string {
     }
     case "agent.message.sent":
       return "Sent to the agent's active native session.";
+    case "agent.cancel.requested":
+      return "A durable cancellation request was recorded; the native harness still needs to acknowledge it.";
     case "agent.recovered": {
       const continuity = payloadString(event, "continuity");
       const recoveredStatus = payloadString(event, "recoveredStatus");

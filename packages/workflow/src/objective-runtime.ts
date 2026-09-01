@@ -43,6 +43,7 @@ import {
   type ObjectiveControlPlanRevision,
   type ObjectiveControlPlanSnapshot,
   type ObjectiveControlMutation,
+  type ObjectiveControlExecutionKey,
   objectiveControlExecutionId,
   ObjectiveControlSignalDeliveryInputSchema,
   objectiveControlSubscriptionKey,
@@ -797,19 +798,25 @@ export class ObjectiveRuntime {
       this.assertAuthority(authority);
       let state = this.controlState(runId);
       if (!state) return null;
-      for (const execution of state.snapshot.executions) {
-        if (!execution.suspension || execution.suspension.status !== "waiting") continue;
-        const intent = nextObjectiveControlIntent(state.revision.plan, state.snapshot, this.now());
+      for (const execution of [...state.snapshot.executions]) {
+        const current = state.snapshot.executions.find((entry) => objectiveControlExecutionId(entry.key) === objectiveControlExecutionId(execution.key));
+        if (!current?.suspension || current.suspension.status !== "waiting") continue;
+        // A parallel control node may have several durable suspensions in its
+        // frontier. Derive and acknowledge each target against a scoped
+        // frontier; deriving only the global next intent would repeatedly see
+        // the first waiting suspension and silently leave its siblings live.
+        const scopedSnapshot = ObjectiveControlPlanSnapshotSchema.parse({ ...state.snapshot, frontier: [current.key] });
+        const intent = nextObjectiveControlIntent(state.revision.plan, scopedSnapshot, this.now());
         if ((intent.kind !== "timer" && intent.kind !== "signal") || objectiveControlExecutionId(intent.execution) !== objectiveControlExecutionId(execution.key)) continue;
         state = this.acknowledgeControlAction(runId, {
           kind: intent.kind,
           intentId: intent.intentId,
           requestKey: `objective-control-cancel:${runId}:${objectiveControlExecutionId(execution.key)}`,
-        reason: "Objective control suspension cancelled with its objective run.",
-        state: "cancelled",
-        now: this.now(),
+          reason: "Objective control suspension cancelled with its objective run.",
+          state: "cancelled",
+          now: this.now(),
           eventCursor: state.snapshot.eventCursor,
-        }, authority);
+        }, authority, current.key);
       }
       return state;
     });
@@ -863,6 +870,7 @@ export class ObjectiveRuntime {
     runId: string,
     rawAcknowledgement: ObjectiveControlAcknowledgement,
     authority: ObjectiveRuntimeAuthority,
+    executionOverride?: ObjectiveControlExecutionKey,
   ): ObjectiveControlState {
     this.assertAuthority(authority);
     const acknowledgement = ObjectiveControlAcknowledgementSchema.parse(rawAcknowledgement);
@@ -879,7 +887,14 @@ export class ObjectiveRuntime {
     this.assertRunPolicy(run, authority);
     const state = this.controlState(runId);
     if (!state) throw new ObjectiveRuntimeError(`Objective control plan not found: ${runId}.`, "not-found");
-    const intent = nextObjectiveControlIntent(state.revision.plan, state.snapshot, this.now());
+    // Internal lifecycle operations such as cancelling all suspensions may
+    // target a waiting execution that is not the first global frontier item.
+    // Keep the override private and scope only intent derivation/reduction;
+    // the persisted snapshot still contains every other frontier entry.
+    const controlSnapshot = executionOverride
+      ? ObjectiveControlPlanSnapshotSchema.parse({ ...state.snapshot, frontier: [executionOverride] })
+      : state.snapshot;
+    const intent = nextObjectiveControlIntent(state.revision.plan, controlSnapshot, this.now());
     if (intent.intentId !== acknowledgement.intentId) {
       throw new ObjectiveRuntimeError(`Objective control acknowledgement ${acknowledgement.requestKey} is stale.`, "revision-conflict");
     }
@@ -933,7 +948,7 @@ export class ObjectiveRuntime {
       }
     }
 
-    const nextSnapshot = applyObjectiveControlAcknowledgement(state.revision.plan, state.snapshot, acknowledgement);
+    const nextSnapshot = applyObjectiveControlAcknowledgement(state.revision.plan, controlSnapshot, acknowledgement);
     const advanced = nextSnapshot.sequence !== state.snapshot.sequence;
     if (advanced) {
       if (!this.repository.saveObjectiveControlSnapshot) {

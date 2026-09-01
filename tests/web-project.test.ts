@@ -223,6 +223,21 @@ describe("durable chat projection", () => {
     expect(snapshot.events.every((item) => item.source === "runtime-observed")).toBe(true);
   });
 
+  it("keeps a durable cancellation request visible before native acknowledgement", () => {
+    const snapshot = snapshotForThread(
+      thread,
+      bootstrap(agentRecord("cancel-requested"), "running"),
+      [event(1, "agent.cancel.requested", { previousStatus: "running" })],
+    );
+
+    expect(snapshot.events).toMatchObject([{
+      id: "event-1",
+      title: "Conductor cancellation requested",
+      detail: "A durable cancellation request was recorded; the native harness still needs to acknowledge it.",
+      source: "runtime-observed",
+    }]);
+  });
+
   it("scopes structural workflow activity to child runs linked through the conductor tree", () => {
     const child = {
       ...agentRecord("running"),
