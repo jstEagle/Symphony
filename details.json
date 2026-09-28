@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "title": "Symphony",
+  "description": "A local-first orchestration harness for native coding agents, with a conductor, worker trees, durable workflows, and a shared chat interface.",
+  "tags": [
+    "TypeScript",
+    "AI Agents",
+    "Codex",
+    "Claude Code",
+    "Orchestration"
+  ],
+  "featured": true,
+  "order": 3,
+  "links": {
+    "repo": "https://github.com/jstEagle/Symphony"
+  }
+}
